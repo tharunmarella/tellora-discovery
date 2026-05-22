@@ -41,6 +41,9 @@ async def lookup_domain(company_name: str) -> dict[str, str]:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(f"{JINA_SEARCH_URL}{query}", headers=headers)
 
+        if resp.status_code == 401:
+            logger.error("Jina API key required — set JINA_API_KEY in .env (free at jina.ai)")
+            return {}
         if resp.status_code == 429:
             logger.warning(f"Jina 429 for '{company_name}' — pausing 30s")
             await asyncio.sleep(30)
@@ -50,7 +53,7 @@ async def lookup_domain(company_name: str) -> dict[str, str]:
         hits = resp.json().get("data", [])
 
     except Exception as exc:
-        logger.debug(f"Jina lookup failed for '{company_name}': {exc}")
+        logger.warning(f"Jina lookup failed for '{company_name}': {exc}")
         return {}
 
     for hit in hits[:4]:
