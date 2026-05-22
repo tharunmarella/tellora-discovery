@@ -2,8 +2,8 @@
 Tellora Discovery Service — entry point.
 
 Usage:
-  python -m tellora_discovery          # run the scrape
-  python -m tellora_discovery --dry-run  # 2 pages per profile, no writes
+  python __main__.py           # run the scrape
+  python __main__.py --dry-run # 2 pages per profile, no writes
 
 Railway cron schedule: 0 3 * * 0  (every Sunday 3 AM UTC)
 """

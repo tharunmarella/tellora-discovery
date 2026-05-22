@@ -11,4 +11,4 @@ COPY . .
 
 # Default command — runs the full scrape.
 # Pass --dry-run to limit to 2 pages per profile for testing.
-CMD ["python", "-m", "tellora_discovery"]
+CMD ["python", "__main__.py"]
