@@ -3,32 +3,9 @@ services:
     build: .
     env_file: .env
     environment:
-      # Override MAX_PAGES_PER_PROFILE here for local testing (default 500)
       MAX_PAGES_PER_PROFILE: "${MAX_PAGES_PER_PROFILE:-500}"
-    # Remove the command override below to run a full scrape
+    # Uncomment for a quick dry-run (2 pages per profile, no writes):
     # command: ["python", "-m", "tellora_discovery", "--dry-run"]
-    restart: "no"      # cron job — exits after one run, no auto-restart
-    depends_on:
-      db:
-        condition: service_healthy
-
-  # Local Postgres — only used for local dev/testing.
-  # In production (Railway), set DATABASE_URL in .env pointing to Railway Postgres.
-  db:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: discovery
-      POSTGRES_PASSWORD: discovery
-      POSTGRES_DB: tellora_discovery
-    ports:
-           - "5434:5432"       # 5433 on host to avoid clash with local Postgres
-    volumes:
-      - discovery_pg_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U discovery -d tellora_discovery"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-volumes:
-  discovery_pg_data:
+    restart: "no"    # cron job — exits after one run, no auto-restart
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
