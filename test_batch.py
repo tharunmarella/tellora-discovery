@@ -24,7 +24,7 @@ setup_logging()
 import settings as cfg
 from profiles import PROFILE_BY_SLUG
 from apollo_client import ApolloRateLimiter, search_page
-from ddg_client import lookup_domain
+from serper_client import lookup_domain
 
 # ── CLI args ──────────────────────────────────────────────────────────────────
 args = sys.argv[1:]
@@ -96,13 +96,13 @@ async def main():
 
     print(f"\n  Total unique org names: {len(all_companies)}\n")
 
-    # ── Step 2: Jina domain lookup (5 concurrent) ─────────────────────────────
-    print("[ 2 / 3 ]  Resolving domains via Jina (5 concurrent) …")
+    # ── Step 2: Domain lookup (5 concurrent) ───────────────────────────────────
+    print("[ 2 / 3 ]  Resolving domains via Serper (5 concurrent) …")
     sem = asyncio.Semaphore(5)
 
     async def _resolve(company: dict) -> None:
         async with sem:
-            result = await lookup_domain(company["name"], company["ceo_first_name"])
+            result = await lookup_domain(company["name"], company["ceo_first_name"], api_key=cfg.SERPER_API_KEY)
             company.update({
                 "domain":      result.get("domain"),
                 "website_url": result.get("website_url"),

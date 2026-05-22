@@ -27,7 +27,7 @@ from database import get_session
 from models import DiscoveryCompany, DiscoveryProgress
 from profiles import ICP_PROFILES
 from apollo_client import ApolloRateLimiter, paginate_profile
-from ddg_client import lookup_domain
+from serper_client import lookup_domain
 
 logger = logging.getLogger("discovery.service")
 
@@ -214,7 +214,7 @@ async def _scrape_profile(
             # Concurrent Jina lookups (5 at a time)
             async def _resolve(org_name: str, ceo_first_name: str) -> tuple[str, dict]:
                 async with _jina_sem:
-                    return org_name, await lookup_domain(org_name, ceo_first_name)
+                    return org_name, await lookup_domain(org_name, ceo_first_name, api_key=cfg.SERPER_API_KEY)
 
             jina_results = await asyncio.gather(*[_resolve(n, c) for n, c in new_companies])
 
