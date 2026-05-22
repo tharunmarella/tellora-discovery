@@ -7,7 +7,7 @@ and returns the company's domain, website URL, and a short description.
 
 import asyncio
 import logging
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 import httpx
 
@@ -32,13 +32,13 @@ async def lookup_domain(company_name: str) -> dict[str, str]:
     Returns a dict with any of: domain, website_url, description.
     Empty dict if Jina finds nothing useful.
     """
-    query = f'"{company_name}" official website'
+    query = quote(f'"{company_name}" official website')
     headers: dict[str, str] = {"Accept": "application/json"}
     if cfg.JINA_API_KEY:
         headers["Authorization"] = f"Bearer {cfg.JINA_API_KEY}"
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(f"{JINA_SEARCH_URL}{query}", headers=headers)
 
         if resp.status_code == 401:
