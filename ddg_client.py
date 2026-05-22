@@ -43,10 +43,7 @@ async def lookup_domain(company_name: str, ceo_first_name: str = "") -> dict[str
 
     Runs DDGS in a thread pool so it doesn't block the event loop.
     """
-    if ceo_first_name:
-        query = f'"{company_name}" "{ceo_first_name}" CEO official site'
-    else:
-        query = f'"{company_name}" official website'
+    query = f'"{company_name}" official website'
 
     try:
         results = await asyncio.get_event_loop().run_in_executor(
