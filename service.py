@@ -27,7 +27,7 @@ from database import get_session
 from models import DiscoveryCompany, DiscoveryProgress
 from profiles import ICP_PROFILES
 from apollo_client import ApolloRateLimiter, paginate_profile
-from jina_client import lookup_domain
+from ddg_client import lookup_domain
 
 logger = logging.getLogger("discovery.service")
 

@@ -24,7 +24,7 @@ setup_logging()
 import settings as cfg
 from profiles import PROFILE_BY_SLUG
 from apollo_client import ApolloRateLimiter, search_page
-from jina_client import lookup_domain
+from ddg_client import lookup_domain
 
 # ── CLI args ──────────────────────────────────────────────────────────────────
 args = sys.argv[1:]
