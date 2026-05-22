@@ -26,7 +26,8 @@ ICP_PROFILES: list[dict[str, Any]] = [
             "person_seniorities": ["founder", "c_suite"],
             "organization_num_employees_ranges": ["21,50", "51,200"],
             "organization_locations": ["United States"],
-            "q_organization_job_titles": ["software engineer", "machine learning engineer"],
+            # "platform engineer" / "site reliability" = infra-heavy companies = buy devtools
+            "q_organization_job_titles": ["platform engineer", "site reliability engineer", "devops engineer"],
             "organization_num_jobs_range_min": 3,
             "include_similar_titles": True,
         },
@@ -79,7 +80,8 @@ ICP_PROFILES: list[dict[str, Any]] = [
             "person_seniorities": ["founder", "c_suite"],
             "organization_num_employees_ranges": ["21,50", "51,200", "201,500"],
             "organization_locations": ["United States"],
-            "q_organization_job_titles": ["account executive", "sales development representative"],
+            # Hiring SDR + demand gen = dedicated outbound team = buys CRM/sales tools
+            "q_organization_job_titles": ["sales development representative", "demand generation manager"],
             "organization_num_jobs_range_min": 2,
             "include_similar_titles": True,
         },
