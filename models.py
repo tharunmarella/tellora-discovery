@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 import uuid
 
 from sqlmodel import SQLModel, Field, Column, String
-from sqlalchemy import TIMESTAMP, Text, Boolean, Index
+from sqlalchemy import TIMESTAMP, Text, Boolean
 from sqlalchemy.dialects.postgresql import JSONB, ARRAY
 
 
@@ -36,11 +36,7 @@ class DiscoveryCompany(SQLModel, table=True):
     """
     __tablename__ = "discovery_company"
 
-    __table_args__ = (
-        Index("ix_discovery_company_name_lower", "apollo_org_name"),
-        Index("ix_discovery_company_domain", "domain"),
-        {"extend_existing": True},
-    )
+    __table_args__ = {"extend_existing": True}
 
     id: str = Field(default_factory=_uuid, sa_column=Column(String, primary_key=True))
 

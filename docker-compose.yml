@@ -21,7 +21,7 @@ services:
       POSTGRES_PASSWORD: discovery
       POSTGRES_DB: tellora_discovery
     ports:
-      - "5433:5432"       # 5433 on host to avoid clash with local Postgres
+           - "5434:5432"       # 5433 on host to avoid clash with local Postgres
     volumes:
       - discovery_pg_data:/var/lib/postgresql/data
     healthcheck:

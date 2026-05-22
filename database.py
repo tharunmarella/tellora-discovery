@@ -24,7 +24,7 @@ engine = create_engine(
 def create_tables() -> None:
     """Create discovery_company and discovery_progress tables if they don't exist."""
     import models  # noqa: F401 — registers SQLModel metadata
-    SQLModel.metadata.create_all(engine)
+    SQLModel.metadata.create_all(engine, checkfirst=True)
     logger.info("Tables verified/created")
 
 
