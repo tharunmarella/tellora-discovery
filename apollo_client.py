@@ -149,17 +149,17 @@ async def paginate_profile(
     limiter: ApolloRateLimiter,
     start_page: int = 1,
     max_pages: int = 500,
-) -> list[tuple[int, list[str]]]:
+) -> list[tuple[int, list[tuple[str, str]]]]:
     """
     Paginate Apollo for one ICP profile starting from start_page.
-    Yields (page_number, [org_name, ...]) per page so the caller can
-    checkpoint after each page.
 
-    Returns a list of (page, org_names) tuples for all pages processed.
+    Returns a list of (page, [(org_name, ceo_first_name), ...]) tuples.
+    ceo_first_name is the CEO's first name (free tier gives this unobfuscated)
+    and is used to disambiguate Jina searches for companies with generic names.
     """
     slug = profile["slug"]
     filters = profile["filters"]
-    pages_data: list[tuple[int, list[str]]] = []
+    pages_data: list[tuple[int, list[tuple[str, str]]]] = []
 
     logger.info(f"[{slug}] Starting from page {start_page}")
 
@@ -183,16 +183,16 @@ async def paginate_profile(
             logger.info(f"[{slug}] No more results at page {page} — done")
             break
 
-        org_names = [
-            (person.get("organization") or {}).get("name", "").strip()
-            for person in people
-        ]
-        org_names = [n for n in org_names if n]
+        orgs: list[tuple[str, str]] = []
+        for person in people:
+            org_name = (person.get("organization") or {}).get("name", "").strip()
+            if org_name:
+                orgs.append((org_name, person.get("first_name") or ""))
 
         total = data.get("total_entries", "?")
-        logger.info(f"[{slug}] page {page} — {len(org_names)} orgs (total_entries={total})")
+        logger.info(f"[{slug}] page {page} — {len(orgs)} orgs (total_entries={total})")
 
-        pages_data.append((page, org_names))
+        pages_data.append((page, orgs))
 
         if len(people) < 100:
             logger.info(f"[{slug}] Last page reached at {page}")

@@ -27,12 +27,18 @@ _SKIP_DOMAINS = {
 }
 
 
-async def lookup_domain(company_name: str) -> dict[str, str]:
+async def lookup_domain(company_name: str, ceo_first_name: str = "") -> dict[str, str]:
     """
     Returns a dict with any of: domain, website_url, description.
     Empty dict if Jina finds nothing useful.
+
+    ceo_first_name (CEO's first name from Apollo) disambiguates searches for
+    companies with generic names — e.g. 'Close' → 'Nick Close CRM' not a museum.
     """
-    query = quote(f'"{company_name}" official website')
+    if ceo_first_name:
+        query = quote(f'"{company_name}" "{ceo_first_name}" CEO site')
+    else:
+        query = quote(f'"{company_name}" official website')
     headers: dict[str, str] = {"Accept": "application/json"}
     if cfg.JINA_API_KEY:
         headers["Authorization"] = f"Bearer {cfg.JINA_API_KEY}"

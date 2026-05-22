@@ -68,18 +68,23 @@ async def main():
 
         people = data.get("people", [])
         total  = data.get("total_entries", "?")
-        names  = [
-            (p.get("organization") or {}).get("name", "").strip()
-            for p in people
-        ]
-        names = list(dict.fromkeys(n for n in names if n))  # dedup, preserve order
 
-        print(f"  page {page:>3} → {len(names):>3} org names  "
+        seen_names: set[str] = {c["name"].lower() for c in all_companies}
+        new_count = 0
+        for p in people:
+            org_name = (p.get("organization") or {}).get("name", "").strip()
+            if org_name and org_name.lower() not in seen_names:
+                seen_names.add(org_name.lower())
+                all_companies.append({
+                    "name": org_name,
+                    "ceo_first_name": p.get("first_name") or "",
+                    "page": page,
+                    "domain": None, "website_url": None, "description": None,
+                })
+                new_count += 1
+
+        print(f"  page {page:>3} → {new_count:>3} org names  "
               f"(total_entries={total}, {elapsed:.1f}s)")
-
-        for name in names:
-            all_companies.append({"name": name, "page": page,
-                                  "domain": None, "website_url": None, "description": None})
 
         if len(people) < 100:
             print(f"  Last page reached at {page}")
@@ -91,23 +96,32 @@ async def main():
 
     print(f"\n  Total unique org names: {len(all_companies)}\n")
 
-    # ── Step 2: Jina domain lookup ─────────────────────────────────────────────
-    print("[ 2 / 3 ]  Resolving domains via Jina …")
-    JINA_DELAY = 0.6
-    for i, company in enumerate(all_companies):
-        await asyncio.sleep(JINA_DELAY)
-        result = await lookup_domain(company["name"])
-        company.update({
-            "domain":      result.get("domain"),
-            "website_url": result.get("website_url"),
-            "description": (result.get("description") or "")[:80],
-        })
-        resolved = "✓" if result.get("domain") else "✗"
-        print(f"  [{i+1:>3}/{len(all_companies)}] {resolved}  {company['name']:<40}  "
-              f"{company['domain'] or '—'}")
+    # ── Step 2: Jina domain lookup (5 concurrent) ─────────────────────────────
+    print("[ 2 / 3 ]  Resolving domains via Jina (5 concurrent) …")
+    sem = asyncio.Semaphore(5)
 
-    resolved_count = sum(1 for c in all_companies if c["domain"])
-    print(f"\n  Domains resolved: {resolved_count} / {len(all_companies)}\n")
+    async def _resolve(company: dict) -> None:
+        async with sem:
+            result = await lookup_domain(company["name"], company["ceo_first_name"])
+            company.update({
+                "domain":      result.get("domain"),
+                "website_url": result.get("website_url"),
+                "description": (result.get("description") or "")[:80],
+            })
+
+    t_jina = time.monotonic()
+    await asyncio.gather(*[_resolve(c) for c in all_companies])
+    jina_elapsed = time.monotonic() - t_jina
+
+    for i, company in enumerate(all_companies):
+        resolved = "✓" if company.get("domain") else "✗"
+        print(f"  [{i+1:>3}/{len(all_companies)}] {resolved}  {company['name']:<40}  "
+              f"{company.get('domain') or '—'}")
+
+    resolved_count = sum(1 for c in all_companies if c.get("domain"))
+    rate = len(all_companies) / jina_elapsed if jina_elapsed > 0 else 0
+    print(f"\n  Domains resolved: {resolved_count} / {len(all_companies)}  "
+          f"({jina_elapsed:.0f}s total, {rate:.1f} companies/sec)\n")
 
     # ── Step 3: Summary table ──────────────────────────────────────────────────
     print("[ 3 / 3 ]  Results\n")

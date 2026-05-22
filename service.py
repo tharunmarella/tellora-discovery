@@ -31,7 +31,8 @@ from jina_client import lookup_domain
 
 logger = logging.getLogger("discovery.service")
 
-JINA_DELAY = 0.5  # seconds between Jina calls (~2 req/sec)
+JINA_CONCURRENCY = 5   # parallel Jina lookups per page
+_jina_sem = asyncio.Semaphore(JINA_CONCURRENCY)
 
 
 # ── Checkpoint helpers ─────────────────────────────────────────────────────────
@@ -198,19 +199,27 @@ async def _scrape_profile(
             new_for_page: list[DiscoveryCompany] = []
             seen_in_page: set[str] = set()
 
-            for name in org_names:
-                norm = _norm(name)
+            # Filter to only new companies before hitting Jina
+            new_companies: list[tuple[str, str]] = []  # (org_name, ceo_first_name)
+            for org_name, ceo_first_name in org_names:
+                norm = _norm(org_name)
                 if not norm or norm in known_names or norm in seen_in_page:
                     continue
                 seen_in_page.add(norm)
-
                 if _add_profile_to_existing(db, norm, slug):
                     known_names.add(norm)
                     continue
+                new_companies.append((org_name, ceo_first_name))
 
-                # New company — Jina domain lookup
-                await asyncio.sleep(JINA_DELAY)
-                jina = await lookup_domain(name)
+            # Concurrent Jina lookups (5 at a time)
+            async def _resolve(org_name: str, ceo_first_name: str) -> tuple[str, dict]:
+                async with _jina_sem:
+                    return org_name, await lookup_domain(org_name, ceo_first_name)
+
+            jina_results = await asyncio.gather(*[_resolve(n, c) for n, c in new_companies])
+
+            for name, jina in jina_results:
+                norm = _norm(name)
                 domain = jina.get("domain")
 
                 # Check domain collision (same company found by different profile)
