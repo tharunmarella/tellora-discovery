@@ -31,7 +31,7 @@ from ddg_client import lookup_domain
 
 logger = logging.getLogger("discovery.service")
 
-LOOKUP_CONCURRENCY = 5   # parallel enrichment lookups per page
+LOOKUP_CONCURRENCY = 2   # parallel enrichment lookups per page (each = 2 Gemini calls)
 _lookup_sem = asyncio.Semaphore(LOOKUP_CONCURRENCY)
 
 

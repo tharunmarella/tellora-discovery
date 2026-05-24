@@ -14,9 +14,21 @@ Requires: GOOGLE_API_KEY env var (shared with tellora-backend).
 import asyncio
 import json
 import logging
+import time
 from urllib.parse import urlparse
 
 logger = logging.getLogger("discovery.ddg")
+
+# Reuse a single Gemini client per process to avoid per-call instantiation overhead
+_gemini_client = None
+
+
+def _get_gemini_client(api_key: str):
+    global _gemini_client
+    if _gemini_client is None:
+        from google import genai
+        _gemini_client = genai.Client(api_key=api_key)
+    return _gemini_client
 
 _SKIP_DOMAINS = {
     "linkedin.com", "crunchbase.com", "zoominfo.com", "bloomberg.com",
@@ -65,6 +77,22 @@ Return a JSON object with exactly these fields (all based only on the snippets a
 JSON only, no explanation."""
 
 
+def _retry_gemini(fn, max_retries: int = 3):
+    """Retry a Gemini API call with exponential backoff on rate-limit or transient errors."""
+    backoff = 5
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception as exc:
+            exc_str = str(exc).lower()
+            is_retryable = any(s in exc_str for s in ("429", "rate", "quota", "resource_exhausted", "503", "timeout"))
+            if not is_retryable or attempt == max_retries - 1:
+                raise
+            logger.warning(f"Gemini retryable error (attempt {attempt+1}): {exc} — backing off {backoff}s")
+            time.sleep(backoff)
+            backoff *= 2
+
+
 def _embed_text(text: str, api_key: str) -> list[float] | None:
     """
     Embed text using gemini-embedding-001 (768 dims).
@@ -72,36 +100,41 @@ def _embed_text(text: str, api_key: str) -> list[float] | None:
     output_dimensionality must be set explicitly — default is 3072.
     """
     try:
-        from google import genai
         from google.genai import types
 
-        client = genai.Client(api_key=api_key)
-        resp = client.models.embed_content(
-            model="gemini-embedding-001",
-            contents=text,
-            config=types.EmbedContentConfig(
-                task_type="RETRIEVAL_DOCUMENT",
-                output_dimensionality=768,
-            ),
-        )
-        return resp.embeddings[0].values
+        client = _get_gemini_client(api_key)
+
+        def _do():
+            resp = client.models.embed_content(
+                model="gemini-embedding-001",
+                contents=text,
+                config=types.EmbedContentConfig(
+                    task_type="RETRIEVAL_DOCUMENT",
+                    output_dimensionality=768,
+                ),
+            )
+            return resp.embeddings[0].values
+
+        return _retry_gemini(_do)
     except Exception as exc:
         logger.warning(f"Embedding failed: {exc}")
         return None
 
 
 def _call_gemini(prompt: str, api_key: str) -> dict:
-    from google import genai
+    client = _get_gemini_client(api_key)
 
-    client = genai.Client(api_key=api_key)
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash-lite",
-        contents=prompt,
-    )
-    raw = resp.text.strip().strip("`").strip()
-    if raw.startswith("json"):
-        raw = raw[4:].strip()
-    return json.loads(raw)
+    def _do():
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=prompt,
+        )
+        raw = resp.text.strip().strip("`").strip()
+        if raw.startswith("json"):
+            raw = raw[4:].strip()
+        return json.loads(raw)
+
+    return _retry_gemini(_do)
 
 
 def _run_lookup(company_name: str, ceo_first_name: str, api_key: str) -> dict:
@@ -119,8 +152,6 @@ def _run_lookup(company_name: str, ceo_first_name: str, api_key: str) -> dict:
             from duckduckgo_search.exceptions import RatelimitException
         except Exception:
             RatelimitException = Exception  # type: ignore
-
-    import time
 
     query = f"{company_name} company software"
 
