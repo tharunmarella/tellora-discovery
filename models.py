@@ -44,13 +44,20 @@ class DiscoveryCompany(SQLModel, table=True):
     # From Apollo (only field returned for free)
     apollo_org_name: str = Field(sa_column=Column(String, nullable=False, index=True))
 
-    # Resolved by Jina
+    # Resolved by search + LLM enrichment
     name: str = Field(sa_column=Column(String, nullable=False, index=True))
     domain: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True, index=True))
     website_url: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
     linkedin_url: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
     description: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
     industry: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True, index=True))
+
+    # Company profile fields — sourced from Serper KG / Apollo / Gemini
+    ceo_name: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
+    headquarters: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
+    founded_year: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
+    funding: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
+    logo_url: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
 
     # Embedding of description + use_case — used for semantic prospect search
     # Populated during discovery scrape via gemini-embedding-001 (768 dims)

@@ -27,7 +27,7 @@ from database import get_session
 from models import DiscoveryCompany, DiscoveryProgress
 from profiles import ICP_PROFILES
 from apollo_client import ApolloRateLimiter, paginate_profile
-from ddg_client import lookup_domain
+from enrichment import lookup_domain
 
 logger = logging.getLogger("discovery.service")
 
@@ -199,7 +199,7 @@ async def _scrape_profile(
             new_for_page: list[DiscoveryCompany] = []
             seen_in_page: set[str] = set()
 
-            # Filter to only new companies before hitting Jina
+            # Filter to only new companies before enrichment
             new_companies: list[tuple[str, str]] = []  # (org_name, ceo_first_name)
             for org_name, ceo_first_name in org_names:
                 norm = _norm(org_name)
@@ -243,11 +243,16 @@ async def _scrape_profile(
                     website_url=enrichment.get("website_url"),
                     description=enrichment.get("description"),
                     industry=enrichment.get("industry"),
+                    ceo_name=enrichment.get("ceo_name"),
+                    headquarters=enrichment.get("headquarters"),
+                    founded_year=enrichment.get("founded_year"),
+                    funding=enrichment.get("funding"),
+                    logo_url=enrichment.get("logo_url"),
                     description_embedding=enrichment.get("description_embedding"),
                     employee_range=employee_range or None,
                     source_profiles=[slug],
                     domain_resolved=bool(domain),
-                    enrichment_status="pending",
+                    enrichment_status="enriched" if enrichment.get("description") else "pending",
                     raw_meta={
                         "keywords": enrichment.get("keywords"),
                         "use_case": enrichment.get("use_case"),
