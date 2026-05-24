@@ -17,6 +17,7 @@ import uuid
 from sqlmodel import SQLModel, Field, Column, String
 from sqlalchemy import TIMESTAMP, Text, Boolean
 from sqlalchemy.dialects.postgresql import JSONB, ARRAY
+from pgvector.sqlalchemy import Vector
 
 
 def _utc_now() -> datetime:
@@ -50,6 +51,12 @@ class DiscoveryCompany(SQLModel, table=True):
     linkedin_url: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
     description: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
     industry: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True, index=True))
+
+    # Embedding of description + use_case — used for semantic prospect search
+    # Populated during discovery scrape via gemini-embedding-001 (768 dims)
+    description_embedding: Optional[List[float]] = Field(
+        default=None, sa_column=Column(Vector(768), nullable=True)
+    )
     location: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
     employee_range: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
 

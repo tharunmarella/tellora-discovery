@@ -27,12 +27,12 @@ from database import get_session
 from models import DiscoveryCompany, DiscoveryProgress
 from profiles import ICP_PROFILES
 from apollo_client import ApolloRateLimiter, paginate_profile
-from serper_client import lookup_domain
+from ddg_client import lookup_domain
 
 logger = logging.getLogger("discovery.service")
 
-JINA_CONCURRENCY = 5   # parallel Jina lookups per page
-_jina_sem = asyncio.Semaphore(JINA_CONCURRENCY)
+LOOKUP_CONCURRENCY = 5   # parallel enrichment lookups per page
+_lookup_sem = asyncio.Semaphore(LOOKUP_CONCURRENCY)
 
 
 # ── Checkpoint helpers ─────────────────────────────────────────────────────────
@@ -211,16 +211,16 @@ async def _scrape_profile(
                     continue
                 new_companies.append((org_name, ceo_first_name))
 
-            # Concurrent Jina lookups (5 at a time)
+            # Concurrent enrichment lookups (5 at a time)
             async def _resolve(org_name: str, ceo_first_name: str) -> tuple[str, dict]:
-                async with _jina_sem:
-                    return org_name, await lookup_domain(org_name, ceo_first_name, api_key=cfg.SERPER_API_KEY)
+                async with _lookup_sem:
+                    return org_name, await lookup_domain(org_name, ceo_first_name)
 
-            jina_results = await asyncio.gather(*[_resolve(n, c) for n, c in new_companies])
+            lookup_results = await asyncio.gather(*[_resolve(n, c) for n, c in new_companies])
 
-            for name, jina in jina_results:
+            for name, enrichment in lookup_results:
                 norm = _norm(name)
-                domain = jina.get("domain")
+                domain = enrichment.get("domain")
 
                 # Check domain collision (same company found by different profile)
                 if domain:
@@ -240,13 +240,18 @@ async def _scrape_profile(
                     apollo_org_name=name,
                     name=name,
                     domain=domain or None,
-                    website_url=jina.get("website_url"),
-                    description=jina.get("description"),
+                    website_url=enrichment.get("website_url"),
+                    description=enrichment.get("description"),
+                    industry=enrichment.get("industry"),
+                    description_embedding=enrichment.get("description_embedding"),
                     employee_range=employee_range or None,
                     source_profiles=[slug],
                     domain_resolved=bool(domain),
                     enrichment_status="pending",
-                    raw_meta={"jina": jina} if jina else None,
+                    raw_meta={
+                        "keywords": enrichment.get("keywords"),
+                        "use_case": enrichment.get("use_case"),
+                    } if enrichment else None,
                 )
                 new_for_page.append(company)
                 known_names.add(norm)
