@@ -21,6 +21,11 @@ GEMINI_API_KEY: str = os.getenv("GOOGLE_API_KEY", os.getenv("GEMINI_API_KEY", ""
 # Falls back to DDG if not set.
 SERPER_API_KEY: str = os.getenv("SERPER_API_KEY", "")
 
+# Jina Reader API — used for fetching company website content (homepage, about, careers)
+# and funding news search. Get a free key with 10M tokens at https://jina.ai/reader
+# Falls back to unauthenticated requests (20 RPM) if not set.
+JINA_API_KEY: str = os.getenv("JINA_API_KEY", "")
+
 # Max pages to scrape per profile per run (100 results/page → 50,000 max).
 # Override in env for testing: MAX_PAGES_PER_PROFILE=5
 MAX_PAGES_PER_PROFILE: int = int(os.getenv("MAX_PAGES_PER_PROFILE", "500"))

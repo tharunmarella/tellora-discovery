@@ -1,12 +1,12 @@
 """
-Semantic search test — mirrors exactly what the backend /api/discovery/search does.
+Semantic search test — buyer-intent query matching.
 
-Steps:
-  1. Generate 4-5 ICP company profiles from a product description (Gemini)
-  2. Embed each query with RETRIEVAL_QUERY task type
-  3. Average the embeddings into one search vector
-  4. Cosine similarity search via pgvector
-  5. Print top results
+Instead of generating ICP queries that describe NEEDS ("companies that need PM tools"),
+generates queries that describe what buyer companies ARE ("a general contracting firm
+specializing in commercial construction"). This matches company descriptions in the DB
+instead of matching competitors' use_cases.
+
+Also: searches per ICP query separately (no averaging), deduplicates by company ID.
 
 Usage:
   GOOGLE_API_KEY=xxx DATABASE_URL=postgresql://... python test_search.py
@@ -31,16 +31,12 @@ if not DATABASE_URL:
     print("Set DATABASE_URL env var")
     sys.exit(1)
 
-# ── Test queries — change these to test different ICPs ────────────────────────
-
 SEARCHES = [
     "AI-powered sales coaching platform for B2B SaaS companies",
     "Cybersecurity compliance tool for financial institutions",
     "Construction project management software for general contractors",
     "HR onboarding automation for mid-size companies",
 ]
-
-# ─────────────────────────────────────────────────────────────────────────────
 
 from google import genai
 from google.genai import types
@@ -50,17 +46,26 @@ client = genai.Client(api_key=GOOGLE_API_KEY)
 GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 
-def generate_icp_queries(product_description: str) -> list[str]:
-    prompt = f"""You are a B2B sales expert helping identify ideal customer profiles (ICPs).
+def generate_buyer_profiles(product_description: str) -> list[str]:
+    """
+    Generate descriptions of what ideal BUYER companies look like —
+    written as if they were the company's own About page.
+    """
+    prompt = f"""You are a B2B sales expert. A company sells this product:
 
-Product description: {product_description}
+"{product_description}"
 
-Generate 4 short descriptions of the types of COMPANIES that would most benefit from buying this product.
-Each should sound like a company profile, e.g.:
-- "Home services companies with door-to-door sales teams managing field reps"
-- "Construction contractors looking to reduce risk in large commercial projects"
+Describe 4 types of companies that would BUY this product. For each, write a short
+paragraph (2-3 sentences) as if you are writing that company's own About page or
+LinkedIn summary.
 
-Return a JSON array of strings only. No explanation."""
+Focus on what the company DOES as its core business — its operations, its industry,
+its employees, its customers. Do NOT mention what software or tools they need.
+
+Example for "field service scheduling software":
+- "A regional HVAC and plumbing company serving residential customers across three states. The company employs 80 field technicians who handle 200+ daily service calls, coordinated by a small dispatch team."
+
+Return a JSON array of strings. No explanation."""
 
     resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
     raw = resp.text.strip().strip("`").strip()
@@ -82,18 +87,13 @@ def embed(text: str) -> list[float]:
     return resp.embeddings[0].values
 
 
-def avg_embeddings(embeddings: list[list[float]]) -> list[float]:
-    dims = len(embeddings[0])
-    return [sum(e[i] for e in embeddings) / len(embeddings) for i in range(dims)]
-
-
-def search(vector: list[float], limit: int = 8, min_score: float = 0.45) -> list[dict]:
+def search(vector: list[float], limit: int = 10, min_score: float = 0.40) -> list[dict]:
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
     vec_str = "[" + ",".join(str(v) for v in vector) + "]"
     cur.execute("""
         SELECT
-            name, domain, industry, ceo_name, headquarters, funding,
+            id, name, domain, industry, ceo_name, headquarters, funding,
             raw_meta->>'use_case' AS use_case,
             LEFT(description, 120) AS description,
             ROUND((1 - (description_embedding <=> %s::vector))::numeric, 4) AS score
@@ -110,34 +110,46 @@ def search(vector: list[float], limit: int = 8, min_score: float = 0.45) -> list
     return rows
 
 
+def search_multi_query(queries: list[str], per_query: int = 10, min_score: float = 0.40) -> list[dict]:
+    """
+    Search each query separately, deduplicate by company ID, keep highest score.
+    """
+    seen: dict[str, dict] = {}
+    for q in queries:
+        vec = embed(q)
+        results = search(vec, limit=per_query, min_score=min_score)
+        for r in results:
+            cid = r["id"]
+            if cid not in seen or float(r["score"]) > float(seen[cid]["score"]):
+                seen[cid] = r
+    return sorted(seen.values(), key=lambda r: float(r["score"]), reverse=True)
+
+
 def main():
     for product_desc in SEARCHES:
         print(f"\n{'='*70}")
         print(f"  SEARCH: {product_desc}")
         print(f"{'='*70}")
 
-        print("  Generating ICP queries...")
-        icp_queries = generate_icp_queries(product_desc)
-        for q in icp_queries:
-            print(f"    • {q}")
+        print("  Generating buyer profiles...")
+        buyer_profiles = generate_buyer_profiles(product_desc)
+        for i, bp in enumerate(buyer_profiles, 1):
+            print(f"    {i}. {bp[:120]}...")
 
-        print("  Embedding and searching...")
-        embeddings = [embed(q) for q in icp_queries]
-        vector = avg_embeddings(embeddings)
-        results = search(vector, limit=8, min_score=0.45)
+        print("  Searching per query (no averaging)...")
+        results = search_multi_query(buyer_profiles, per_query=10, min_score=0.40)
 
         if not results:
             print("  No results above threshold.")
             continue
 
-        print(f"\n  Top {len(results)} matches:\n")
-        for r in results:
+        top = results[:10]
+        print(f"\n  Top {len(top)} matches:\n")
+        for r in top:
             print(f"  [{r['score']}] {r['name']}")
             print(f"    domain    : {r['domain'] or '—'}")
             print(f"    industry  : {r['industry'] or '—'}")
             print(f"    hq        : {r['headquarters'] or '—'}")
-            print(f"    ceo       : {r['ceo_name'] or '—'}")
-            print(f"    funding   : {r['funding'] or '—'}")
             print(f"    desc      : {r['description'] or '—'}")
             print()
 

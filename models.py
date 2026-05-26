@@ -15,8 +15,8 @@ from typing import Any, Dict, List, Optional
 import uuid
 
 from sqlmodel import SQLModel, Field, Column, String
-from sqlalchemy import TIMESTAMP, Text, Boolean
-from sqlalchemy.dialects.postgresql import JSONB, ARRAY
+from sqlalchemy import TIMESTAMP, Text, Boolean, Integer
+from sqlalchemy.dialects.postgresql import JSONB, ARRAY, TSVECTOR
 from pgvector.sqlalchemy import Vector
 
 
@@ -79,6 +79,24 @@ class DiscoveryCompany(SQLModel, table=True):
         default="pending",
         sa_column=Column(String, nullable=False, server_default="pending", index=True),
     )
+
+    # ── Signal enrichment fields ────────────────────────────────────────────
+    company_summary: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
+    buying_signals: Optional[List[str]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    signal_score: Optional[int] = Field(default=None, sa_column=Column(Integer, nullable=True))
+    hiring_roles: Optional[List[str]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    hiring_count: Optional[int] = Field(default=None, sa_column=Column(Integer, nullable=True))
+    tech_stack: Optional[List[str]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    funding_stage: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
+    total_raised: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
+    headcount: Optional[int] = Field(default=None, sa_column=Column(Integer, nullable=True))
+    signal_enriched_at: Optional[datetime] = Field(default=None, sa_column=Column(TIMESTAMP(timezone=True), nullable=True))
+    signal_enrichment_status: str = Field(
+        default="pending",
+        sa_column=Column(String, nullable=False, server_default="pending", index=True),
+        description="pending | enriched | failed | skipped",
+    )
+    search_tsv: Optional[Any] = Field(default=None, sa_column=Column(TSVECTOR, nullable=True))
 
     raw_meta: Optional[Dict[str, Any]] = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
