@@ -38,6 +38,13 @@ def main() -> None:
 
     total = stats.get("total", 0)
     logger.info(f"Done. {total} new companies added. Per-profile: {stats}")
+
+    # Run signal enrichment for all pending companies after Apollo scrape
+    if not dry_run and total > 0:
+        logger.info("Starting signal enrichment for newly scraped companies...")
+        from signal_runner import run as run_signals
+        asyncio.run(run_signals(limit=None, concurrency=5, batch_size=50, reset_failed=False))
+
     sys.exit(0)
 
 
