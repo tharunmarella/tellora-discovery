@@ -231,22 +231,8 @@ def _run_lookup(company_name: str, ceo_first_name: str, gemini_api_key: str, ser
     if extracted.get("use_case"):
         enrichment["use_case"] = extracted["use_case"]
 
-    # Embed all semantic fields together for richer prospect search matching.
-    # Combines: description (what they do), use_case (who buys from them),
-    # industry (category signal), keywords (dense tags).
-    keywords_str = ", ".join(extracted.get("keywords") or [])
-    industries_str = ", ".join(extracted.get("industries") or [])
-    embed_parts = [
-        extracted.get("description"),
-        extracted.get("use_case"),
-        industries_str or None,
-        keywords_str or None,
-    ]
-    embed_text = " ".join(filter(None, embed_parts)).strip()
-    if embed_text:
-        embedding = _embed_text(embed_text, gemini_api_key)
-        if embedding:
-            enrichment["description_embedding"] = embedding
+    # Embedding is handled by signal_runner.py with richer context
+    # (company_summary + industry + tech_stack). No need to embed here.
 
     return enrichment
 
