@@ -53,6 +53,68 @@ def _get_gemini_client():
     return _gemini_client
 
 
+# ── Serper Knowledge Graph lookup ──────────────────────────────────────────
+
+async def fetch_serper_kg(company_name: str) -> dict:
+    """
+    Single Serper call to get Google Knowledge Graph + LinkedIn snippet.
+    Returns structured facts: {founded, headquarters, founder, headcount, kg_description}.
+    Zero LLM cost — pure Google structured data.
+    """
+    if not company_name or not cfg.SERPER_API_KEY:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                "https://google.serper.dev/search",
+                headers={
+                    "X-API-KEY": cfg.SERPER_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                json={"q": f"{company_name} company", "num": 5},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:
+        logger.warning(f"Serper KG failed for '{company_name}': {exc}")
+        return {}
+
+    result: dict = {}
+
+    kg = data.get("knowledgeGraph", {})
+    if kg:
+        attrs = kg.get("attributes", {})
+        result["kg_description"] = kg.get("description", "")
+        result["founded"] = attrs.get("Founded", "")
+        result["headquarters"] = attrs.get("Headquarters", "")
+        result["founder"] = attrs.get("Founder", "")
+        result["ceo"] = attrs.get("CEO", "")
+        emp = attrs.get("Number of employees", "")
+        if emp:
+            nums = re.findall(r"[\d,]+", emp.replace(",", ""))
+            if nums:
+                try:
+                    result["headcount"] = int(nums[-1])
+                except ValueError:
+                    pass
+
+    for hit in data.get("organic", []):
+        snippet = hit.get("snippet", "")
+        link = hit.get("link", "")
+        if "linkedin.com/company" in link:
+            size_match = re.search(r"(\d[\d,]*)\s*[-–]\s*([\d,]+)\s*employees", snippet, re.IGNORECASE)
+            if size_match and "headcount" not in result:
+                try:
+                    result["headcount"] = int(size_match.group(2).replace(",", ""))
+                except ValueError:
+                    pass
+            break
+
+    if result:
+        logger.info(f"Serper KG for {company_name}: {result}")
+    return result
+
+
 # ── Tech stack patterns ────────────────────────────────────────────────────
 
 _TECH_PATTERNS: dict[str, list[str]] = {
@@ -353,6 +415,7 @@ def synthesize_company_signals(
     tech_stack: list[str],
     job_board: dict,
     funding_news: list[str],
+    serper_kg: Optional[dict] = None,
 ) -> CompanySignalResult:
     """
     Send all company evidence to Gemini and receive a structured CompanySignalResult.
@@ -386,6 +449,22 @@ def synthesize_company_signals(
         else "No recent funding news found."
     )
 
+    kg = serper_kg or {}
+    kg_lines = []
+    if kg.get("kg_description"):
+        kg_lines.append(f"Description: {kg['kg_description']}")
+    if kg.get("founded"):
+        kg_lines.append(f"Founded: {kg['founded']}")
+    if kg.get("headquarters"):
+        kg_lines.append(f"HQ: {kg['headquarters']}")
+    if kg.get("ceo"):
+        kg_lines.append(f"CEO: {kg['ceo']}")
+    if kg.get("founder"):
+        kg_lines.append(f"Founder: {kg['founder']}")
+    if kg.get("headcount"):
+        kg_lines.append(f"Employees: ~{kg['headcount']}")
+    kg_block = "\n".join(kg_lines) if kg_lines else "No Knowledge Graph data available."
+
     prompt = f"""You are a B2B sales intelligence analyst. Extract factual signals from the evidence below.
 
 STRICT RULES:
@@ -405,6 +484,9 @@ JOB BOARD:
 
 RECENT FUNDING NEWS:
 {news_block}
+
+GOOGLE KNOWLEDGE GRAPH / LINKEDIN:
+{kg_block}
 
 COMPANY HOMEPAGE:
 {homepage_text or "Unavailable"}
@@ -543,14 +625,15 @@ async def enrich_company_signals(
     """
     logger.info(f"[{company_name}] Starting signal enrichment")
 
-    # Step 1 — parallel signal gathering
+    # Step 1 — parallel signal gathering (5 sources)
     ctx_task     = asyncio.create_task(fetch_company_context(domain))
     jobs_task    = asyncio.create_task(check_job_boards(company_name))
     news_task    = asyncio.create_task(fetch_funding_news(company_name))
     tech_task    = asyncio.create_task(detect_tech_stack(domain))
+    kg_task      = asyncio.create_task(fetch_serper_kg(company_name))
 
-    ctx, job_board, funding_news, tech_stack = await asyncio.gather(
-        ctx_task, jobs_task, news_task, tech_task
+    ctx, job_board, funding_news, tech_stack, serper_kg = await asyncio.gather(
+        ctx_task, jobs_task, news_task, tech_task, kg_task
     )
 
     homepage_text = ctx.get("homepage", "")
@@ -569,6 +652,7 @@ async def enrich_company_signals(
         tech_stack,
         job_board,
         funding_news,
+        serper_kg,
     )
 
     # Step 3 — Re-embed with richer text
@@ -595,18 +679,21 @@ async def enrich_company_signals(
         f"signals={len(result.buying_signals)}, hiring={job_board.get('count', 0)}"
     )
 
+    # Use Serper KG headcount as fallback if Gemini didn't extract one
+    headcount = result.headcount or serper_kg.get("headcount")
+
     return {
         "company_summary":          result.company_summary,
         "buying_signals":           result.buying_signals,
         "signal_score":             result.signal_score,
         "funding_stage":            result.funding_stage,
         "total_raised":             result.total_raised,
-        "headcount":                result.headcount,
+        "headcount":                headcount,
         "hiring_roles":             result.hiring_roles or job_board.get("roles", []),
         "hiring_count":             job_board.get("count") or len(result.hiring_roles),
         "tech_stack":               result.tech_stack or tech_stack,
         "description_embedding":    embedding,
-        "tsv_text":                 tsv_text,  # passed to runner for to_tsvector() update
+        "tsv_text":                 tsv_text,
         "signal_enriched_at":       datetime.now(timezone.utc),
         "signal_enrichment_status": "enriched" if result.company_summary else "failed",
     }
