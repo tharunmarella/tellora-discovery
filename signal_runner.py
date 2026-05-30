@@ -151,6 +151,24 @@ async def _process_batch(rows: list[dict], concurrency: int = 5) -> list[dict]:
 import json as _json
 
 
+SIGNALS_READY_KEY = "tellora:signals_ready"
+
+
+def _notify_signals_ready(domains: list[str]) -> None:
+    """Push enriched domains to Redis so the backend ARQ worker can re-run Gemini."""
+    if not domains:
+        return
+    try:
+        import redis as _redis
+        import settings as _cfg
+        r = _redis.from_url(_cfg.REDIS_URL, socket_connect_timeout=2)
+        for domain in domains:
+            r.rpush(SIGNALS_READY_KEY, domain)
+        logger.info(f"Pushed {len(domains)} domain(s) to {SIGNALS_READY_KEY}")
+    except Exception as exc:
+        logger.warning(f"Could not notify Redis after signal enrichment: {exc}")
+
+
 def _write_batch(session: Session, results: list[dict]) -> tuple[int, int]:
     """Write enrichment results to DB. Returns (success_count, fail_count)."""
     ok = fail = 0
@@ -244,6 +262,13 @@ async def run(limit: Optional[int], concurrency: int, batch_size: int, reset_fai
         with Session(engine) as session:
             ok, fail = _write_batch(session, results)
 
+        # Notify backend worker for successfully enriched domains
+        enriched_domains = [
+            rows[i]["domain"] for i, r in enumerate(results)
+            if r.get("signal_enrichment_status") != "failed" and rows[i].get("domain")
+        ]
+        _notify_signals_ready(enriched_domains)
+
         total_ok   += ok
         total_fail += fail
         processed  += len(rows)
@@ -277,6 +302,21 @@ async def run(limit: Optional[int], concurrency: int, batch_size: int, reset_fai
 
 # ── CLI ────────────────────────────────────────────────────────────────────
 
+async def run_daemon(poll_interval: int = 60) -> None:
+    """
+    Long-running daemon mode: poll for pending companies and process them,
+    then sleep and repeat. Stays alive indefinitely like an ARQ worker.
+    """
+    logger.info(f"Signal runner daemon starting (poll_interval={poll_interval}s)")
+    while True:
+        try:
+            await run(limit=None, concurrency=5, batch_size=50, reset_failed=False)
+        except Exception as exc:
+            logger.error(f"Run cycle failed: {exc}", exc_info=True)
+        logger.info(f"Sleeping {poll_interval}s before next poll...")
+        await asyncio.sleep(poll_interval)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run signal enrichment on all pending discovery_company rows."
@@ -297,18 +337,29 @@ def main() -> None:
         "--reset-failed", action="store_true",
         help="Reset companies with status=failed back to pending before running"
     )
+    parser.add_argument(
+        "--daemon", action="store_true",
+        help="Run as a long-lived daemon, polling for new work every --poll-interval seconds"
+    )
+    parser.add_argument(
+        "--poll-interval", type=int, default=60,
+        help="Seconds to sleep between polls in daemon mode (default: 60)"
+    )
     args = parser.parse_args()
 
     if not cfg.GEMINI_API_KEY:
         logger.error("GEMINI_API_KEY / GOOGLE_API_KEY is not set — cannot run signal enrichment")
         sys.exit(1)
 
-    asyncio.run(run(
-        limit=args.limit,
-        concurrency=args.concurrency,
-        batch_size=args.batch_size,
-        reset_failed=args.reset_failed,
-    ))
+    if args.daemon:
+        asyncio.run(run_daemon(poll_interval=args.poll_interval))
+    else:
+        asyncio.run(run(
+            limit=args.limit,
+            concurrency=args.concurrency,
+            batch_size=args.batch_size,
+            reset_failed=args.reset_failed,
+        ))
 
 
 if __name__ == "__main__":

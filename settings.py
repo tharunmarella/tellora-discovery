@@ -21,6 +21,9 @@ GEMINI_API_KEY: str = os.getenv("GOOGLE_API_KEY", os.getenv("GEMINI_API_KEY", ""
 # Falls back to DDG if not set.
 SERPER_API_KEY: str = os.getenv("SERPER_API_KEY", "")
 
+# Redis — used to notify the backend worker after company signals are enriched
+REDIS_URL: str = os.getenv("REDIS_URL", "redis://redis:6379")
+
 # Jina Reader API — used for fetching company website content (homepage, about, careers)
 # and funding news search. Get a free key with 10M tokens at https://jina.ai/reader
 # Falls back to unauthenticated requests (20 RPM) if not set.
