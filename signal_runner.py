@@ -1,12 +1,22 @@
 """
-Signal Enrichment Runner
+Signal Enrichment Runner — Manual Backfill CLI
+===============================================
 
-Batch-processes discovery_company rows that need signal enrichment.
-Mirrors the checkpoint architecture from service.py.
+One-shot batch tool for backfilling signal enrichment on pending
+discovery_company rows. Use this for:
+
+  - Initial data loads / migrations
+  - Manually retrying a large batch of failed companies
+  - Ad-hoc dev/test runs
+
+In production, new companies are enriched by the ARQ workers (see worker.py):
+  - arq:ondemand  → user-triggered (immediate, via backend enqueue)
+  - arq:bulk      → scrape-triggered (weekly Apollo run)
+  - reconciler    → cron safety-net in the bulk worker
 
 Usage:
-  python signal_runner.py              # process all pending
-  python signal_runner.py --limit 100  # test run: only 100 companies
+  python signal_runner.py                 # backfill all pending
+  python signal_runner.py --limit 100     # test run: only 100 companies
   python signal_runner.py --reset-failed  # retry previously failed
 
 Architecture:
@@ -15,15 +25,16 @@ Architecture:
   - Concurrency: 5 companies processed in parallel per batch (semaphore-limited)
   - After each batch: commit + log progress checkpoint to stdout
   - Rate limiting: 1s delay between companies within a batch
-  - Crash recovery: re-query pending rows — committed rows have status='enriched'
   - Companies with no domain: mark 'skipped'
 """
 
 import argparse
 import asyncio
+import json as _json
 import logging
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import create_engine, text
@@ -43,10 +54,13 @@ logger = logging.getLogger("signal_runner")
 # ── DB setup ───────────────────────────────────────────────────────────────
 
 def _make_engine():
-    return create_engine(cfg.DATABASE_URL, pool_pre_ping=True)
+    url = cfg.DATABASE_URL
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    return create_engine(url, pool_pre_ping=True)
 
 
-# ── Queries ────────────────────────────────────────────────────────────────
+# ── SQL statements ──────────────────────────────────────────────────────────
 
 _SELECT_PENDING = text("""
     SELECT id, name, domain, description, industry, raw_meta
@@ -56,13 +70,7 @@ _SELECT_PENDING = text("""
     AND    domain_resolved = true
     ORDER  BY created_at ASC
     LIMIT  :batch_size
-    OFFSET :offset
-""")
-
-_SELECT_NO_DOMAIN = text("""
-    SELECT id FROM discovery_company
-    WHERE  signal_enrichment_status = 'pending'
-    AND    (domain IS NULL OR domain_resolved = false)
+    OFFSET 0
 """)
 
 _COUNT_PENDING = text("""
@@ -70,6 +78,13 @@ _COUNT_PENDING = text("""
     WHERE  signal_enrichment_status = 'pending'
     AND    domain IS NOT NULL
     AND    domain_resolved = true
+""")
+
+_SKIP_NO_DOMAIN = text("""
+    UPDATE discovery_company
+    SET    signal_enrichment_status = 'skipped', updated_at = NOW()
+    WHERE  signal_enrichment_status = 'pending'
+    AND    (domain IS NULL OR domain_resolved = false)
 """)
 
 _UPDATE_SIGNAL = text("""
@@ -91,28 +106,71 @@ _UPDATE_SIGNAL = text("""
     WHERE id = :id
 """)
 
-_SKIP_NO_DOMAIN = text("""
-    UPDATE discovery_company
-    SET    signal_enrichment_status = 'skipped', updated_at = NOW()
-    WHERE  signal_enrichment_status = 'pending'
-    AND    (domain IS NULL OR domain_resolved = false)
-""")
+
+# ── Shared persist helper (used by both this runner and worker.py) ──────────
+
+def persist_result(session: Session, company_id: str, result: dict) -> bool:
+    """
+    Write a single enrichment result dict to discovery_company.
+    Returns True on success, False on DB error.
+
+    Called by _write_batch (batch runner) and directly by worker.py (ARQ task).
+    The result dict is the value returned by enrich_company_signals().
+    """
+    emb = result.get("description_embedding")
+    try:
+        session.execute(_UPDATE_SIGNAL, {
+            "id":                       company_id,
+            "company_summary":          result.get("company_summary"),
+            "buying_signals":           _json.dumps(result.get("buying_signals") or []),
+            "signal_score":             result.get("signal_score") or 0,
+            "funding_stage":            result.get("funding_stage"),
+            "total_raised":             result.get("total_raised"),
+            "headcount":                result.get("headcount"),
+            "hiring_roles":             _json.dumps(result.get("hiring_roles") or []),
+            "hiring_count":             result.get("hiring_count") or 0,
+            "tech_stack":               _json.dumps(result.get("tech_stack") or []),
+            "description_embedding":    _json.dumps(emb) if emb else None,
+            "tsv_text":                 (result.get("tsv_text") or "").strip() or " ",
+            "signal_enriched_at":       result.get("signal_enriched_at") or datetime.now(timezone.utc),
+            "signal_enrichment_status": result.get("signal_enrichment_status", "enriched"),
+        })
+        return True
+    except Exception as exc:
+        logger.error(f"DB write failed for {company_id}: {exc}")
+        return False
 
 
-# ── Batch worker ───────────────────────────────────────────────────────────
+SIGNALS_READY_KEY = "tellora:signals_ready"
+
+
+def _notify_signals_ready(domains: list[str]) -> None:
+    """Push enriched domains to Redis so the backend ARQ worker can re-queue waiting contacts."""
+    if not domains:
+        return
+    try:
+        import redis as _redis
+        r = _redis.from_url(cfg.REDIS_URL, socket_connect_timeout=2)
+        for domain in domains:
+            r.rpush(SIGNALS_READY_KEY, domain)
+        logger.info(f"Pushed {len(domains)} domain(s) to {SIGNALS_READY_KEY}")
+    except Exception as exc:
+        logger.warning(f"Could not notify Redis after signal enrichment: {exc}")
+
+
+# ── Batch processing ────────────────────────────────────────────────────────
 
 async def _process_company(row: dict, sem: asyncio.Semaphore) -> dict:
-    """Enrich a single company under the semaphore. Returns result dict."""
-    company_id   = row["id"]
+    """Enrich a single company under the semaphore. Returns result dict with 'id' set."""
+    company_id   = str(row["id"])
     company_name = row["name"]
-    domain       = row["domain"]
 
     async with sem:
         try:
             result = await enrich_company_signals(
                 company_id=company_id,
                 company_name=company_name,
-                domain=domain,
+                domain=row["domain"],
                 description=row.get("description"),
                 industry=row.get("industry"),
                 raw_meta=row.get("raw_meta"),
@@ -135,80 +193,34 @@ async def _process_company(row: dict, sem: asyncio.Semaphore) -> dict:
                 "signal_enriched_at": None,
             }
         result["id"] = company_id
-        # Brief pause after each company to be polite to external APIs
         await asyncio.sleep(1)
         return result
 
 
 async def _process_batch(rows: list[dict], concurrency: int = 5) -> list[dict]:
     sem = asyncio.Semaphore(concurrency)
-    tasks = [_process_company(row, sem) for row in rows]
-    return await asyncio.gather(*tasks)
-
-
-# ── DB write ───────────────────────────────────────────────────────────────
-
-import json as _json
-
-
-SIGNALS_READY_KEY = "tellora:signals_ready"
-
-
-def _notify_signals_ready(domains: list[str]) -> None:
-    """Push enriched domains to Redis so the backend ARQ worker can re-run Gemini."""
-    if not domains:
-        return
-    try:
-        import redis as _redis
-        import settings as _cfg
-        r = _redis.from_url(_cfg.REDIS_URL, socket_connect_timeout=2)
-        for domain in domains:
-            r.rpush(SIGNALS_READY_KEY, domain)
-        logger.info(f"Pushed {len(domains)} domain(s) to {SIGNALS_READY_KEY}")
-    except Exception as exc:
-        logger.warning(f"Could not notify Redis after signal enrichment: {exc}")
+    return await asyncio.gather(*[_process_company(row, sem) for row in rows])
 
 
 def _write_batch(session: Session, results: list[dict]) -> tuple[int, int]:
-    """Write enrichment results to DB. Returns (success_count, fail_count)."""
+    """Write a batch of enrichment results. Returns (success_count, fail_count)."""
     ok = fail = 0
     for r in results:
-        emb = r.get("description_embedding")
-        try:
-            session.execute(_UPDATE_SIGNAL, {
-                "id":                       r["id"],
-                "company_summary":          r.get("company_summary"),
-                "buying_signals":           _json.dumps(r.get("buying_signals") or []),
-                "signal_score":             r.get("signal_score") or 0,
-                "funding_stage":            r.get("funding_stage"),
-                "total_raised":             r.get("total_raised"),
-                "headcount":                r.get("headcount"),
-                "hiring_roles":             _json.dumps(r.get("hiring_roles") or []),
-                "hiring_count":             r.get("hiring_count") or 0,
-                "tech_stack":               _json.dumps(r.get("tech_stack") or []),
-                "description_embedding":    _json.dumps(emb) if emb else None,
-                "tsv_text":                 (r.get("tsv_text") or "").strip() or " ",
-                "signal_enriched_at":       r.get("signal_enriched_at"),
-                "signal_enrichment_status": r.get("signal_enrichment_status", "enriched"),
-            })
-            if r.get("signal_enrichment_status") != "failed":
-                ok += 1
-            else:
-                fail += 1
-        except Exception as exc:
-            logger.error(f"DB write failed for {r['id']}: {exc}")
+        success = persist_result(session, r["id"], r)
+        if success and r.get("signal_enrichment_status") != "failed":
+            ok += 1
+        else:
             fail += 1
     session.commit()
     return ok, fail
 
 
-# ── Main runner ────────────────────────────────────────────────────────────
+# ── Main runner (one-shot backfill) ────────────────────────────────────────
 
 async def run(limit: Optional[int], concurrency: int, batch_size: int, reset_failed: bool) -> None:
     engine = _make_engine()
 
     with Session(engine) as session:
-        # Optionally reset previously failed companies to pending
         if reset_failed:
             count = session.execute(text(
                 "UPDATE discovery_company SET signal_enrichment_status = 'pending' "
@@ -217,13 +229,11 @@ async def run(limit: Optional[int], concurrency: int, batch_size: int, reset_fai
             session.commit()
             logger.info(f"Reset {count} failed companies to pending")
 
-        # Mark companies without a domain as skipped
         skipped = session.execute(_SKIP_NO_DOMAIN).rowcount
         session.commit()
         if skipped:
             logger.info(f"Skipped {skipped} companies with no resolved domain")
 
-        # Count total to process
         total_pending = session.execute(_COUNT_PENDING).scalar() or 0
         if limit:
             total_pending = min(total_pending, limit)
@@ -232,23 +242,24 @@ async def run(limit: Optional[int], concurrency: int, batch_size: int, reset_fai
             logger.info("No companies pending signal enrichment. Exiting.")
             return
 
-        logger.info(f"Starting signal enrichment for {total_pending} companies "
-                    f"(batch_size={batch_size}, concurrency={concurrency})")
+        logger.info(
+            f"Starting signal enrichment for {total_pending} companies "
+            f"(batch_size={batch_size}, concurrency={concurrency})"
+        )
 
     total_ok   = 0
     total_fail = 0
     processed  = 0
-    offset     = 0
     start_time = time.time()
 
     while processed < total_pending:
-        remaining = total_pending - processed
+        remaining  = total_pending - processed
         this_batch = min(batch_size, remaining)
 
         with Session(engine) as session:
             rows_raw = session.execute(
                 _SELECT_PENDING,
-                {"batch_size": this_batch, "offset": 0}  # always offset=0 since processed rows get updated
+                {"batch_size": this_batch},
             ).mappings().all()
             rows = [dict(r) for r in rows_raw]
 
@@ -256,13 +267,11 @@ async def run(limit: Optional[int], concurrency: int, batch_size: int, reset_fai
             logger.info("No more pending rows — done.")
             break
 
-        batch_start = time.time()
         results = await _process_batch(rows, concurrency=concurrency)
 
         with Session(engine) as session:
             ok, fail = _write_batch(session, results)
 
-        # Notify backend worker for successfully enriched domains
         enriched_domains = [
             rows[i]["domain"] for i, r in enumerate(results)
             if r.get("signal_enrichment_status") != "failed" and rows[i].get("domain")
@@ -275,23 +284,22 @@ async def run(limit: Optional[int], concurrency: int, batch_size: int, reset_fai
         elapsed     = time.time() - start_time
         rate        = processed / elapsed if elapsed > 0 else 0
 
-        logger.info(
-            f"Batch done: {processed}/{total_pending} companies processed | "
-            f"ok={ok} fail={fail} | "
-            f"rate={rate:.1f}/s | "
-            f"eta={((total_pending - processed) / rate / 60):.0f}min"
-            if rate > 0 else
-            f"Batch done: {processed}/{total_pending} | ok={ok} fail={fail}"
-        )
+        if rate > 0:
+            eta_min = (total_pending - processed) / rate / 60
+            logger.info(
+                f"Batch done: {processed}/{total_pending} | "
+                f"ok={ok} fail={fail} | rate={rate:.1f}/s | eta={eta_min:.0f}min"
+            )
+        else:
+            logger.info(f"Batch done: {processed}/{total_pending} | ok={ok} fail={fail}")
 
-        # 2s cooldown between batches to give APIs breathing room
         if processed < total_pending:
             await asyncio.sleep(2)
 
     total_elapsed = time.time() - start_time
     logger.info(
         f"\n{'='*60}\n"
-        f"Signal enrichment complete!\n"
+        f"Signal enrichment backfill complete!\n"
         f"  Total processed : {processed}\n"
         f"  Enriched (ok)   : {total_ok}\n"
         f"  Failed          : {total_fail}\n"
@@ -302,24 +310,12 @@ async def run(limit: Optional[int], concurrency: int, batch_size: int, reset_fai
 
 # ── CLI ────────────────────────────────────────────────────────────────────
 
-async def run_daemon(poll_interval: int = 60) -> None:
-    """
-    Long-running daemon mode: poll for pending companies and process them,
-    then sleep and repeat. Stays alive indefinitely like an ARQ worker.
-    """
-    logger.info(f"Signal runner daemon starting (poll_interval={poll_interval}s)")
-    while True:
-        try:
-            await run(limit=None, concurrency=5, batch_size=50, reset_failed=False)
-        except Exception as exc:
-            logger.error(f"Run cycle failed: {exc}", exc_info=True)
-        logger.info(f"Sleeping {poll_interval}s before next poll...")
-        await asyncio.sleep(poll_interval)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run signal enrichment on all pending discovery_company rows."
+        description=(
+            "One-shot backfill: run signal enrichment on pending discovery_company rows. "
+            "For production use, see worker.py (ARQ-based on-demand + bulk workers)."
+        )
     )
     parser.add_argument(
         "--limit", type=int, default=None,
@@ -337,29 +333,18 @@ def main() -> None:
         "--reset-failed", action="store_true",
         help="Reset companies with status=failed back to pending before running"
     )
-    parser.add_argument(
-        "--daemon", action="store_true",
-        help="Run as a long-lived daemon, polling for new work every --poll-interval seconds"
-    )
-    parser.add_argument(
-        "--poll-interval", type=int, default=60,
-        help="Seconds to sleep between polls in daemon mode (default: 60)"
-    )
     args = parser.parse_args()
 
     if not cfg.GEMINI_API_KEY:
         logger.error("GEMINI_API_KEY / GOOGLE_API_KEY is not set — cannot run signal enrichment")
         sys.exit(1)
 
-    if args.daemon:
-        asyncio.run(run_daemon(poll_interval=args.poll_interval))
-    else:
-        asyncio.run(run(
-            limit=args.limit,
-            concurrency=args.concurrency,
-            batch_size=args.batch_size,
-            reset_failed=args.reset_failed,
-        ))
+    asyncio.run(run(
+        limit=args.limit,
+        concurrency=args.concurrency,
+        batch_size=args.batch_size,
+        reset_failed=args.reset_failed,
+    ))
 
 
 if __name__ == "__main__":

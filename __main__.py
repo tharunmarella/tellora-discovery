@@ -39,11 +39,39 @@ def main() -> None:
     total = stats.get("total", 0)
     logger.info(f"Done. {total} new companies added. Per-profile: {stats}")
 
-    # Run signal enrichment for all pending companies after Apollo scrape
+    # Enqueue signal enrichment for all pending companies onto the bulk ARQ queue.
+    # The bulk worker (arq worker.BulkWorkerSettings) will process them; the
+    # reconciler cron provides a safety net for any that are dropped.
     if not dry_run and total > 0:
-        logger.info("Starting signal enrichment for newly scraped companies...")
-        from signal_runner import run as run_signals
-        asyncio.run(run_signals(limit=None, concurrency=5, batch_size=50, reset_failed=False))
+        logger.info("Enqueueing signal enrichment jobs for newly scraped companies...")
+        from sqlalchemy import text as _text
+        from database import engine as _engine
+        from sqlalchemy.orm import Session as _Session
+        import arq as _arq
+        from arq.connections import RedisSettings as _RedisSettings
+        import settings as _cfg
+        import asyncio as _asyncio
+
+        with _Session(_engine) as _db:
+            pending_ids = [
+                str(r[0]) for r in _db.execute(_text(
+                    "SELECT id FROM discovery_company "
+                    "WHERE signal_enrichment_status = 'pending' "
+                    "AND domain IS NOT NULL AND domain_resolved = true"
+                )).all()
+            ]
+
+        async def _enqueue_bulk():
+            pool = await _arq.create_pool(
+                _RedisSettings.from_dsn(_cfg.REDIS_URL),
+                default_queue_name="arq:bulk",
+            )
+            for company_id in pending_ids:
+                await pool.enqueue_job("enrich_company_task", company_id)
+            await pool.aclose()
+            logger.info(f"Enqueued {len(pending_ids)} companies onto arq:bulk")
+
+        _asyncio.run(_enqueue_bulk())
 
     sys.exit(0)
 
