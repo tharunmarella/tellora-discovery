@@ -9,10 +9,9 @@ discovery_company rows. Use this for:
   - Manually retrying a large batch of failed companies
   - Ad-hoc dev/test runs
 
-In production, new companies are enriched by the ARQ worker (see worker.py):
-  - arq:discovery → all enrichment (user-triggered via backend enqueue +
-                    scrape-triggered weekly Apollo run)
-  - reconciler    → cron safety-net in the worker
+In production, enrichment runs in two disjoint places:
+  - Weekly discovery cron (__main__.py) → scrapes + enriches inline via run()
+  - Signal worker (worker.py, arq:ondemand) → user-triggered on-demand enrich
 
 Usage:
   python signal_runner.py                 # backfill all pending
@@ -314,7 +313,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "One-shot backfill: run signal enrichment on pending discovery_company rows. "
-            "For production use, see worker.py (ARQ-based on-demand + bulk workers)."
+            "Also used inline by the weekly discovery job (__main__.py)."
         )
     )
     parser.add_argument(

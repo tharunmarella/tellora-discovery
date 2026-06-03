@@ -1,16 +1,16 @@
 """
-Tellora Discovery ARQ Worker
-============================
+Tellora Discovery ARQ Worker — On-Demand Enrichment
+===================================================
 
-A single worker pool listens on one queue and handles all enrichment —
-both user-triggered ("Enrich" clicks) and batch/scrape-triggered — plus the
-reconciler cron:
+Always-on worker that serves user-triggered (on-demand) enrichment from the
+app — both single "Enrich" clicks and bulk on-demand actions (select-many →
+enrich). The backend enqueues enrich_company_task onto arq:ondemand.
 
-  arq:discovery  ← all enrichment jobs (enrich_company_task)
+  arq:ondemand  ← user-triggered enrichment (single + bulk on-demand)
 
-If bulk volume ever grows enough to delay user-triggered enrichment, split
-this back into separate on-demand/bulk pools on dedicated queues (ARQ has no
-in-queue priority, so isolation requires separate queues + processes).
+This is intentionally disjoint from the weekly discovery job: the discovery
+service (python __main__.py) scrapes AND enriches its own companies inline, so
+nothing here ever blocks behind the weekly batch (and vice versa).
 
 Running:
   arq worker.WorkerSettings
@@ -19,7 +19,6 @@ Running:
 import logging
 
 import redis.asyncio as aioredis
-from arq import cron
 from arq.connections import RedisSettings
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
@@ -61,16 +60,6 @@ _MARK_FAILED = text("""
     WHERE  id = :company_id
 """)
 
-# Reconciler: find rows stuck at 'pending' or 'processing' for >15 min
-_STALE_PENDING = text("""
-    SELECT id FROM discovery_company
-    WHERE  signal_enrichment_status IN ('pending', 'processing')
-    AND    domain IS NOT NULL
-    AND    domain_resolved = true
-    AND    updated_at < NOW() - INTERVAL '15 minutes'
-    LIMIT  100
-""")
-
 
 # ── Core task ───────────────────────────────────────────────────────────────
 
@@ -79,7 +68,7 @@ async def enrich_company_task(ctx, company_id: str) -> dict:
     Enrich a single company. Safe to enqueue multiple times — the atomic
     'pending → processing' claim ensures only one worker does the work.
 
-    Used by both the on-demand and bulk worker pools.
+    Enqueued by the backend for user-triggered (on-demand) enrichment.
     """
     logger.info(f"[enrich_company_task] Starting for company_id={company_id}")
 
@@ -130,43 +119,6 @@ async def enrich_company_task(ctx, company_id: str) -> dict:
     return {"ok": True, "company_id": company_id, "signal_score": result.get("signal_score")}
 
 
-# ── Reconciler cron (runs in bulk worker only) ──────────────────────────────
-
-async def reconcile_pending_task(ctx) -> dict:
-    """
-    Safety-net cron: find companies stuck at 'pending' or 'processing' for
-    >15 min (missed/dropped enqueue, or worker crash mid-job) and re-enqueue
-    them onto arq:discovery.
-
-    Runs every 10 minutes in the worker.
-    """
-    with Session(_engine) as session:
-        rows = session.execute(_STALE_PENDING).mappings().all()
-        stale_ids = [str(r["id"]) for r in rows]
-
-    if not stale_ids:
-        return {"reconciled": 0}
-
-    logger.info(f"[reconcile_pending_task] Re-enqueueing {len(stale_ids)} stale companies onto arq:discovery")
-
-    pool = ctx.get("redis")
-    if pool is None:
-        logger.warning("[reconcile_pending_task] No Redis pool in ctx, skipping re-enqueue")
-        return {"reconciled": 0}
-
-    import arq
-    discovery_pool = await arq.create_pool(
-        RedisSettings.from_dsn(cfg.REDIS_URL),
-        default_queue_name="arq:discovery",
-    )
-    for company_id in stale_ids:
-        await discovery_pool.enqueue_job("enrich_company_task", company_id)
-    await discovery_pool.aclose()
-
-    logger.info(f"[reconcile_pending_task] Re-enqueued {len(stale_ids)} companies")
-    return {"reconciled": len(stale_ids)}
-
-
 # ── ARQ lifecycle hooks ─────────────────────────────────────────────────────
 
 async def startup(ctx):
@@ -186,19 +138,15 @@ _redis_settings = RedisSettings.from_dsn(cfg.REDIS_URL)
 
 class WorkerSettings:
     """
-    Single discovery worker pool: listens on arq:discovery and handles both
-    user-triggered (on-demand) and batch/scrape-triggered enrichment, plus the
-    reconciler cron. Split into separate pools later if bulk volume starts
-    delaying user-triggered "Enrich" requests.
+    On-demand enrichment worker: listens on arq:ondemand for user-triggered
+    enrichment (single "Enrich" clicks + bulk on-demand actions) enqueued by
+    the backend. Stays disjoint from the weekly discovery job, which scrapes
+    and enriches its own companies inline.
     """
-    functions = [enrich_company_task, reconcile_pending_task]
-    queue_name = "arq:discovery"
+    functions = [enrich_company_task]
+    queue_name = "arq:ondemand"
     redis_settings = _redis_settings
     on_startup = startup
     on_shutdown = shutdown
     max_jobs = 5
     job_timeout = 600
-    cron_jobs = [
-        # Reconciler: re-enqueue stale/dropped companies every 10 minutes
-        cron(reconcile_pending_task, minute={0, 10, 20, 30, 40, 50}),
-    ]

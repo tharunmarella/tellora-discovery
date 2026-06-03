@@ -1,9 +1,13 @@
 """
 Tellora Discovery Service — entry point.
 
+Self-contained weekly job: scrapes Apollo AND enriches everything it scraped,
+end-to-end, in one process. It does NOT depend on the signal-worker — the
+signal-worker only serves user-triggered (on-demand) enrichment from the app.
+
 Usage:
-  python __main__.py           # run the scrape
-  python __main__.py --dry-run # 2 pages per profile, no writes
+  python __main__.py           # scrape + enrich all newly scraped companies
+  python __main__.py --dry-run # 2 pages per profile, no writes, no enrichment
 
 Railway cron schedule: 0 3 * * 0  (every Sunday 3 AM UTC)
 """
@@ -18,11 +22,33 @@ setup_logging()
 logger = logging.getLogger("discovery")
 
 
+async def _scrape_and_enrich(dry_run: bool) -> None:
+    """Run the Apollo scrape, then enrich the newly-pending companies inline."""
+    from service import run_discovery_scrape
+    stats = await run_discovery_scrape()
+    total = stats.get("total", 0)
+    logger.info(f"Scrape done. {total} new companies added. Per-profile: {stats}")
+
+    if dry_run or total <= 0:
+        return
+
+    # Enrich inline — the discovery job owns its companies end-to-end rather than
+    # handing them off to the always-on signal-worker. signal_runner.run() pulls
+    # every pending row (batched + concurrency-limited) and persists the signals.
+    logger.info("Enriching newly scraped companies inline...")
+    from signal_runner import run as run_enrichment
+    await run_enrichment(limit=None, concurrency=5, batch_size=50, reset_failed=False)
+
+
 def main() -> None:
     dry_run = "--dry-run" in sys.argv
 
     # Validate env first — fail fast before doing any work
     import settings as cfg  # noqa — triggers _require() validation
+
+    if not cfg.GEMINI_API_KEY:
+        logger.error("GEMINI_API_KEY / GOOGLE_API_KEY is not set — cannot enrich signals")
+        sys.exit(1)
 
     # Ensure tables exist (idempotent — CREATE TABLE IF NOT EXISTS)
     from database import create_tables
@@ -33,46 +59,7 @@ def main() -> None:
         import settings
         settings.MAX_PAGES_PER_PROFILE = 2
 
-    from service import run_discovery_scrape
-    stats = asyncio.run(run_discovery_scrape())
-
-    total = stats.get("total", 0)
-    logger.info(f"Done. {total} new companies added. Per-profile: {stats}")
-
-    # Enqueue signal enrichment for all pending companies onto the discovery
-    # ARQ queue. The worker (arq worker.WorkerSettings) will process them; the
-    # reconciler cron provides a safety net for any that are dropped.
-    if not dry_run and total > 0:
-        logger.info("Enqueueing signal enrichment jobs for newly scraped companies...")
-        from sqlalchemy import text as _text
-        from database import engine as _engine
-        from sqlalchemy.orm import Session as _Session
-        import arq as _arq
-        from arq.connections import RedisSettings as _RedisSettings
-        import settings as _cfg
-        import asyncio as _asyncio
-
-        with _Session(_engine) as _db:
-            pending_ids = [
-                str(r[0]) for r in _db.execute(_text(
-                    "SELECT id FROM discovery_company "
-                    "WHERE signal_enrichment_status = 'pending' "
-                    "AND domain IS NOT NULL AND domain_resolved = true"
-                )).all()
-            ]
-
-        async def _enqueue_discovery():
-            pool = await _arq.create_pool(
-                _RedisSettings.from_dsn(_cfg.REDIS_URL),
-                default_queue_name="arq:discovery",
-            )
-            for company_id in pending_ids:
-                await pool.enqueue_job("enrich_company_task", company_id)
-            await pool.aclose()
-            logger.info(f"Enqueued {len(pending_ids)} companies onto arq:discovery")
-
-        _asyncio.run(_enqueue_discovery())
-
+    asyncio.run(_scrape_and_enrich(dry_run))
     sys.exit(0)
 
 
