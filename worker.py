@@ -1,20 +1,19 @@
 """
-Tellora Discovery ARQ Workers
-==============================
+Tellora Discovery ARQ Worker
+============================
 
-Two worker pools share one task function (`enrich_company_task`) but listen
-on different queues:
+A single worker pool listens on one queue and handles all enrichment —
+both user-triggered ("Enrich" clicks) and batch/scrape-triggered — plus the
+reconciler cron:
 
-  arq:ondemand  ← user-triggered enrichment (low volume, must be fast)
-  arq:bulk      ← batch/scrape-triggered enrichment (high volume, latency-tolerant)
+  arq:discovery  ← all enrichment jobs (enrich_company_task)
 
-Priority = isolation: the on-demand pool is always available; it never queues
-behind a bulk backlog. ARQ has no in-queue priority, so we use separate queues
-and separate worker processes.
+If bulk volume ever grows enough to delay user-triggered enrichment, split
+this back into separate on-demand/bulk pools on dedicated queues (ARQ has no
+in-queue priority, so isolation requires separate queues + processes).
 
 Running:
-  arq worker.OnDemandWorkerSettings   # on-demand pool
-  arq worker.BulkWorkerSettings       # bulk pool (includes reconciler cron)
+  arq worker.WorkerSettings
 """
 
 import logging
@@ -137,9 +136,9 @@ async def reconcile_pending_task(ctx) -> dict:
     """
     Safety-net cron: find companies stuck at 'pending' or 'processing' for
     >15 min (missed/dropped enqueue, or worker crash mid-job) and re-enqueue
-    them onto arq:bulk.
+    them onto arq:discovery.
 
-    Runs every 10 minutes in the bulk worker.
+    Runs every 10 minutes in the worker.
     """
     with Session(_engine) as session:
         rows = session.execute(_STALE_PENDING).mappings().all()
@@ -148,7 +147,7 @@ async def reconcile_pending_task(ctx) -> dict:
     if not stale_ids:
         return {"reconciled": 0}
 
-    logger.info(f"[reconcile_pending_task] Re-enqueueing {len(stale_ids)} stale companies onto arq:bulk")
+    logger.info(f"[reconcile_pending_task] Re-enqueueing {len(stale_ids)} stale companies onto arq:discovery")
 
     pool = ctx.get("redis")
     if pool is None:
@@ -156,13 +155,13 @@ async def reconcile_pending_task(ctx) -> dict:
         return {"reconciled": 0}
 
     import arq
-    bulk_pool = await arq.create_pool(
+    discovery_pool = await arq.create_pool(
         RedisSettings.from_dsn(cfg.REDIS_URL),
-        default_queue_name="arq:bulk",
+        default_queue_name="arq:discovery",
     )
     for company_id in stale_ids:
-        await bulk_pool.enqueue_job("enrich_company_task", company_id)
-    await bulk_pool.aclose()
+        await discovery_pool.enqueue_job("enrich_company_task", company_id)
+    await discovery_pool.aclose()
 
     logger.info(f"[reconcile_pending_task] Re-enqueued {len(stale_ids)} companies")
     return {"reconciled": len(stale_ids)}
@@ -185,27 +184,15 @@ _redis_settings = RedisSettings.from_dsn(cfg.REDIS_URL)
 
 # ── Worker settings ─────────────────────────────────────────────────────────
 
-class OnDemandWorkerSettings:
+class WorkerSettings:
     """
-    On-demand worker pool: listens on arq:ondemand.
-    Keep replicas fixed (1–2). Never scales with bulk backlog.
-    """
-    functions = [enrich_company_task]
-    queue_name = "arq:ondemand"
-    redis_settings = _redis_settings
-    on_startup = startup
-    on_shutdown = shutdown
-    max_jobs = 5
-    job_timeout = 600
-
-
-class BulkWorkerSettings:
-    """
-    Bulk worker pool: listens on arq:bulk.
-    Includes the reconciler cron. Scale replicas manually against API quotas.
+    Single discovery worker pool: listens on arq:discovery and handles both
+    user-triggered (on-demand) and batch/scrape-triggered enrichment, plus the
+    reconciler cron. Split into separate pools later if bulk volume starts
+    delaying user-triggered "Enrich" requests.
     """
     functions = [enrich_company_task, reconcile_pending_task]
-    queue_name = "arq:bulk"
+    queue_name = "arq:discovery"
     redis_settings = _redis_settings
     on_startup = startup
     on_shutdown = shutdown

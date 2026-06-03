@@ -39,8 +39,8 @@ def main() -> None:
     total = stats.get("total", 0)
     logger.info(f"Done. {total} new companies added. Per-profile: {stats}")
 
-    # Enqueue signal enrichment for all pending companies onto the bulk ARQ queue.
-    # The bulk worker (arq worker.BulkWorkerSettings) will process them; the
+    # Enqueue signal enrichment for all pending companies onto the discovery
+    # ARQ queue. The worker (arq worker.WorkerSettings) will process them; the
     # reconciler cron provides a safety net for any that are dropped.
     if not dry_run and total > 0:
         logger.info("Enqueueing signal enrichment jobs for newly scraped companies...")
@@ -61,17 +61,17 @@ def main() -> None:
                 )).all()
             ]
 
-        async def _enqueue_bulk():
+        async def _enqueue_discovery():
             pool = await _arq.create_pool(
                 _RedisSettings.from_dsn(_cfg.REDIS_URL),
-                default_queue_name="arq:bulk",
+                default_queue_name="arq:discovery",
             )
             for company_id in pending_ids:
                 await pool.enqueue_job("enrich_company_task", company_id)
             await pool.aclose()
-            logger.info(f"Enqueued {len(pending_ids)} companies onto arq:bulk")
+            logger.info(f"Enqueued {len(pending_ids)} companies onto arq:discovery")
 
-        _asyncio.run(_enqueue_bulk())
+        _asyncio.run(_enqueue_discovery())
 
     sys.exit(0)
 

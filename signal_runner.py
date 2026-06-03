@@ -9,10 +9,10 @@ discovery_company rows. Use this for:
   - Manually retrying a large batch of failed companies
   - Ad-hoc dev/test runs
 
-In production, new companies are enriched by the ARQ workers (see worker.py):
-  - arq:ondemand  → user-triggered (immediate, via backend enqueue)
-  - arq:bulk      → scrape-triggered (weekly Apollo run)
-  - reconciler    → cron safety-net in the bulk worker
+In production, new companies are enriched by the ARQ worker (see worker.py):
+  - arq:discovery → all enrichment (user-triggered via backend enqueue +
+                    scrape-triggered weekly Apollo run)
+  - reconciler    → cron safety-net in the worker
 
 Usage:
   python signal_runner.py                 # backfill all pending
