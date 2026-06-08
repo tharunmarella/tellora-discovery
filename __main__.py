@@ -39,6 +39,12 @@ async def _scrape_and_enrich(dry_run: bool) -> None:
     from signal_runner import run as run_enrichment
     await run_enrichment(limit=None, concurrency=5, batch_size=50, reset_failed=False)
 
+    # Backfill headcount on older Apollo rows still missing it (free people-search proxy).
+    logger.info("Backfilling Apollo headcount estimates for rows missing headcount...")
+    from signal_enrichment import backfill_apollo_headcounts
+    stats_hc = await backfill_apollo_headcounts()
+    logger.info(f"Headcount backfill: {stats_hc}")
+
 
 def main() -> None:
     dry_run = "--dry-run" in sys.argv

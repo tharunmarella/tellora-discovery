@@ -51,7 +51,7 @@ _CLAIM_AND_LOAD = text("""
            updated_at               = NOW()
     WHERE  id = :company_id
     AND    signal_enrichment_status = 'pending'
-    RETURNING id, name, domain, description, industry, raw_meta
+    RETURNING id, name, domain, description, industry, raw_meta, headcount
 """)
 
 _MARK_FAILED = text("""
@@ -91,6 +91,7 @@ async def enrich_company_task(ctx, company_id: str) -> dict:
             description=row.get("description"),
             industry=row.get("industry"),
             raw_meta=row.get("raw_meta"),
+            existing_headcount=row.get("headcount"),
         )
     except Exception as exc:
         logger.error(f"[enrich_company_task] Enrichment failed for {company_name}: {exc}", exc_info=True)

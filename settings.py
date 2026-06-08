@@ -32,3 +32,9 @@ JINA_API_KEY: str = os.getenv("JINA_API_KEY", "")
 # Max pages to scrape per profile per run (100 results/page → 50,000 max).
 # Override in env for testing: MAX_PAGES_PER_PROFILE=5
 MAX_PAGES_PER_PROFILE: int = int(os.getenv("MAX_PAGES_PER_PROFILE", "500"))
+
+# Apollo free people-count → headcount proxy (total_entries × factor).
+APOLLO_HEADCOUNT_FACTOR: float = float(os.getenv("APOLLO_HEADCOUNT_FACTOR", "1.0") or "1.0")
+
+# Weekly backfill: max Apollo rows to headcount-fill per cron run (rate-limited).
+HEADCOUNT_BACKFILL_LIMIT: int = int(os.getenv("HEADCOUNT_BACKFILL_LIMIT", "1000"))

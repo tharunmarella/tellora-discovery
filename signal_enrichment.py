@@ -42,6 +42,66 @@ _HTTP_TIMEOUT = 8.0
 _DOMAIN_CACHE: dict[str, tuple[float, dict]] = {}
 _DOMAIN_CACHE_TTL = 3600  # 1 hour
 
+# Apollo's free people-search returns total_entries (contacts Apollo knows at a
+# company). It is NOT headcount, but scales with company size, so we use it as a
+# last-resort headcount proxy when Gemini + Serper KG give us nothing. The factor
+# converts "contacts Apollo has" → "approx employees" (rough; tune via env).
+APOLLO_HEADCOUNT_FACTOR = float(getattr(cfg, "APOLLO_HEADCOUNT_FACTOR", 1.0) or 1.0)
+
+
+async def backfill_apollo_headcounts(limit: int | None = None) -> dict:
+    """
+    Weekly cron helper: fill headcount on Apollo-sourced discovery_company rows
+    that are missing it, using the free people-search proxy. Does not re-run
+    full signal enrichment.
+    """
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.orm import Session
+
+    cap = limit if limit is not None else int(getattr(cfg, "HEADCOUNT_BACKFILL_LIMIT", 1000))
+    url = cfg.DATABASE_URL
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    engine = create_engine(url, pool_pre_ping=True)
+
+    _select = text("""
+        SELECT id, domain, name
+        FROM   discovery_company
+        WHERE  domain IS NOT NULL
+        AND    (source = 'apollo' OR source IS NULL)
+        AND    (headcount IS NULL OR headcount = 0)
+        ORDER  BY updated_at DESC
+        LIMIT  :lim
+    """)
+    _update = text("""
+        UPDATE discovery_company
+        SET    headcount = :hc, updated_at = NOW()
+        WHERE  id = :id
+    """)
+
+    filled = skipped = 0
+    with Session(engine) as session:
+        rows = session.execute(_select, {"lim": cap}).mappings().all()
+        logger.info(f"[headcount_backfill] {len(rows)} Apollo rows to process (cap={cap})")
+        for row in rows:
+            domain = row["domain"]
+            if not domain:
+                skipped += 1
+                continue
+            res = await fetch_apollo_headcount(domain)
+            hc = res.get("headcount_estimate")
+            if hc:
+                session.execute(_update, {"hc": hc, "id": row["id"]})
+                filled += 1
+                logger.info(f"[headcount_backfill] {row['name']} ({domain}) → {hc}")
+            else:
+                skipped += 1
+            await asyncio.sleep(1.1)  # pace with Apollo free-tier limits
+        session.commit()
+
+    logger.info(f"[headcount_backfill] done — filled={filled}, skipped={skipped}")
+    return {"filled": filled, "skipped": skipped, "processed": len(rows)}
+
 _gemini_client = None
 
 
@@ -113,6 +173,54 @@ async def fetch_serper_kg(company_name: str) -> dict:
     if result:
         logger.info(f"Serper KG for {company_name}: {result}")
     return result
+
+
+# ── Apollo free people-count headcount proxy ───────────────────────────────
+
+def _round_headcount(n: int) -> int:
+    """Round to a tidy magnitude so an estimate doesn't look falsely precise."""
+    if n <= 0:
+        return 0
+    if n < 100:
+        return max(10, round(n / 10) * 10)
+    if n < 1000:
+        return round(n / 50) * 50
+    return round(n / 100) * 100
+
+
+async def fetch_apollo_headcount(domain: str) -> dict:
+    """
+    Free Apollo people-search by domain → total_entries (contacts Apollo has at
+    the company). Used only as a last-resort headcount proxy: estimate ≈
+    total_entries × APOLLO_HEADCOUNT_FACTOR. Costs no Apollo credits.
+
+    Returns {"apollo_people_count": int, "headcount_estimate": int} or {}.
+    """
+    if not domain or not getattr(cfg, "TELLORA_APOLLO_API_KEY", None):
+        return {}
+    try:
+        from apollo_client import search_page
+        data = await search_page(
+            cfg.TELLORA_APOLLO_API_KEY,
+            {"q_organization_domains_list": [domain]},
+            page=1,
+            per_page=1,
+        )
+    except Exception as exc:
+        logger.warning(f"Apollo headcount lookup failed for '{domain}': {exc}")
+        return {}
+
+    total = data.get("total_entries") or data.get("pagination", {}).get("total_entries") or 0
+    try:
+        total = int(total)
+    except (TypeError, ValueError):
+        total = 0
+    if total <= 0:
+        return {}
+
+    estimate = _round_headcount(int(total * APOLLO_HEADCOUNT_FACTOR))
+    logger.info(f"Apollo headcount proxy for {domain}: people={total} → ~{estimate} employees")
+    return {"apollo_people_count": total, "headcount_estimate": estimate}
 
 
 # ── Tech stack patterns ────────────────────────────────────────────────────
@@ -612,6 +720,7 @@ async def enrich_company_signals(
     description: Optional[str],
     industry: Optional[str],
     raw_meta: Optional[dict],
+    existing_headcount: Optional[int] = None,
 ) -> dict:
     """
     Full signal enrichment for one company. Returns a dict ready to write
@@ -630,11 +739,18 @@ async def enrich_company_signals(
     jobs_task    = asyncio.create_task(check_job_boards(company_name))
     news_task    = asyncio.create_task(fetch_funding_news(company_name))
     tech_task    = asyncio.create_task(detect_tech_stack(domain))
-    kg_task      = asyncio.create_task(fetch_serper_kg(company_name))
-
-    ctx, job_board, funding_news, tech_stack, serper_kg = await asyncio.gather(
-        ctx_task, jobs_task, news_task, tech_task, kg_task
-    )
+    kg_task = asyncio.create_task(fetch_serper_kg(company_name))
+    need_apollo_hc = not (existing_headcount and existing_headcount > 0)
+    if need_apollo_hc:
+        apollo_task = asyncio.create_task(fetch_apollo_headcount(domain))
+        ctx, job_board, funding_news, tech_stack, serper_kg, apollo_hc = await asyncio.gather(
+            ctx_task, jobs_task, news_task, tech_task, kg_task, apollo_task
+        )
+    else:
+        ctx, job_board, funding_news, tech_stack, serper_kg = await asyncio.gather(
+            ctx_task, jobs_task, news_task, tech_task, kg_task
+        )
+        apollo_hc = {}
 
     homepage_text = ctx.get("homepage", "")
     about_text    = ctx.get("about", "")
@@ -679,8 +795,14 @@ async def enrich_company_signals(
         f"signals={len(result.buying_signals)}, hiring={job_board.get('count', 0)}"
     )
 
-    # Use Serper KG headcount as fallback if Gemini didn't extract one
-    headcount = result.headcount or serper_kg.get("headcount")
+    # Headcount priority: Gemini extraction → Serper KG → Apollo people-count proxy.
+    # The Apollo proxy fills the common gap where Gemini/KG have no size data.
+    headcount = (
+        result.headcount
+        or serper_kg.get("headcount")
+        or (existing_headcount if existing_headcount and existing_headcount > 0 else None)
+        or apollo_hc.get("headcount_estimate")
+    )
 
     return {
         "company_summary":          result.company_summary,

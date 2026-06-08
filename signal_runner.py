@@ -62,7 +62,7 @@ def _make_engine():
 # ── SQL statements ──────────────────────────────────────────────────────────
 
 _SELECT_PENDING = text("""
-    SELECT id, name, domain, description, industry, raw_meta
+    SELECT id, name, domain, description, industry, raw_meta, headcount
     FROM   discovery_company
     WHERE  signal_enrichment_status = 'pending'
     AND    domain IS NOT NULL
@@ -173,6 +173,7 @@ async def _process_company(row: dict, sem: asyncio.Semaphore) -> dict:
                 description=row.get("description"),
                 industry=row.get("industry"),
                 raw_meta=row.get("raw_meta"),
+                existing_headcount=row.get("headcount"),
             )
         except Exception as exc:
             logger.error(f"[{company_name}] Unhandled error: {exc}", exc_info=True)

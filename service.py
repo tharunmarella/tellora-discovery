@@ -28,6 +28,7 @@ from models import DiscoveryCompany, DiscoveryProgress
 from profiles import ICP_PROFILES
 from apollo_client import ApolloRateLimiter, paginate_profile
 from enrichment import lookup_domain
+from signal_enrichment import fetch_apollo_headcount
 
 logger = logging.getLogger("discovery.service")
 
@@ -211,14 +212,17 @@ async def _scrape_profile(
                     continue
                 new_companies.append((org_name, ceo_first_name))
 
-            # Concurrent enrichment lookups (5 at a time)
-            async def _resolve(org_name: str, ceo_first_name: str) -> tuple[str, dict]:
+            # Concurrent enrichment lookups (domain resolve + free Apollo headcount)
+            async def _resolve(org_name: str, ceo_first_name: str) -> tuple[str, dict, dict]:
                 async with _lookup_sem:
-                    return org_name, await lookup_domain(org_name, ceo_first_name)
+                    enrichment = await lookup_domain(org_name, ceo_first_name)
+                    domain = enrichment.get("domain")
+                    apollo_hc = await fetch_apollo_headcount(domain) if domain else {}
+                    return org_name, enrichment, apollo_hc
 
             lookup_results = await asyncio.gather(*[_resolve(n, c) for n, c in new_companies])
 
-            for name, enrichment in lookup_results:
+            for name, enrichment, apollo_hc in lookup_results:
                 norm = _norm(name)
                 domain = enrichment.get("domain")
 
@@ -250,6 +254,7 @@ async def _scrape_profile(
                     logo_url=enrichment.get("logo_url"),
                     description_embedding=enrichment.get("description_embedding"),
                     employee_range=employee_range or None,
+                    headcount=apollo_hc.get("headcount_estimate"),
                     source_profiles=[slug],
                     domain_resolved=bool(domain),
                     enrichment_status="enriched" if enrichment.get("description") else "pending",
