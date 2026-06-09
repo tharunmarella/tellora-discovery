@@ -49,16 +49,27 @@ _DOMAIN_CACHE_TTL = 3600  # 1 hour
 APOLLO_HEADCOUNT_FACTOR = float(getattr(cfg, "APOLLO_HEADCOUNT_FACTOR", 1.0) or 1.0)
 
 
-async def backfill_apollo_headcounts(limit: int | None = None) -> dict:
+async def backfill_apollo_headcounts(
+    limit: int | None = None,
+    *,
+    run_all: bool = False,
+) -> dict:
     """
-    Weekly cron helper: fill headcount on Apollo-sourced discovery_company rows
-    that are missing it, using the free people-search proxy. Does not re-run
-    full signal enrichment.
+    Fill headcount on discovery_company rows missing it, using the free
+    people-search proxy. Does not re-run full signal enrichment.
+
+    Weekly cron: one batch capped by HEADCOUNT_BACKFILL_LIMIT (default 1000).
+    --headcount-backfill-only: run_all=True loops until no eligible rows remain.
     """
     from sqlalchemy import create_engine, text
     from sqlalchemy.orm import Session
 
-    cap = limit if limit is not None else int(getattr(cfg, "HEADCOUNT_BACKFILL_LIMIT", 1000))
+    batch_size = int(getattr(cfg, "HEADCOUNT_BACKFILL_LIMIT", 1000))
+    if run_all:
+        cap = batch_size
+    else:
+        cap = limit if limit is not None else batch_size
+
     url = cfg.DATABASE_URL
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql://", 1)
@@ -68,7 +79,6 @@ async def backfill_apollo_headcounts(limit: int | None = None) -> dict:
         SELECT id, domain, name
         FROM   discovery_company
         WHERE  domain IS NOT NULL
-        AND    (source = 'apollo' OR source IS NULL)
         AND    (headcount IS NULL OR headcount = 0)
         ORDER  BY updated_at DESC
         LIMIT  :lim
@@ -79,28 +89,57 @@ async def backfill_apollo_headcounts(limit: int | None = None) -> dict:
         WHERE  id = :id
     """)
 
-    filled = skipped = 0
-    with Session(engine) as session:
-        rows = session.execute(_select, {"lim": cap}).mappings().all()
-        logger.info(f"[headcount_backfill] {len(rows)} Apollo rows to process (cap={cap})")
-        for row in rows:
-            domain = row["domain"]
-            if not domain:
-                skipped += 1
-                continue
-            res = await fetch_apollo_headcount(domain)
-            hc = res.get("headcount_estimate")
-            if hc:
-                session.execute(_update, {"hc": hc, "id": row["id"]})
-                filled += 1
-                logger.info(f"[headcount_backfill] {row['name']} ({domain}) → {hc}")
-            else:
-                skipped += 1
-            await asyncio.sleep(1.1)  # pace with Apollo free-tier limits
-        session.commit()
+    total_filled = total_skipped = total_processed = 0
+    batch_num = 0
 
-    logger.info(f"[headcount_backfill] done — filled={filled}, skipped={skipped}")
-    return {"filled": filled, "skipped": skipped, "processed": len(rows)}
+    while True:
+        batch_num += 1
+        filled = skipped = 0
+        with Session(engine) as session:
+            rows = session.execute(_select, {"lim": cap}).mappings().all()
+            if not rows:
+                if batch_num == 1:
+                    logger.info("[headcount_backfill] no rows missing headcount")
+                break
+
+            mode = "run_all" if run_all else f"cap={cap}"
+            logger.info(
+                f"[headcount_backfill] batch {batch_num}: {len(rows)} rows "
+                f"({mode}, total so far: filled={total_filled}, skipped={total_skipped})"
+            )
+            for row in rows:
+                domain = row["domain"]
+                if not domain:
+                    skipped += 1
+                    continue
+                res = await fetch_apollo_headcount(domain)
+                hc = res.get("headcount_estimate")
+                if hc:
+                    session.execute(_update, {"hc": hc, "id": row["id"]})
+                    filled += 1
+                    logger.info(f"[headcount_backfill] {row['name']} ({domain}) → {hc}")
+                else:
+                    skipped += 1
+                await asyncio.sleep(1.1)  # pace with Apollo free-tier limits
+            session.commit()
+
+        total_filled += filled
+        total_skipped += skipped
+        total_processed += len(rows)
+
+        if not run_all or len(rows) < cap:
+            break
+
+    logger.info(
+        f"[headcount_backfill] done — filled={total_filled}, "
+        f"skipped={total_skipped}, processed={total_processed}"
+    )
+    return {
+        "filled": total_filled,
+        "skipped": total_skipped,
+        "processed": total_processed,
+        "batches": batch_num,
+    }
 
 _gemini_client = None
 

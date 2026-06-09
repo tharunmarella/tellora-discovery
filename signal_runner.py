@@ -93,7 +93,7 @@ _UPDATE_SIGNAL = text("""
         signal_score             = :signal_score,
         funding_stage            = :funding_stage,
         total_raised             = :total_raised,
-        headcount                = :headcount,
+        headcount                = COALESCE(NULLIF(headcount, 0), :headcount),
         hiring_roles             = CAST(:hiring_roles AS jsonb),
         hiring_count             = :hiring_count,
         tech_stack               = CAST(:tech_stack AS jsonb),
@@ -115,6 +115,9 @@ def persist_result(session: Session, company_id: str, result: dict) -> bool:
 
     Called by _write_batch (batch runner) and directly by worker.py (ARQ task).
     The result dict is the value returned by enrich_company_signals().
+
+    Headcount is only written when the row has no value yet (NULL or 0) — scrape
+    and backfill estimates are never overwritten by signal enrichment.
     """
     emb = result.get("description_embedding")
     try:
