@@ -16,6 +16,11 @@ def _require(key: str) -> str:
 DATABASE_URL: str = _require("DATABASE_URL")
 TELLORA_APOLLO_API_KEY: str = _require("TELLORA_APOLLO_API_KEY")
 GEMINI_API_KEY: str = os.getenv("GOOGLE_API_KEY", os.getenv("GEMINI_API_KEY", ""))
+GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+
+# HQ backfill LLM: "gemini" (default) or "groq"
+HQ_NORMALIZE_PROVIDER: str = os.getenv("HQ_NORMALIZE_PROVIDER", "gemini").strip().lower()
+HQ_NORMALIZE_MODEL: str = os.getenv("HQ_NORMALIZE_MODEL", "").strip()
 
 # Serper.dev — primary web search. Get a key at https://serper.dev
 # Falls back to DDG if not set.

@@ -514,6 +514,18 @@ class CompanySignalResult(BaseModel):
         description="One of: enterprise, self-serve, freemium, usage-based. null if unclear.",
     )
     known_customers: list[str] = Field(default_factory=list)
+    hq_city: Optional[str] = Field(
+        None,
+        description="Canonical English city name (GeoNames-style). null if unknown.",
+    )
+    hq_region: Optional[str] = Field(
+        None,
+        description="US: ISO 3166-2 two-letter state (CA, NY). Non-US: subdivision name. null if unknown.",
+    )
+    hq_country: Optional[str] = Field(
+        None,
+        description="ISO 3166-1 alpha-2 country code (US, GB). null if unknown.",
+    )
 
 
 _EMPTY_SIGNAL = CompanySignalResult(
@@ -533,8 +545,60 @@ _JSON_SCHEMA = """{
   "hiring_roles": ["<role1>", "<role2>"],
   "tech_stack": ["<tool1>", "<tool2>"],
   "pricing_model": "<enterprise|self-serve|freemium|usage-based or null>",
-  "known_customers": ["<customer1>"]
+  "known_customers": ["<customer1>"],
+  "hq_city": "<canonical English city or null>",
+  "hq_region": "<ISO 3166-2 subdivision or null>",
+  "hq_country": "<ISO 3166-1 alpha-2 or null>"
 }"""
+
+_HQ_NORMALIZATION_RULES = """HEADQUARTERS NORMALIZATION (hq_city, hq_region, hq_country):
+- Normalize from KNOWN HEADQUARTERS and/or Google Knowledge Graph HQ evidence.
+- Return null for any field you cannot determine confidently — never guess.
+- hq_city: Canonical English city name (GeoNames-style). No abbreviations (not "SF"/"NYC"/"SFO"). For metro/region labels (e.g. "Bay Area", "Greater NYC Area"), use the anchor city ("San Francisco", "New York").
+- hq_region: United States → ISO 3166-2 two-letter state code (CA, NY, TX). Other countries → full subdivision/province name, or null.
+- hq_country: ISO 3166-1 alpha-2 uppercase (US, GB, IN, DE)."""
+
+_HQ_JSON_SCHEMA = """{
+  "hq_city": "<canonical English city or null>",
+  "hq_region": "<ISO 3166-2 subdivision or null>",
+  "hq_country": "<ISO 3166-1 alpha-2 or null>"
+}"""
+
+_HQ_BATCH_JSON_SCHEMA = """{
+  "items": [
+    {"raw": "<exact input headquarters string>", "hq_city": "<canonical English city or null>", "hq_region": "<ISO 3166-2 subdivision or null>", "hq_country": "<ISO 3166-1 alpha-2 or null>"}
+  ]
+}"""
+
+HQ_GROQ_MODEL = "openai/gpt-oss-20b"
+
+_EMPTY_HQ = {"hq_city": None, "hq_region": None, "hq_country": None}
+
+
+def _strip_json_fences(raw: str) -> str:
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip().rstrip("`").strip()
+    return text
+
+
+def _parse_hq_batch_response(raw: str) -> list[dict]:
+    text = _strip_json_fences(raw)
+    start_obj = text.find("{")
+    start_arr = text.find("[")
+    if start_obj != -1 and (start_arr == -1 or start_obj < start_arr):
+        end = text.rfind("}")
+        payload = json.loads(text[start_obj:end + 1])
+        if isinstance(payload, dict):
+            items = payload.get("items") or payload.get("results") or []
+            return items if isinstance(items, list) else []
+    if start_arr != -1:
+        end = text.rfind("]")
+        return json.loads(text[start_arr:end + 1])
+    return json.loads(text)
 
 
 def _retry_gemini(fn, max_retries: int = 3):
@@ -554,6 +618,129 @@ def _retry_gemini(fn, max_retries: int = 3):
             backoff *= 2
 
 
+def _hq_normalize_model(provider: str, model: Optional[str] = None) -> str:
+    if model:
+        return model
+    if provider == "groq":
+        return HQ_GROQ_MODEL
+    return GEMINI_MODEL
+
+
+def _hq_provider_ready(provider: str) -> bool:
+    if provider == "groq":
+        return bool(cfg.GROQ_API_KEY)
+    return bool(cfg.GEMINI_API_KEY)
+
+
+def _call_hq_llm(prompt: str, *, provider: str, model: str) -> str:
+    if provider == "groq":
+        from groq import Groq
+        client = Groq(api_key=cfg.GROQ_API_KEY)
+        resp = client.chat.completions.create(
+            model=model,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You normalize company headquarters strings to structured geographic fields. "
+                        "Respond with valid JSON only."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+        )
+        return resp.choices[0].message.content or ""
+
+    client = _get_gemini_client()
+    resp = client.models.generate_content(model=model, contents=prompt)
+    return resp.text
+
+
+def _build_hq_batch_prompt(inputs: list[str]) -> str:
+    lines = "\n".join(f"{i + 1}. {raw}" for i, raw in enumerate(inputs))
+    return f"""You normalize messy company headquarters strings to standard geographic fields.
+
+{_HQ_NORMALIZATION_RULES}
+
+For EACH headquarters string below, output one object in the "items" array.
+Include the exact raw string unchanged in "raw".
+Return null for any field you cannot determine confidently — never guess.
+
+HEADQUARTERS STRINGS:
+{lines}
+
+Respond with ONLY valid JSON matching this schema. No markdown:
+{_HQ_BATCH_JSON_SCHEMA}"""
+
+
+def _items_to_hq_map(items: list[dict]) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for item in items:
+        raw = (item.get("raw") or "").strip()
+        if not raw:
+            continue
+        out[raw] = {
+            "hq_city": item.get("hq_city") or None,
+            "hq_region": item.get("hq_region") or None,
+            "hq_country": item.get("hq_country") or None,
+        }
+    return out
+
+
+def normalize_headquarters_batch(
+    raw_headquarters: list[str],
+    *,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+) -> dict[str, dict]:
+    """
+    Normalize many raw headquarters strings in one LLM call (Gemini or Groq).
+    Returns {raw_string: {hq_city, hq_region, hq_country}} for each input.
+    """
+    inputs = [(r or "").strip() for r in raw_headquarters if (r or "").strip()]
+    if not inputs:
+        return {}
+
+    provider = (provider or cfg.HQ_NORMALIZE_PROVIDER or "gemini").strip().lower()
+    if not _hq_provider_ready(provider):
+        logger.warning(f"HQ batch normalization skipped — {provider} API key not set")
+        return {}
+
+    prompt = _build_hq_batch_prompt(inputs)
+    model_id = _hq_normalize_model(provider, model)
+
+    def _do():
+        raw = _call_hq_llm(prompt, provider=provider, model=model_id)
+        return _items_to_hq_map(_parse_hq_batch_response(raw))
+
+    try:
+        return _retry_gemini(_do)
+    except Exception as exc:
+        logger.warning(
+            f"HQ batch normalization failed ({len(inputs)} items, {provider}/{model_id}): {exc}"
+        )
+        return {}
+
+
+def normalize_headquarters(
+    raw_headquarters: str,
+    *,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+) -> dict:
+    """
+    Normalize a single raw headquarters string to hq_city / hq_region / hq_country.
+    Used by the one-off backfill script; enrichment uses synthesize_company_signals.
+    """
+    raw = (raw_headquarters or "").strip()
+    if not raw:
+        return dict(_EMPTY_HQ)
+    batch = normalize_headquarters_batch([raw], provider=provider, model=model)
+    return batch.get(raw) or dict(_EMPTY_HQ)
+
+
 def synthesize_company_signals(
     company_name: str,
     homepage_text: str,
@@ -563,6 +750,7 @@ def synthesize_company_signals(
     job_board: dict,
     funding_news: list[str],
     serper_kg: Optional[dict] = None,
+    existing_headquarters: Optional[str] = None,
 ) -> CompanySignalResult:
     """
     Send all company evidence to Gemini and receive a structured CompanySignalResult.
@@ -620,8 +808,12 @@ STRICT RULES:
 3. signal_score: 0=no evidence, 40=some signals, 70=strong buying triggers, 90+=exceptional.
 4. company_summary: what the company does, who they sell to, market position. From homepage/about only. null if text is too thin.
 5. buying_signals: concrete, time-sensitive triggers only (funding rounds, hiring sprees, product launches, expansions).
+6. {_HQ_NORMALIZATION_RULES}
 
 COMPANY: {company_name}
+
+KNOWN HEADQUARTERS (raw, from database):
+{(existing_headquarters or "").strip() or "Unknown"}
 
 TECH STACK:
 {tech_line}
@@ -760,6 +952,7 @@ async def enrich_company_signals(
     industry: Optional[str],
     raw_meta: Optional[dict],
     existing_headcount: Optional[int] = None,
+    existing_headquarters: Optional[str] = None,
 ) -> dict:
     """
     Full signal enrichment for one company. Returns a dict ready to write
@@ -808,6 +1001,7 @@ async def enrich_company_signals(
         job_board,
         funding_news,
         serper_kg,
+        existing_headquarters,
     )
 
     # Step 3 — Re-embed with richer text
@@ -855,6 +1049,9 @@ async def enrich_company_signals(
         "tech_stack":               result.tech_stack or tech_stack,
         "description_embedding":    embedding,
         "tsv_text":                 tsv_text,
+        "hq_city":                  result.hq_city,
+        "hq_region":                result.hq_region,
+        "hq_country":               result.hq_country,
         "signal_enriched_at":       datetime.now(timezone.utc),
         "signal_enrichment_status": "enriched" if result.company_summary else "failed",
     }

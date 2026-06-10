@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# One-off full headcount backfill — revert to ["python", "__main__.py"] after it completes.
+# Default command runs the weekly scrape (used by the cron service).
 # The always-on worker service overrides this with a Custom Start Command:
 #   arq worker.WorkerSettings
-CMD ["python", "__main__.py", "--headcount-backfill-only"]
+CMD ["python", "__main__.py"]

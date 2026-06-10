@@ -55,6 +55,9 @@ class DiscoveryCompany(SQLModel, table=True):
     # Company profile fields — sourced from Serper KG / Apollo / Gemini
     ceo_name: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
     headquarters: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
+    hq_city: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True, index=True))
+    hq_region: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
+    hq_country: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True, index=True))
     founded_year: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
     funding: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
     logo_url: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
