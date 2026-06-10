@@ -36,10 +36,11 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 import settings as cfg
+from database import make_engine
 from signal_enrichment import enrich_company_signals
 
 logging.basicConfig(
@@ -48,15 +49,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("signal_runner")
-
-
-# ── DB setup ───────────────────────────────────────────────────────────────
-
-def _make_engine():
-    url = cfg.DATABASE_URL
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
-    return create_engine(url, pool_pre_ping=True)
 
 
 # ── SQL statements ──────────────────────────────────────────────────────────
@@ -69,7 +61,6 @@ _SELECT_PENDING = text("""
     AND    domain_resolved = true
     ORDER  BY created_at ASC
     LIMIT  :batch_size
-    OFFSET 0
 """)
 
 _COUNT_PENDING = text("""
@@ -149,9 +140,6 @@ def persist_result(session: Session, company_id: str, result: dict) -> bool:
         return False
 
 
-SIGNALS_READY_KEY = "tellora:signals_ready"
-
-
 def _notify_signals_ready(domains: list[str]) -> None:
     """Push enriched domains to Redis so the backend ARQ worker can re-queue waiting contacts."""
     if not domains:
@@ -160,8 +148,8 @@ def _notify_signals_ready(domains: list[str]) -> None:
         import redis as _redis
         r = _redis.from_url(cfg.REDIS_URL, socket_connect_timeout=2)
         for domain in domains:
-            r.rpush(SIGNALS_READY_KEY, domain)
-        logger.info(f"Pushed {len(domains)} domain(s) to {SIGNALS_READY_KEY}")
+            r.rpush(cfg.SIGNALS_READY_KEY, domain)
+        logger.info(f"Pushed {len(domains)} domain(s) to {cfg.SIGNALS_READY_KEY}")
     except Exception as exc:
         logger.warning(f"Could not notify Redis after signal enrichment: {exc}")
 
@@ -228,7 +216,7 @@ def _write_batch(session: Session, results: list[dict]) -> tuple[int, int]:
 # ── Main runner (one-shot backfill) ────────────────────────────────────────
 
 async def run(limit: Optional[int], concurrency: int, batch_size: int, reset_failed: bool) -> None:
-    engine = _make_engine()
+    engine = make_engine()
 
     with Session(engine) as session:
         if reset_failed:

@@ -9,25 +9,23 @@ instead of matching competitors' use_cases.
 Also: searches per ICP query separately (no averaging), deduplicates by company ID.
 
 Usage:
-  GOOGLE_API_KEY=xxx DATABASE_URL=postgresql://... python test_search.py
-  or just: python test_search.py  (reads from .env)
+  cd tellora-discovery
+  GOOGLE_API_KEY=xxx DATABASE_URL=postgresql://... python scripts/test_search.py
+  or just: python scripts/test_search.py  (reads from .env)
 """
 
 import json
-import os
 import sys
+from pathlib import Path
 
-from dotenv import load_dotenv
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-load_dotenv()
+import settings as cfg
 
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
-
-if not GOOGLE_API_KEY:
-    print("Set GOOGLE_API_KEY env var")
+if not cfg.GEMINI_API_KEY:
+    print("Set GOOGLE_API_KEY / GEMINI_API_KEY env var")
     sys.exit(1)
-if not DATABASE_URL:
+if not cfg.DATABASE_URL:
     print("Set DATABASE_URL env var")
     sys.exit(1)
 
@@ -42,8 +40,7 @@ from google import genai
 from google.genai import types
 import psycopg2
 
-client = genai.Client(api_key=GOOGLE_API_KEY)
-GEMINI_MODEL = "gemini-2.5-flash-lite"
+client = genai.Client(api_key=cfg.GEMINI_API_KEY)
 
 
 def generate_buyer_profiles(product_description: str) -> list[str]:
@@ -67,7 +64,7 @@ Example for "field service scheduling software":
 
 Return a JSON array of strings. No explanation."""
 
-    resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+    resp = client.models.generate_content(model=cfg.ENRICHMENT_GEMINI_MODEL, contents=prompt)
     raw = resp.text.strip().strip("`").strip()
     if raw.startswith("json"):
         raw = raw[4:].strip()
@@ -88,7 +85,7 @@ def embed(text: str) -> list[float]:
 
 
 def search(vector: list[float], limit: int = 10, min_score: float = 0.40) -> list[dict]:
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = psycopg2.connect(cfg.DATABASE_URL)
     cur = conn.cursor()
     vec_str = "[" + ",".join(str(v) for v in vector) + "]"
     cur.execute("""

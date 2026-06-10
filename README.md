@@ -1,6 +1,6 @@
 # tellora-discovery
 
-Standalone Railway cron service that builds Tellora's pre-populated company database.
+Standalone Railway service that builds Tellora's pre-populated company database and serves on-demand signal enrichment.
 
 ## What it does
 
@@ -10,12 +10,17 @@ Queries Apollo's **free** People API Search (`mixed_people/api_search`) across 1
 
 **CEO filter trick:** All profiles search for `person_titles=CEO` — every company has one CEO, so each result is a unique company. Natural dedup, no client-side grouping needed.
 
+### Two disjoint enrichment paths
+
+1. **Weekly cron** (`python __main__.py`) — scrapes Apollo, enriches new companies inline, runs headcount backfill cap.
+2. **On-demand worker** (`arq worker.WorkerSettings`, queue `arq:ondemand`) — user-triggered enrichment from the app (single "Enrich" + bulk actions). Backend enqueues `enrich_company_task`.
+
 ## Enrichment pipeline (per company)
 
 1. **Serper search** `"{company} CEO: {ceo_first_name}"` → Google SERP results
 2. **Gemini** reads knowledgeGraph + organic results → extracts domain, description, industries, CEO name, HQ, founded year, funding, keywords, use_case
 3. **logo_url** constructed from domain via Google Favicon API (no extra call)
-4. **Embedding** of description + use_case + industry + keywords → 768-dim vector stored in pgvector for semantic search
+4. **Signal enrichment** (Jina + job boards + funding news + tech stack + Gemini synthesis) → buying signals, embeddings, HQ normalization
 5. DuckDuckGo fallback if Serper is unavailable
 
 ## Crash recovery
@@ -34,31 +39,43 @@ After every committed page the service writes a checkpoint to `discovery_progres
    - `GOOGLE_API_KEY` — Gemini extraction + embeddings
    - `SERPER_API_KEY` — primary web search (falls back to DDG without it)
 
+For the always-on on-demand worker, deploy a second service with start command `arq worker.WorkerSettings`.
+
 ## Local testing
 
 ```bash
 cd tellora-discovery
 pip install -r requirements.txt
 cp .env.example .env  # fill in values
-python __main__.py --dry-run  # 2 pages per profile, quick test
+python __main__.py --dry-run  # 2 pages per profile, skips enrichment + backfill
 python __main__.py             # full run
-python test_batch.py           # test enrichment on a batch of companies
+python scripts/test_batch.py   # test scrape-time enrichment on a batch of companies
+python scripts/test_search.py  # test semantic search against discovery_company
+python scripts/backfill_hq_normalize.py --dry-run
 ```
 
 ## File structure
 
 ```
 tellora-discovery/
-├── __main__.py        # Entry point + cron schedule
-├── models.py          # DiscoveryCompany + DiscoveryProgress SQLModel tables
-├── profiles.py        # 17 ICP filter configs
-├── apollo_client.py   # Apollo pagination + rate limiter
-├── enrichment.py      # Serper search + Gemini extraction + embedding
-├── service.py         # Orchestration with checkpoint/resume logic
-├── database.py        # DB engine + session
-├── settings.py        # Env var loading
-├── config_logging.py  # Logging setup
-├── test_batch.py      # Manual enrichment quality test
+├── __main__.py           # Weekly cron entry point (scrape + inline enrich + headcount cap)
+├── worker.py             # ARQ on-demand worker (arq:ondemand)
+├── service.py            # Apollo scrape orchestration with checkpoint/resume
+├── signal_runner.py      # Batch signal enrichment runner (CLI + inline from cron)
+├── signal_enrichment.py  # Per-company signal pipeline (Jina, job boards, Gemini)
+├── headcount_backfill.py # Apollo people-count headcount backfill job
+├── enrichment.py       # Serper + Gemini domain lookup at scrape time
+├── llm.py                # Shared Gemini client, retry, JSON fence strip, embed
+├── profiles.py           # 17 ICP filter configs
+├── apollo_client.py      # Apollo pagination + rate limiter
+├── models.py             # DiscoveryCompany + DiscoveryProgress SQLModel tables
+├── database.py           # DB engine + session helpers
+├── settings.py           # Env var loading
+├── config_logging.py     # Logging setup
+├── scripts/
+│   ├── backfill_hq_normalize.py  # One-off HQ field normalization
+│   ├── test_batch.py             # Manual scrape enrichment smoke test
+│   └── test_search.py            # Manual semantic search smoke test
 └── requirements.txt
 ```
 

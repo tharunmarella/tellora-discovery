@@ -18,20 +18,10 @@ import time
 
 import httpx
 
+import settings as cfg
+from llm import get_gemini_client, retry_llm, strip_json_fences
+
 logger = logging.getLogger("discovery.enrichment")
-
-_gemini_client = None
-
-
-def _get_gemini_client(api_key: str):
-    global _gemini_client
-    if _gemini_client is None:
-        from google import genai
-        _gemini_client = genai.Client(api_key=api_key)
-    return _gemini_client
-
-
-GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 INDUSTRY_ENUM = [
     "DevTools", "Logistics", "Healthcare", "Financial Services",
@@ -66,44 +56,7 @@ Search result JSON:
 Return only valid JSON. No explanation, no markdown fences."""
 
 
-def _retry_gemini(fn, max_retries: int = 3):
-    backoff = 5
-    for attempt in range(max_retries):
-        try:
-            return fn()
-        except Exception as exc:
-            exc_str = str(exc).lower()
-            is_retryable = any(s in exc_str for s in ("429", "rate", "quota", "resource_exhausted", "503", "timeout"))
-            if not is_retryable or attempt == max_retries - 1:
-                raise
-            logger.warning(f"Gemini retryable error (attempt {attempt+1}): {exc} — backing off {backoff}s")
-            time.sleep(backoff)
-            backoff *= 2
-
-
-def _embed_text(text: str, api_key: str) -> list[float] | None:
-    try:
-        from google.genai import types
-        client = _get_gemini_client(api_key)
-
-        def _do():
-            resp = client.models.embed_content(
-                model="gemini-embedding-001",
-                contents=text,
-                config=types.EmbedContentConfig(
-                    task_type="RETRIEVAL_DOCUMENT",
-                    output_dimensionality=768,
-                ),
-            )
-            return resp.embeddings[0].values
-
-        return _retry_gemini(_do)
-    except Exception as exc:
-        logger.warning(f"Embedding failed: {exc}")
-        return None
-
-
-def _call_gemini(company_name: str, serper_data: dict, api_key: str) -> dict:
+def _call_gemini(company_name: str, serper_data: dict) -> dict:
     trimmed = {
         "knowledgeGraph": serper_data.get("knowledgeGraph"),
         "organic": serper_data.get("organic", [])[:7],
@@ -113,16 +66,13 @@ def _call_gemini(company_name: str, serper_data: dict, api_key: str) -> dict:
         serper_json=json.dumps(trimmed, indent=2),
         industry_list=", ".join(INDUSTRY_ENUM),
     )
-    client = _get_gemini_client(api_key)
+    client = get_gemini_client()
 
     def _do():
-        resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-        raw = resp.text.strip().strip("`").strip()
-        if raw.startswith("json"):
-            raw = raw[4:].strip()
-        return json.loads(raw)
+        resp = client.models.generate_content(model=cfg.ENRICHMENT_GEMINI_MODEL, contents=prompt)
+        return json.loads(strip_json_fences(resp.text))
 
-    return _retry_gemini(_do)
+    return retry_llm(_do)
 
 
 # ── Search providers ──────────────────────────────────────────────────────────
@@ -180,7 +130,7 @@ def _fetch_ddg(query: str) -> dict:
 
 # ── Main lookup ───────────────────────────────────────────────────────────────
 
-def _run_lookup(company_name: str, ceo_first_name: str, gemini_api_key: str, serper_api_key: str) -> dict:
+def _run_lookup(company_name: str, ceo_first_name: str, serper_api_key: str) -> dict:
     """
     One search (Serper → DDG fallback) + one Gemini call.
     Returns enrichment dict matching DiscoveryCompany fields plus
@@ -203,7 +153,7 @@ def _run_lookup(company_name: str, ceo_first_name: str, gemini_api_key: str, ser
 
     # Single Gemini call — extracts all fields from the full Serper JSON
     try:
-        extracted = _call_gemini(company_name, serper_data, gemini_api_key)
+        extracted = _call_gemini(company_name, serper_data)
     except Exception as exc:
         logger.warning(f"Gemini extraction failed for {company_name!r}: {exc}")
         return {}
@@ -242,17 +192,14 @@ async def lookup_domain(company_name: str, ceo_first_name: str = "") -> dict:
     Async wrapper — runs in thread pool to avoid blocking the event loop.
     Returns enrichment dict with DiscoveryCompany fields ready to write to DB.
     """
-    import settings
-
-    gemini_api_key = settings.GEMINI_API_KEY
-    if not gemini_api_key:
+    if not cfg.GEMINI_API_KEY:
         logger.warning("GEMINI_API_KEY not set — skipping enrichment")
         return {}
 
-    serper_api_key = settings.SERPER_API_KEY
+    serper_api_key = cfg.SERPER_API_KEY
     if not serper_api_key:
         logger.info("SERPER_API_KEY not set — using DDG only")
 
     return await asyncio.get_event_loop().run_in_executor(
-        None, _run_lookup, company_name, ceo_first_name, gemini_api_key, serper_api_key
+        None, _run_lookup, company_name, ceo_first_name, serper_api_key
     )

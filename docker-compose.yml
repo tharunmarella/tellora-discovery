@@ -4,7 +4,7 @@ services:
     env_file: .env
     environment:
       MAX_PAGES_PER_PROFILE: "${MAX_PAGES_PER_PROFILE:-500}"
-    # Uncomment for a quick dry-run (2 pages per profile, no writes):
+    # Uncomment for a quick dry-run (2 pages per profile, skips enrichment + backfill):
     # command: ["python", "__main__.py", "--dry-run"]
     restart: "no"    # cron job — exits after one run, no auto-restart
     extra_hosts:

@@ -7,14 +7,17 @@ import settings as cfg
 
 logger = logging.getLogger("discovery.db")
 
-_db_url = cfg.DATABASE_URL
-if _db_url.startswith("postgres://"):
-    _db_url = _db_url.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(
-    _db_url,
+def make_engine(*, pool_pre_ping: bool = True, **kwargs):
+    """Create a SQLAlchemy engine with postgres:// URL normalization."""
+    url = cfg.DATABASE_URL
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    return create_engine(url, pool_pre_ping=pool_pre_ping, **kwargs)
+
+
+engine = make_engine(
     echo=False,
-    pool_pre_ping=True,
     pool_recycle=300,
     pool_size=3,
     max_overflow=5,

@@ -1,5 +1,5 @@
 """
-The 5 ICP filter profiles for Apollo People API Search.
+The 17 ICP filter profiles for Apollo People API Search.
 
 All profiles use "CEO" as the sole person_titles filter.
 Every company has exactly one CEO → ~1 result per company = natural dedup.
@@ -256,5 +256,3 @@ ICP_PROFILES: list[dict[str, Any]] = [
         },
     },
 ]
-
-PROFILE_BY_SLUG: dict[str, dict[str, Any]] = {p["slug"]: p for p in ICP_PROFILES}

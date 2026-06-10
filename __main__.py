@@ -25,7 +25,7 @@ logger = logging.getLogger("discovery")
 
 
 async def _run_headcount_backfill(*, run_all: bool) -> None:
-    from signal_enrichment import backfill_apollo_headcounts
+    from headcount_backfill import backfill_apollo_headcounts
 
     if run_all:
         logger.info("Starting full headcount backfill (all eligible rows)...")
@@ -81,7 +81,7 @@ def main() -> None:
         sys.exit(1)
 
     if dry_run:
-        logger.info("DRY RUN — max 2 pages per profile, no Jina calls, no DB writes")
+        logger.info("DRY RUN — max 2 pages per profile, skips enrichment + headcount backfill")
         import settings
 
         settings.MAX_PAGES_PER_PROFILE = 2

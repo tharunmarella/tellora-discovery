@@ -21,6 +21,14 @@ GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 # HQ backfill LLM: "gemini" (default) or "groq"
 HQ_NORMALIZE_PROVIDER: str = os.getenv("HQ_NORMALIZE_PROVIDER", "gemini").strip().lower()
 HQ_NORMALIZE_MODEL: str = os.getenv("HQ_NORMALIZE_MODEL", "").strip()
+HQ_GROQ_MODEL: str = os.getenv("HQ_GROQ_MODEL", "openai/gpt-oss-20b").strip()
+
+# Gemini model IDs (intentionally different per pipeline stage)
+ENRICHMENT_GEMINI_MODEL: str = os.getenv("ENRICHMENT_GEMINI_MODEL", "gemini-2.5-flash-lite")
+SIGNAL_GEMINI_MODEL: str = os.getenv("SIGNAL_GEMINI_MODEL", "gemini-3.1-flash-lite")
+
+# Redis key — backend ARQ worker listens for enriched company domains
+SIGNALS_READY_KEY: str = "tellora:signals_ready"
 
 # Serper.dev — primary web search. Get a key at https://serper.dev
 # Falls back to DDG if not set.

@@ -70,7 +70,7 @@ class DiscoveryCompany(SQLModel, table=True):
     location: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
     employee_range: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
 
-    # Which of the 5 ICP profiles matched this company
+    # Which ICP profiles matched this company
     source_profiles: Optional[List[str]] = Field(
         default=None, sa_column=Column(ARRAY(Text), nullable=True)
     )

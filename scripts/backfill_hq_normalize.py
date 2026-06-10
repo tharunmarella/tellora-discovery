@@ -29,12 +29,13 @@ import sys
 import time
 from pathlib import Path
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import settings as cfg
+from database import make_engine
 from signal_enrichment import normalize_headquarters, normalize_headquarters_batch
 
 logging.basicConfig(
@@ -84,10 +85,7 @@ _UPDATE_ROWS = text("""
 
 
 def _make_engine():
-    url = cfg.DATABASE_URL
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
-    return create_engine(url, pool_pre_ping=True)
+    return make_engine()
 
 
 def ensure_schema(session: Session) -> None:
@@ -178,7 +176,7 @@ def run(
         to_process = min(distinct_hq, limit) if limit else distinct_hq
         num_batches = (to_process + batch_size - 1) // batch_size if to_process else 0
 
-        model_label = model or ("openai/gpt-oss-20b" if provider == "groq" else "gemini-3.1-flash-lite")
+        model_label = model or (cfg.HQ_GROQ_MODEL if provider == "groq" else cfg.SIGNAL_GEMINI_MODEL)
         logger.info(
             f"Rows to update: {row_count} | distinct headquarters: {distinct_hq} | "
             f"will normalize: {to_process} in {num_batches} batch(es) of {batch_size} | "

@@ -20,30 +20,23 @@ import logging
 
 import redis.asyncio as aioredis
 from arq.connections import RedisSettings
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 import settings as cfg
+from database import make_engine
 
 logger = logging.getLogger("discovery.worker")
 
 # ── DB engine (module-level; workers are long-lived processes) ──────────────
 
-_db_url = cfg.DATABASE_URL
-if _db_url.startswith("postgres://"):
-    _db_url = _db_url.replace("postgres://", "postgresql://", 1)
-
-_engine = create_engine(
-    _db_url,
-    pool_pre_ping=True,
+_engine = make_engine(
     pool_recycle=300,
     pool_size=3,
     max_overflow=5,
 )
 
 # ── Redis helpers ───────────────────────────────────────────────────────────
-
-SIGNALS_READY_KEY = "tellora:signals_ready"
 
 _CLAIM_AND_LOAD = text("""
     UPDATE discovery_company
@@ -111,9 +104,9 @@ async def enrich_company_task(ctx, company_id: str) -> dict:
     if domain and result.get("signal_enrichment_status") != "failed":
         try:
             r = aioredis.from_url(cfg.REDIS_URL, socket_connect_timeout=2)
-            await r.rpush(SIGNALS_READY_KEY, domain)
+            await r.rpush(cfg.SIGNALS_READY_KEY, domain)
             await r.aclose()
-            logger.info(f"[enrich_company_task] Pushed {domain} to {SIGNALS_READY_KEY}")
+            logger.info(f"[enrich_company_task] Pushed {domain} to {cfg.SIGNALS_READY_KEY}")
         except Exception as exc:
             logger.warning(f"[enrich_company_task] Redis notify failed: {exc}")
 

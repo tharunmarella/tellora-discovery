@@ -25,6 +25,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 import settings as cfg
+from llm import embed_text, get_gemini_client, retry_llm, strip_json_fences
 
 logger = logging.getLogger("discovery.signal")
 
@@ -35,9 +36,6 @@ JINA_SEARCH    = "https://s.jina.ai/"
 GREENHOUSE_API = "https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
 LEVER_API      = "https://api.lever.co/v0/postings/{slug}?mode=json"
 
-GEMINI_MODEL = "gemini-3.1-flash-lite"
-EMBED_MODEL  = "gemini-embedding-001"
-
 _HTTP_TIMEOUT = 8.0
 _DOMAIN_CACHE: dict[str, tuple[float, dict]] = {}
 _DOMAIN_CACHE_TTL = 3600  # 1 hour
@@ -47,109 +45,6 @@ _DOMAIN_CACHE_TTL = 3600  # 1 hour
 # last-resort headcount proxy when Gemini + Serper KG give us nothing. The factor
 # converts "contacts Apollo has" → "approx employees" (rough; tune via env).
 APOLLO_HEADCOUNT_FACTOR = float(getattr(cfg, "APOLLO_HEADCOUNT_FACTOR", 1.0) or 1.0)
-
-
-async def backfill_apollo_headcounts(
-    limit: int | None = None,
-    *,
-    run_all: bool = False,
-) -> dict:
-    """
-    Fill headcount on discovery_company rows missing it, using the free
-    people-search proxy. Does not re-run full signal enrichment.
-
-    Weekly cron: one batch capped by HEADCOUNT_BACKFILL_LIMIT (default 1000).
-    --headcount-backfill-only: run_all=True loops until no eligible rows remain.
-    """
-    from sqlalchemy import create_engine, text
-    from sqlalchemy.orm import Session
-
-    batch_size = int(getattr(cfg, "HEADCOUNT_BACKFILL_LIMIT", 1000))
-    if run_all:
-        cap = batch_size
-    else:
-        cap = limit if limit is not None else batch_size
-
-    url = cfg.DATABASE_URL
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
-    engine = create_engine(url, pool_pre_ping=True)
-
-    _select = text("""
-        SELECT id, domain, name
-        FROM   discovery_company
-        WHERE  domain IS NOT NULL
-        AND    (headcount IS NULL OR headcount = 0)
-        ORDER  BY updated_at DESC
-        LIMIT  :lim
-    """)
-    _update = text("""
-        UPDATE discovery_company
-        SET    headcount = :hc, updated_at = NOW()
-        WHERE  id = :id
-    """)
-
-    total_filled = total_skipped = total_processed = 0
-    batch_num = 0
-
-    while True:
-        batch_num += 1
-        filled = skipped = 0
-        with Session(engine) as session:
-            rows = session.execute(_select, {"lim": cap}).mappings().all()
-            if not rows:
-                if batch_num == 1:
-                    logger.info("[headcount_backfill] no rows missing headcount")
-                break
-
-            mode = "run_all" if run_all else f"cap={cap}"
-            logger.info(
-                f"[headcount_backfill] batch {batch_num}: {len(rows)} rows "
-                f"({mode}, total so far: filled={total_filled}, skipped={total_skipped})"
-            )
-            for row in rows:
-                domain = row["domain"]
-                if not domain:
-                    skipped += 1
-                    continue
-                res = await fetch_apollo_headcount(domain)
-                hc = res.get("headcount_estimate")
-                if hc:
-                    session.execute(_update, {"hc": hc, "id": row["id"]})
-                    filled += 1
-                    logger.info(f"[headcount_backfill] {row['name']} ({domain}) → {hc}")
-                else:
-                    skipped += 1
-                await asyncio.sleep(1.1)  # pace with Apollo free-tier limits
-            session.commit()
-
-        total_filled += filled
-        total_skipped += skipped
-        total_processed += len(rows)
-
-        if not run_all or len(rows) < cap:
-            break
-
-    logger.info(
-        f"[headcount_backfill] done — filled={total_filled}, "
-        f"skipped={total_skipped}, processed={total_processed}"
-    )
-    return {
-        "filled": total_filled,
-        "skipped": total_skipped,
-        "processed": total_processed,
-        "batches": batch_num,
-    }
-
-_gemini_client = None
-
-
-def _get_gemini_client():
-    global _gemini_client
-    if _gemini_client is None:
-        from google import genai
-        _gemini_client = genai.Client(api_key=cfg.GEMINI_API_KEY)
-    return _gemini_client
 
 
 # ── Serper Knowledge Graph lookup ──────────────────────────────────────────
@@ -558,35 +453,17 @@ _HQ_NORMALIZATION_RULES = """HEADQUARTERS NORMALIZATION (hq_city, hq_region, hq_
 - hq_region: United States → ISO 3166-2 two-letter state code (CA, NY, TX). Other countries → full subdivision/province name, or null.
 - hq_country: ISO 3166-1 alpha-2 uppercase (US, GB, IN, DE)."""
 
-_HQ_JSON_SCHEMA = """{
-  "hq_city": "<canonical English city or null>",
-  "hq_region": "<ISO 3166-2 subdivision or null>",
-  "hq_country": "<ISO 3166-1 alpha-2 or null>"
-}"""
-
 _HQ_BATCH_JSON_SCHEMA = """{
   "items": [
     {"raw": "<exact input headquarters string>", "hq_city": "<canonical English city or null>", "hq_region": "<ISO 3166-2 subdivision or null>", "hq_country": "<ISO 3166-1 alpha-2 or null>"}
   ]
 }"""
 
-HQ_GROQ_MODEL = "openai/gpt-oss-20b"
-
 _EMPTY_HQ = {"hq_city": None, "hq_region": None, "hq_country": None}
 
 
-def _strip_json_fences(raw: str) -> str:
-    text = raw.strip()
-    if text.startswith("```"):
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
-        text = text.strip().rstrip("`").strip()
-    return text
-
-
 def _parse_hq_batch_response(raw: str) -> list[dict]:
-    text = _strip_json_fences(raw)
+    text = strip_json_fences(raw)
     start_obj = text.find("{")
     start_arr = text.find("[")
     if start_obj != -1 and (start_arr == -1 or start_obj < start_arr):
@@ -601,29 +478,14 @@ def _parse_hq_batch_response(raw: str) -> list[dict]:
     return json.loads(text)
 
 
-def _retry_gemini(fn, max_retries: int = 3):
-    backoff = 5
-    for attempt in range(max_retries):
-        try:
-            return fn()
-        except Exception as exc:
-            exc_str = str(exc).lower()
-            is_retryable = any(
-                s in exc_str for s in ("429", "rate", "quota", "resource_exhausted", "503", "timeout")
-            )
-            if not is_retryable or attempt == max_retries - 1:
-                raise
-            logger.warning(f"Gemini retryable error (attempt {attempt+1}): {exc} — backing off {backoff}s")
-            _time.sleep(backoff)
-            backoff *= 2
-
-
 def _hq_normalize_model(provider: str, model: Optional[str] = None) -> str:
     if model:
         return model
     if provider == "groq":
-        return HQ_GROQ_MODEL
-    return GEMINI_MODEL
+        return cfg.HQ_GROQ_MODEL
+    if cfg.HQ_NORMALIZE_MODEL:
+        return cfg.HQ_NORMALIZE_MODEL
+    return cfg.SIGNAL_GEMINI_MODEL
 
 
 def _hq_provider_ready(provider: str) -> bool:
@@ -653,7 +515,7 @@ def _call_hq_llm(prompt: str, *, provider: str, model: str) -> str:
         )
         return resp.choices[0].message.content or ""
 
-    client = _get_gemini_client()
+    client = get_gemini_client()
     resp = client.models.generate_content(model=model, contents=prompt)
     return resp.text
 
@@ -716,7 +578,7 @@ def normalize_headquarters_batch(
         return _items_to_hq_map(_parse_hq_batch_response(raw))
 
     try:
-        return _retry_gemini(_do)
+        return retry_llm(_do)
     except Exception as exc:
         logger.warning(
             f"HQ batch normalization failed ({len(inputs)} items, {provider}/{model_id}): {exc}"
@@ -840,22 +702,16 @@ Respond with ONLY valid JSON matching this exact schema. No markdown, no explana
 {_JSON_SCHEMA}"""
 
     def _do():
-        client = _get_gemini_client()
-        resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-        raw = resp.text.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip().rstrip("`").strip()
-        data = json.loads(raw)
+        client = get_gemini_client()
+        resp = client.models.generate_content(model=cfg.SIGNAL_GEMINI_MODEL, contents=prompt)
+        data = json.loads(strip_json_fences(resp.text))
         return CompanySignalResult(**{
             k: data.get(k)
             for k in CompanySignalResult.model_fields
         })
 
     try:
-        return _retry_gemini(_do)
+        return retry_llm(_do)
     except Exception as exc:
         logger.warning(f"Gemini synthesis failed for {company_name}: {exc}")
         return _EMPTY_SIGNAL
@@ -891,25 +747,7 @@ def embed_company(
     if not text:
         return None
 
-    try:
-        from google.genai import types
-
-        def _do():
-            client = _get_gemini_client()
-            resp = client.models.embed_content(
-                model=EMBED_MODEL,
-                contents=text,
-                config=types.EmbedContentConfig(
-                    task_type="RETRIEVAL_DOCUMENT",
-                    output_dimensionality=768,
-                ),
-            )
-            return resp.embeddings[0].values
-
-        return _retry_gemini(_do)
-    except Exception as exc:
-        logger.warning(f"Embedding failed: {exc}")
-        return None
+    return embed_text(text)
 
 
 def build_search_tsv(
