@@ -135,6 +135,7 @@ def persist_result(session: Session, company_id: str, result: dict) -> bool:
             "signal_enrichment_status": result.get("signal_enrichment_status", "enriched"),
         })
         if result.get("signal_enrichment_status") != "failed":
+            from edges import edges_from_enrichment, upsert_edges
             from job_posts import persist_job_posts
             from signal_diff import persist_snapshot_and_events
             domain = result.get("domain")
@@ -145,6 +146,7 @@ def persist_result(session: Session, company_id: str, result: dict) -> bool:
                 )
                 result["concepts"] = concepts or result.get("concepts") or []
             persist_snapshot_and_events(session, company_id, domain, result)
+            upsert_edges(session, edges_from_enrichment(company_id, result))
         return True
     except Exception as exc:
         logger.error(f"DB write failed for {company_id}: {exc}")

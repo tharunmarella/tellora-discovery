@@ -208,6 +208,44 @@ class DiscoveryJobPost(SQLModel, table=True):
     )
 
 
+# ── DiscoveryEdge ──────────────────────────────────────────────────────────────
+
+class DiscoveryEdge(SQLModel, table=True):
+    """
+    Typed relationship between entities for multi-hop queries.
+
+    Entity types: company (discovery_company.id), person (normalized name slug),
+    vendor (tech key e.g. 'stripe'), customer (normalized company name).
+    Edge types: employs_exec | uses_vendor | has_customer | works_at | left_company
+    """
+    __tablename__ = "discovery_edge"
+
+    __table_args__ = (
+        Index("ix_discovery_edge_unique", "src_type", "src_id", "edge_type",
+              "dst_type", "dst_id", unique=True),
+        Index("ix_discovery_edge_src", "src_type", "src_id"),
+        Index("ix_discovery_edge_dst", "dst_type", "dst_id"),
+    )
+
+    id: str = Field(default_factory=_uuid, sa_column=Column(String, primary_key=True))
+    src_type: str = Field(sa_column=Column(String, nullable=False))
+    src_id: str = Field(sa_column=Column(String, nullable=False))
+    edge_type: str = Field(sa_column=Column(String, nullable=False, index=True))
+    dst_type: str = Field(sa_column=Column(String, nullable=False))
+    dst_id: str = Field(sa_column=Column(String, nullable=False))
+    payload: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    source: str = Field(sa_column=Column(String, nullable=False))
+    observed_at: datetime = Field(
+        default_factory=_utc_now, sa_column=Column(TIMESTAMP(timezone=True), nullable=False)
+    )
+    last_seen_at: datetime = Field(
+        default_factory=_utc_now, sa_column=Column(TIMESTAMP(timezone=True), nullable=False)
+    )
+    created_at: datetime = Field(
+        default_factory=_utc_now, sa_column=Column(TIMESTAMP(timezone=True), nullable=False)
+    )
+
+
 # ── DiscoveryFiling ────────────────────────────────────────────────────────────
 
 class DiscoveryFiling(SQLModel, table=True):

@@ -1204,6 +1204,7 @@ async def enrich_company_signals(
         "concepts":                 concepts,
         "pricing_model":            result.pricing_model,
         "recent_launches":          result.recent_launches,
+        "known_customers":          result.known_customers,
         "page_fingerprints":        {
             "pricing": page_fingerprint(pricing_text),
             "changelog": page_fingerprint(changelog_text),
