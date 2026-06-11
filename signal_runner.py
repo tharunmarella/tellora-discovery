@@ -134,6 +134,17 @@ def persist_result(session: Session, company_id: str, result: dict) -> bool:
             "signal_enriched_at":       result.get("signal_enriched_at") or datetime.now(timezone.utc),
             "signal_enrichment_status": result.get("signal_enrichment_status", "enriched"),
         })
+        if result.get("signal_enrichment_status") != "failed":
+            from job_posts import persist_job_posts
+            from signal_diff import persist_snapshot_and_events
+            domain = result.get("domain")
+            posts = result.get("job_posts") or []
+            if posts:
+                concepts = persist_job_posts(
+                    session, company_id, posts, result.get("job_source") or "none",
+                )
+                result["concepts"] = concepts or result.get("concepts") or []
+            persist_snapshot_and_events(session, company_id, domain, result)
         return True
     except Exception as exc:
         logger.error(f"DB write failed for {company_id}: {exc}")
@@ -191,6 +202,7 @@ async def _process_company(row: dict, sem: asyncio.Semaphore) -> dict:
                 "signal_enriched_at": None,
             }
         result["id"] = company_id
+        result["domain"] = row.get("domain")
         await asyncio.sleep(1)
         return result
 

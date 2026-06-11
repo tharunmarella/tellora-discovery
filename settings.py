@@ -27,12 +27,25 @@ HQ_GROQ_MODEL: str = os.getenv("HQ_GROQ_MODEL", "openai/gpt-oss-20b").strip()
 ENRICHMENT_GEMINI_MODEL: str = os.getenv("ENRICHMENT_GEMINI_MODEL", "gemini-2.5-flash-lite")
 SIGNAL_GEMINI_MODEL: str = os.getenv("SIGNAL_GEMINI_MODEL", "gemini-3.1-flash-lite")
 
-# Redis key — backend ARQ worker listens for enriched company domains
+# Redis keys — backend ARQ worker listens for enriched company domains / instant alerts
 SIGNALS_READY_KEY: str = "tellora:signals_ready"
+SIGNALS_ALERT_KEY: str = "tellora:signals_alert"
+
+# Staleness refresh cap per weekly sweep
+REFRESH_BATCH_CAP: int = int(os.getenv("REFRESH_BATCH_CAP", "500"))
 
 # Serper.dev — primary web search. Get a key at https://serper.dev
 # Falls back to DDG if not set.
 SERPER_API_KEY: str = os.getenv("SERPER_API_KEY", "")
+
+# GitHub REST API — optional token raises rate limit 60/hr → 5k/hr.
+GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
+
+# SEC EDGAR fair-access policy requires an identifying User-Agent.
+EDGAR_USER_AGENT: str = os.getenv("EDGAR_USER_AGENT", "Tellora Research research@tellora.ai")
+
+# Max new discovery_company rows auto-created per daily EDGAR poll.
+EDGAR_AUTO_CREATE_CAP: int = int(os.getenv("EDGAR_AUTO_CREATE_CAP", "25"))
 
 # Redis — used to notify the backend worker after company signals are enriched
 REDIS_URL: str = os.getenv("REDIS_URL", "redis://redis:6379")

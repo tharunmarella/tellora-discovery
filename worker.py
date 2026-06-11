@@ -19,12 +19,19 @@ Running:
 import logging
 
 import redis.asyncio as aioredis
+from arq import cron
 from arq.connections import RedisSettings
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 import settings as cfg
 from database import make_engine
+from monitoring_tasks import (
+    poll_edgar_form_d_task,
+    poll_job_posts_task,
+    refresh_stale_index_task,
+    refresh_watched_companies_task,
+)
 
 logger = logging.getLogger("discovery.worker")
 
@@ -80,7 +87,7 @@ async def enrich_company_task(ctx, company_id: str) -> dict:
         result = await enrich_company_signals(
             company_id=company_id,
             company_name=company_name,
-            domain=domain,
+            domain=domain or "",
             description=row.get("description"),
             industry=row.get("industry"),
             raw_meta=row.get("raw_meta"),
@@ -93,6 +100,8 @@ async def enrich_company_task(ctx, company_id: str) -> dict:
             session.execute(_MARK_FAILED, {"company_id": company_id})
             session.commit()
         raise  # let ARQ retry
+
+    result["domain"] = domain
 
     # Persist result via the shared helper (also used by the CLI backfill runner)
     with Session(_engine) as session:
@@ -138,10 +147,22 @@ class WorkerSettings:
     the backend. Stays disjoint from the weekly discovery job, which scrapes
     and enriches its own companies inline.
     """
-    functions = [enrich_company_task]
+    functions = [
+        enrich_company_task,
+        refresh_watched_companies_task,
+        refresh_stale_index_task,
+        poll_job_posts_task,
+        poll_edgar_form_d_task,
+    ]
     queue_name = "arq:ondemand"
     redis_settings = _redis_settings
     on_startup = startup
     on_shutdown = shutdown
     max_jobs = 5
     job_timeout = 600
+    cron_jobs = [
+        cron(refresh_watched_companies_task, weekday=0, hour=4, minute=0),
+        cron(refresh_stale_index_task, weekday=0, hour=5, minute=0),
+        cron(poll_job_posts_task, hour=6, minute=0),
+        cron(poll_edgar_form_d_task, hour=10, minute=0),
+    ]

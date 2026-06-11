@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 import uuid
 
 from sqlmodel import SQLModel, Field, Column, String
-from sqlalchemy import TIMESTAMP, Text, Boolean, Integer
+from sqlalchemy import TIMESTAMP, Text, Boolean, Integer, Float, Index
 from sqlalchemy.dialects.postgresql import JSONB, ARRAY, TSVECTOR
 from pgvector.sqlalchemy import Vector
 
@@ -75,6 +75,11 @@ class DiscoveryCompany(SQLModel, table=True):
         default=None, sa_column=Column(ARRAY(Text), nullable=True)
     )
 
+    # Origin of this row: apollo (weekly scrape) | ora_research | manual | people_upload | sec_edgar
+    source: str = Field(
+        default="apollo", sa_column=Column(String, nullable=False, server_default="apollo", index=True)
+    )
+
     domain_resolved: bool = Field(
         default=False, sa_column=Column(Boolean, nullable=False, server_default="false")
     )
@@ -115,6 +120,126 @@ class DiscoveryCompany(SQLModel, table=True):
         default_factory=_utc_now, sa_column=Column(TIMESTAMP(timezone=True), nullable=False)
     )
     updated_at: datetime = Field(
+        default_factory=_utc_now, sa_column=Column(TIMESTAMP(timezone=True), nullable=False)
+    )
+
+
+# ── DiscoveryCompanySnapshot ───────────────────────────────────────────────────
+
+class DiscoveryCompanySnapshot(SQLModel, table=True):
+    """Point-in-time observation of company signals — never updated, only appended."""
+    __tablename__ = "discovery_company_snapshot"
+
+    id: str = Field(default_factory=_uuid, sa_column=Column(String, primary_key=True))
+    company_id: str = Field(sa_column=Column(String, nullable=False, index=True))
+    captured_at: datetime = Field(
+        default_factory=_utc_now, sa_column=Column(TIMESTAMP(timezone=True), nullable=False, index=True)
+    )
+    hiring_count: Optional[int] = Field(default=None, sa_column=Column(Integer, nullable=True))
+    hiring_roles: Optional[List[str]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    tech_stack: Optional[List[str]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    funding_stage: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
+    total_raised: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
+    headcount: Optional[int] = Field(default=None, sa_column=Column(Integer, nullable=True))
+    buying_signals: Optional[List[str]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    concepts: Optional[List[str]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    pricing_model: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
+    page_fingerprints: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    recent_launches: Optional[List[str]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+
+
+# ── DiscoverySignalEvent ───────────────────────────────────────────────────────
+
+class DiscoverySignalEvent(SQLModel, table=True):
+    """Typed, time-aware signal event emitted when company state changes."""
+    __tablename__ = "discovery_signal_event"
+
+    __table_args__ = (
+        Index("ix_discovery_signal_event_dedupe", "dedupe_key", unique=True),
+        Index("ix_discovery_signal_event_company_observed", "company_id", "observed_at"),
+    )
+
+    id: str = Field(default_factory=_uuid, sa_column=Column(String, primary_key=True))
+    company_id: str = Field(sa_column=Column(String, nullable=False, index=True))
+    event_type: str = Field(sa_column=Column(String, nullable=False, index=True))
+    title: str = Field(sa_column=Column(Text, nullable=False))
+    payload: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    source: str = Field(sa_column=Column(String, nullable=False))
+    observed_at: datetime = Field(
+        default_factory=_utc_now, sa_column=Column(TIMESTAMP(timezone=True), nullable=False, index=True)
+    )
+    confidence: float = Field(default=1.0, sa_column=Column(Float, nullable=False, server_default="1"))
+    dedupe_key: str = Field(sa_column=Column(String, nullable=False))
+    created_at: datetime = Field(
+        default_factory=_utc_now, sa_column=Column(TIMESTAMP(timezone=True), nullable=False)
+    )
+
+
+# ── DiscoveryJobPost ───────────────────────────────────────────────────────────
+
+class DiscoveryJobPost(SQLModel, table=True):
+    """Individual job posting with extracted concepts — keyed by external ATS id."""
+    __tablename__ = "discovery_job_post"
+
+    __table_args__ = (
+        Index("ix_discovery_job_post_company_external", "company_id", "external_id", unique=True),
+    )
+
+    id: str = Field(default_factory=_uuid, sa_column=Column(String, primary_key=True))
+    company_id: str = Field(sa_column=Column(String, nullable=False, index=True))
+    external_id: str = Field(sa_column=Column(String, nullable=False))
+    title: str = Field(sa_column=Column(String, nullable=False))
+    location: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
+    body_text: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
+    role_family: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True, index=True))
+    seniority: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
+    concepts: Optional[List[str]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    tech: Optional[List[str]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    initiatives: Optional[List[str]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    source: str = Field(sa_column=Column(String, nullable=False))
+    first_seen_at: datetime = Field(
+        default_factory=_utc_now, sa_column=Column(TIMESTAMP(timezone=True), nullable=False)
+    )
+    last_seen_at: datetime = Field(
+        default_factory=_utc_now, sa_column=Column(TIMESTAMP(timezone=True), nullable=False)
+    )
+    closed_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(TIMESTAMP(timezone=True), nullable=True)
+    )
+
+
+# ── DiscoveryFiling ────────────────────────────────────────────────────────────
+
+class DiscoveryFiling(SQLModel, table=True):
+    """
+    Parsed SEC Form D filing (exempt securities offering = funding round).
+    Tech-relevant filings are stored even when no discovery_company matches,
+    so newly funded startups can be auto-added to the index.
+    """
+    __tablename__ = "discovery_filing"
+
+    __table_args__ = (
+        Index("ix_discovery_filing_accession", "accession_no", unique=True),
+        Index("ix_discovery_filing_normalized_name", "normalized_name"),
+    )
+
+    id: str = Field(default_factory=_uuid, sa_column=Column(String, primary_key=True))
+    accession_no: str = Field(sa_column=Column(String, nullable=False))
+    cik: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
+    entity_name: str = Field(sa_column=Column(String, nullable=False))
+    normalized_name: str = Field(sa_column=Column(String, nullable=False))
+    form_type: str = Field(default="D", sa_column=Column(String, nullable=False, server_default="D"))
+    filed_at: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
+    industry_group: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True, index=True))
+    is_tech: bool = Field(default=False, sa_column=Column(Boolean, nullable=False, server_default="false", index=True))
+    offering_amount: Optional[float] = Field(default=None, sa_column=Column(Float, nullable=True))
+    amount_sold: Optional[float] = Field(default=None, sa_column=Column(Float, nullable=True))
+    revenue_range: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
+    date_of_first_sale: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
+    state: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
+    related_persons: Optional[List[Dict[str, Any]]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    matched_company_id: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True, index=True))
+    created_at: datetime = Field(
         default_factory=_utc_now, sa_column=Column(TIMESTAMP(timezone=True), nullable=False)
     )
 

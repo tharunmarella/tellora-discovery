@@ -24,10 +24,25 @@ engine = make_engine(
 )
 
 
+# Idempotent column additions for tables that pre-date newer model fields
+# (create_all only creates missing tables, never alters existing ones).
+_ENSURE_COLUMNS_SQL = """
+ALTER TABLE discovery_company_snapshot ADD COLUMN IF NOT EXISTS pricing_model VARCHAR;
+ALTER TABLE discovery_company_snapshot ADD COLUMN IF NOT EXISTS page_fingerprints JSONB;
+ALTER TABLE discovery_company_snapshot ADD COLUMN IF NOT EXISTS recent_launches JSONB;
+ALTER TABLE discovery_company ADD COLUMN IF NOT EXISTS source VARCHAR NOT NULL DEFAULT 'apollo';
+"""
+
+
 def create_tables() -> None:
     """Create discovery_company and discovery_progress tables if they don't exist."""
+    from sqlalchemy import text as _text
     import models  # noqa: F401 — registers SQLModel metadata
     SQLModel.metadata.create_all(engine, checkfirst=True)
+    with engine.begin() as conn:
+        for stmt in _ENSURE_COLUMNS_SQL.strip().split("\n"):
+            if stmt.strip():
+                conn.execute(_text(stmt))
     logger.info("Tables verified/created")
 
 

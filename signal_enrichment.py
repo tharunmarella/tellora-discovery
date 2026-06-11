@@ -14,6 +14,7 @@ Model: gemini-3.1-flash-lite  ($0.25/$1.50 per 1M tokens, stable)
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -220,6 +221,83 @@ async def detect_tech_stack(domain: str) -> list[str]:
     return detected
 
 
+# ── DNS TXT/MX tech detection ──────────────────────────────────────────────
+
+# Domain-verification TXT records prove actual vendor usage (unlike marketing pages)
+_DNS_TXT_PATTERNS: dict[str, str] = {
+    "google-site-verification": "google_workspace",
+    "ms=": "microsoft365",
+    "atlassian-domain-verification": "atlassian",
+    "stripe-verification": "stripe",
+    "hubspot": "hubspot",
+    "zoom": "zoom",
+    "docusign": "docusign",
+    "slack-domain-verification": "slack",
+    "notion": "notion",
+    "miro-verification": "miro",
+    "openai-domain-verification": "openai",
+    "linear-domain-verification": "linear",
+    "facebook-domain-verification": "meta_ads",
+    "apple-domain-verification": "apple_business",
+    "canva-site-verification": "canva",
+    "loom-verification": "loom",
+    "webex": "webex",
+    "dropbox-domain-verification": "dropbox",
+}
+
+
+def _detect_dns_tech_sync(domain: str) -> list[str]:
+    """Resolve TXT + MX records and map them to vendors. Synchronous (dnspython)."""
+    if not domain:
+        return []
+    try:
+        import dns.resolver
+    except ImportError:
+        logger.warning("dnspython not installed — skipping DNS tech detection")
+        return []
+
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = 5
+    resolver.lifetime = 8
+
+    detected: set[str] = set()
+
+    try:
+        for rdata in resolver.resolve(domain, "TXT"):
+            rec = b"".join(rdata.strings).decode("utf-8", errors="ignore").lower()
+            for needle, vendor in _DNS_TXT_PATTERNS.items():
+                if needle in rec:
+                    detected.add(vendor)
+    except Exception:
+        pass
+
+    try:
+        for rdata in resolver.resolve(domain, "MX"):
+            host = str(rdata.exchange).lower()
+            if "google" in host:
+                detected.add("google_workspace")
+            elif "outlook" in host or "microsoft" in host:
+                detected.add("microsoft365")
+            elif "zoho" in host:
+                detected.add("zoho")
+            elif "proofpoint" in host:
+                detected.add("proofpoint")
+    except Exception:
+        pass
+
+    return sorted(detected)
+
+
+async def detect_dns_tech(domain: str) -> list[str]:
+    """Async wrapper — DNS resolution runs in a thread to keep the loop free."""
+    loop = asyncio.get_event_loop()
+    try:
+        return await loop.run_in_executor(None, _detect_dns_tech_sync, domain)
+    except Exception as exc:
+        logger.warning(f"DNS tech detection failed for {domain}: {exc}")
+        return []
+
+
 # ── Jina helpers ───────────────────────────────────────────────────────────
 
 async def _jina_read(url: str, max_chars: int = 3000) -> str:
@@ -246,27 +324,43 @@ async def _jina_read(url: str, max_chars: int = 3000) -> str:
         return ""
 
 
+def page_fingerprint(text_content: str) -> str:
+    """Stable SHA1 fingerprint of normalized page text. '' for empty pages."""
+    if not text_content or len(text_content.strip()) < 100:
+        return ""
+    normalized = re.sub(r"\s+", " ", text_content).strip().lower()
+    return hashlib.sha1(normalized.encode()).hexdigest()[:16]
+
+
 async def fetch_company_context(domain: str) -> dict:
     """
-    Fetch homepage + /about + /careers via Jina Reader.
-    Cached per domain for 1 hour. Returns {homepage, about, careers}.
+    Fetch homepage + /about + /careers + /pricing + /customers + /changelog
+    via Jina Reader. Cached per domain for 1 hour.
+    Returns {homepage, about, careers, pricing, customers, changelog}.
     """
+    empty = {"homepage": "", "about": "", "careers": "",
+             "pricing": "", "customers": "", "changelog": ""}
     if not domain:
-        return {"homepage": "", "about": "", "careers": ""}
+        return empty
 
     cached = _DOMAIN_CACHE.get(domain)
     if cached:
         ts, ctx = cached
-        if _time.time() - ts < _DOMAIN_CACHE_TTL:
+        if _time.time() - ts < _DOMAIN_CACHE_TTL and "pricing" in ctx:
             return ctx
         del _DOMAIN_CACHE[domain]
 
     base = f"https://{domain}" if not domain.startswith("http") else domain
 
-    homepage_text, about_text, careers_text = await asyncio.gather(
-        _jina_read(base, max_chars=3000),
-        _jina_read(f"{base}/about", max_chars=2000),
-        _jina_read(f"{base}/careers", max_chars=2000),
+    homepage_text, about_text, careers_text, pricing_text, customers_text, changelog_text = (
+        await asyncio.gather(
+            _jina_read(base, max_chars=8000),
+            _jina_read(f"{base}/about", max_chars=2000),
+            _jina_read(f"{base}/careers", max_chars=2000),
+            _jina_read(f"{base}/pricing", max_chars=2000),
+            _jina_read(f"{base}/customers", max_chars=2000),
+            _jina_read(f"{base}/changelog", max_chars=2000),
+        )
     )
 
     if len(about_text) < 200:
@@ -282,13 +376,63 @@ async def fetch_company_context(domain: str) -> dict:
             if len(careers_text) >= 200:
                 break
 
-    ctx = {"homepage": homepage_text, "about": about_text, "careers": careers_text}
+    if len(customers_text) < 200:
+        alt = await _jina_read(f"{base}/case-studies", max_chars=2000)
+        if len(alt) > len(customers_text):
+            customers_text = alt
+
+    if len(changelog_text) < 200:
+        for path in ["/blog", "/whats-new", "/releases"]:
+            alt = await _jina_read(f"{base}{path}", max_chars=2000)
+            if len(alt) > len(changelog_text):
+                changelog_text = alt
+            if len(changelog_text) >= 200:
+                break
+
+    ctx = {
+        "homepage": homepage_text,
+        "about": about_text,
+        "careers": careers_text,
+        "pricing": pricing_text,
+        "customers": customers_text,
+        "changelog": changelog_text,
+    }
     _DOMAIN_CACHE[domain] = (_time.time(), ctx)
     logger.info(
         f"Company context for {domain}: "
-        f"homepage={len(homepage_text)}c, about={len(about_text)}c, careers={len(careers_text)}c"
+        f"homepage={len(homepage_text)}c, about={len(about_text)}c, careers={len(careers_text)}c, "
+        f"pricing={len(pricing_text)}c, customers={len(customers_text)}c, changelog={len(changelog_text)}c"
     )
     return ctx
+
+
+async def fetch_exec_hire_news(company_name: str) -> list[dict]:
+    """Serper news for executive hires at a company."""
+    if not company_name or not cfg.SERPER_API_KEY:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            resp = await client.post(
+                "https://google.serper.dev/news",
+                headers={
+                    "X-API-KEY": cfg.SERPER_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "q": f'"{company_name}" hires OR appoints OR "joins as" VP OR Chief OR Head',
+                    "num": 4,
+                    "tbs": "qdr:m3",
+                },
+            )
+            resp.raise_for_status()
+            return [
+                {"title": h.get("title", ""), "url": h.get("link", ""), "date": h.get("date", "")}
+                for h in resp.json().get("news", [])[:4]
+                if h.get("title")
+            ]
+    except Exception as exc:
+        logger.warning(f"Exec hire news failed for '{company_name}': {exc}")
+        return []
 
 
 async def fetch_funding_news(company_name: str) -> list[str]:
@@ -409,6 +553,11 @@ class CompanySignalResult(BaseModel):
         description="One of: enterprise, self-serve, freemium, usage-based. null if unclear.",
     )
     known_customers: list[str] = Field(default_factory=list)
+    recent_launches: list[str] = Field(
+        default_factory=list,
+        description="Product launches/releases visible in changelog/blog text, "
+                    "e.g. 'AI Gateway GA (2026-06)'. Empty if none.",
+    )
     hq_city: Optional[str] = Field(
         None,
         description="Canonical English city name (GeoNames-style). null if unknown.",
@@ -441,6 +590,7 @@ _JSON_SCHEMA = """{
   "tech_stack": ["<tool1>", "<tool2>"],
   "pricing_model": "<enterprise|self-serve|freemium|usage-based or null>",
   "known_customers": ["<customer1>"],
+  "recent_launches": ["<launch title (date if visible)>"],
   "hq_city": "<canonical English city or null>",
   "hq_region": "<ISO 3166-2 subdivision or null>",
   "hq_country": "<ISO 3166-1 alpha-2 or null>"
@@ -613,6 +763,9 @@ def synthesize_company_signals(
     funding_news: list[str],
     serper_kg: Optional[dict] = None,
     existing_headquarters: Optional[str] = None,
+    pricing_text: str = "",
+    customers_text: str = "",
+    changelog_text: str = "",
 ) -> CompanySignalResult:
     """
     Send all company evidence to Gemini and receive a structured CompanySignalResult.
@@ -670,7 +823,10 @@ STRICT RULES:
 3. signal_score: 0=no evidence, 40=some signals, 70=strong buying triggers, 90+=exceptional.
 4. company_summary: what the company does, who they sell to, market position. From homepage/about only. null if text is too thin.
 5. buying_signals: concrete, time-sensitive triggers only (funding rounds, hiring sprees, product launches, expansions).
-6. {_HQ_NORMALIZATION_RULES}
+6. pricing_model: ground in the PRICING PAGE text when available.
+7. known_customers: named customers from the CUSTOMERS PAGE / homepage logos.
+8. recent_launches: product launches/releases visible in the CHANGELOG/BLOG text, with dates when shown.
+9. {_HQ_NORMALIZATION_RULES}
 
 COMPANY: {company_name}
 
@@ -698,6 +854,15 @@ COMPANY ABOUT PAGE:
 COMPANY CAREERS PAGE:
 {careers_text or "Unavailable"}
 
+COMPANY PRICING PAGE:
+{pricing_text or "Unavailable"}
+
+COMPANY CUSTOMERS PAGE:
+{customers_text or "Unavailable"}
+
+COMPANY CHANGELOG / BLOG:
+{changelog_text or "Unavailable"}
+
 Respond with ONLY valid JSON matching this exact schema. No markdown, no explanation:
 {_JSON_SCHEMA}"""
 
@@ -724,6 +889,7 @@ def embed_company(
     description: Optional[str],
     industry: Optional[str],
     tech_stack: list[str],
+    recent_launches: Optional[list[str]] = None,
 ) -> Optional[list[float]]:
     """
     Embed company text for semantic search using gemini-embedding-001.
@@ -742,6 +908,8 @@ def embed_company(
         parts.append(industry)
     if tech_stack:
         parts.append(", ".join(tech_stack))
+    if recent_launches:
+        parts.append("Recent launches: " + "; ".join(recent_launches[:5]))
 
     text = " ".join(filter(None, parts)).strip()
     if not text:
@@ -756,6 +924,8 @@ def build_search_tsv(
     industry: Optional[str],
     tech_stack: list[str],
     raw_meta: Optional[dict],
+    recent_launches: Optional[list[str]] = None,
+    known_customers: Optional[list[str]] = None,
 ) -> str:
     """
     Build a concatenated plain-text string to be converted to tsvector in Postgres.
@@ -770,6 +940,10 @@ def build_search_tsv(
         parts.append(industry)
     if tech_stack:
         parts.append(" ".join(tech_stack))
+    if recent_launches:
+        parts.append(" ".join(recent_launches))
+    if known_customers:
+        parts.append(" ".join(known_customers))
     if raw_meta:
         if raw_meta.get("keywords"):
             kws = raw_meta["keywords"]
@@ -804,27 +978,53 @@ async def enrich_company_signals(
     """
     logger.info(f"[{company_name}] Starting signal enrichment")
 
-    # Step 1 — parallel signal gathering (5 sources)
+    # Step 1 — parallel signal gathering
+    from github_signals import fetch_github_signals, github_extra_events
+    from job_posts import fetch_job_board_posts
+    from news_signals import classify_news, fetch_company_news
+
     ctx_task     = asyncio.create_task(fetch_company_context(domain))
-    jobs_task    = asyncio.create_task(check_job_boards(company_name))
+    jobs_task    = asyncio.create_task(fetch_job_board_posts(company_name))
     news_task    = asyncio.create_task(fetch_funding_news(company_name))
     tech_task    = asyncio.create_task(detect_tech_stack(domain))
     kg_task = asyncio.create_task(fetch_serper_kg(company_name))
+    dns_task = asyncio.create_task(detect_dns_tech(domain))
+    gh_task = asyncio.create_task(fetch_github_signals(domain))
+    rss_task = asyncio.create_task(fetch_company_news(company_name))
     need_apollo_hc = not (existing_headcount and existing_headcount > 0)
     if need_apollo_hc:
         apollo_task = asyncio.create_task(fetch_apollo_headcount(domain))
-        ctx, job_board, funding_news, tech_stack, serper_kg, apollo_hc = await asyncio.gather(
-            ctx_task, jobs_task, news_task, tech_task, kg_task, apollo_task
+        (ctx, job_posts_result, funding_news, tech_stack, serper_kg,
+         dns_tech, github, rss_news, apollo_hc) = await asyncio.gather(
+            ctx_task, jobs_task, news_task, tech_task, kg_task,
+            dns_task, gh_task, rss_task, apollo_task,
         )
     else:
-        ctx, job_board, funding_news, tech_stack, serper_kg = await asyncio.gather(
-            ctx_task, jobs_task, news_task, tech_task, kg_task
+        (ctx, job_posts_result, funding_news, tech_stack, serper_kg,
+         dns_tech, github, rss_news) = await asyncio.gather(
+            ctx_task, jobs_task, news_task, tech_task, kg_task,
+            dns_task, gh_task, rss_task,
         )
         apollo_hc = {}
+
+    # DNS-verified vendors + GitHub languages beat homepage regex — merge all
+    tech_stack = list(dict.fromkeys(
+        list(tech_stack) + list(dns_tech) + list(github.get("languages") or [])
+    ))
+
+    job_posts, job_source = job_posts_result if isinstance(job_posts_result, tuple) else ([], "none")
+    job_board = {
+        "count": len(job_posts),
+        "roles": [p.get("title", "") for p in job_posts[:10]],
+        "source": job_source,
+    }
 
     homepage_text = ctx.get("homepage", "")
     about_text    = ctx.get("about", "")
     careers_text  = ctx.get("careers", "")
+    pricing_text  = ctx.get("pricing", "")
+    customers_text = ctx.get("customers", "")
+    changelog_text = ctx.get("changelog", "")
 
     # Step 2 — Gemini synthesis (run in executor to keep event loop free)
     loop = asyncio.get_event_loop()
@@ -840,7 +1040,30 @@ async def enrich_company_signals(
         funding_news,
         serper_kg,
         existing_headquarters,
+        pricing_text,
+        customers_text,
+        changelog_text,
     )
+
+    # News: Google News RSS + Gemini classifier (free); Serper exec-hire as fallback
+    news_events: list[dict] = []
+    if rss_news:
+        news_events = await loop.run_in_executor(None, classify_news, company_name, rss_news)
+        exec_news = []
+    else:
+        exec_news = await fetch_exec_hire_news(company_name)
+
+    loop2 = asyncio.get_event_loop()
+    if job_posts:
+        from job_posts import extract_posts_with_gemini
+        job_posts = await loop2.run_in_executor(None, extract_posts_with_gemini, job_posts)
+
+    concepts: list[str] = []
+    for p in job_posts:
+        concepts.extend(p.get("concepts") or [])
+    concepts = list(dict.fromkeys(c.lower() for c in concepts if c))
+
+    merged_tech = list(dict.fromkeys((result.tech_stack or []) + tech_stack))
 
     # Step 3 — Re-embed with richer text
     embedding: Optional[list[float]] = await loop.run_in_executor(
@@ -849,7 +1072,8 @@ async def enrich_company_signals(
         result.company_summary,
         description,
         industry,
-        result.tech_stack or tech_stack,
+        merged_tech,
+        result.recent_launches,
     )
 
     # Step 4 — build search_tsv text (Postgres will convert to tsvector via to_tsvector())
@@ -857,9 +1081,13 @@ async def enrich_company_signals(
         company_summary=result.company_summary,
         description=description,
         industry=industry,
-        tech_stack=result.tech_stack or tech_stack,
+        tech_stack=merged_tech,
         raw_meta=raw_meta,
+        recent_launches=result.recent_launches,
+        known_customers=result.known_customers,
     )
+    if concepts:
+        tsv_text = f"{tsv_text} {' '.join(concepts)}".strip()
 
     logger.info(
         f"[{company_name}] Done — signal_score={result.signal_score}, "
@@ -867,13 +1095,25 @@ async def enrich_company_signals(
     )
 
     # Headcount priority: Gemini extraction → Serper KG → Apollo people-count proxy.
-    # The Apollo proxy fills the common gap where Gemini/KG have no size data.
     headcount = (
         result.headcount
         or serper_kg.get("headcount")
         or (existing_headcount if existing_headcount and existing_headcount > 0 else None)
         or apollo_hc.get("headcount_estimate")
     )
+
+    extra_events = list(news_events)
+    extra_events.extend(github_extra_events(github))
+    extra_events.extend([
+        {
+            "event_type": "exec_hire",
+            "title": h["title"][:500],
+            "payload": {"key": h.get("url", h["title"])[:120], "url": h.get("url"), "date": h.get("date")},
+            "source": "serper_news",
+            "confidence": 0.85,
+        }
+        for h in (exec_news or [])[:2]
+    ])
 
     return {
         "company_summary":          result.company_summary,
@@ -884,7 +1124,7 @@ async def enrich_company_signals(
         "headcount":                headcount,
         "hiring_roles":             result.hiring_roles or job_board.get("roles", []),
         "hiring_count":             job_board.get("count") or len(result.hiring_roles),
-        "tech_stack":               result.tech_stack or tech_stack,
+        "tech_stack":               merged_tech,
         "description_embedding":    embedding,
         "tsv_text":                 tsv_text,
         "hq_city":                  result.hq_city,
@@ -892,4 +1132,15 @@ async def enrich_company_signals(
         "hq_country":               result.hq_country,
         "signal_enriched_at":       datetime.now(timezone.utc),
         "signal_enrichment_status": "enriched" if result.company_summary else "failed",
+        "job_posts":                job_posts,
+        "job_source":               job_source,
+        "concepts":                 concepts,
+        "pricing_model":            result.pricing_model,
+        "recent_launches":          result.recent_launches,
+        "page_fingerprints":        {
+            "pricing": page_fingerprint(pricing_text),
+            "changelog": page_fingerprint(changelog_text),
+        },
+        "github_org":               github.get("org"),
+        "extra_events":             extra_events,
     }
