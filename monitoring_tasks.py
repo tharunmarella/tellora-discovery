@@ -146,6 +146,33 @@ async def poll_edgar_form_d_task(ctx) -> dict:
     }
 
 
+async def poll_product_hunt_task(ctx) -> dict:
+    """Daily: match Product Hunt launches to companies; auto-create unmatched (capped)."""
+    from news_signals import (
+        create_companies_from_launches,
+        fetch_product_hunt_launches,
+        match_ph_launches,
+    )
+
+    launches = await fetch_product_hunt_launches()
+    if not launches:
+        return {"launches": 0, "matched": 0, "created": 0}
+
+    with Session(_engine) as session:
+        matched_domains = match_ph_launches(session, launches)
+        session.commit()
+
+    with Session(_engine) as session:
+        created = await create_companies_from_launches(session, launches)
+        session.commit()
+
+    logger.info(
+        f"Product Hunt poll: {len(launches)} launches, "
+        f"{len(matched_domains)} matched, {created} auto-created"
+    )
+    return {"launches": len(launches), "matched": len(matched_domains), "created": created}
+
+
 async def poll_job_posts_task(ctx) -> dict:
     """Daily: poll ATS for watched accounts only."""
     from job_posts import fetch_job_board_posts, extract_posts_with_gemini, persist_job_posts

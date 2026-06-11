@@ -47,6 +47,9 @@ EDGAR_USER_AGENT: str = os.getenv("EDGAR_USER_AGENT", "Tellora Research research
 # Max new discovery_company rows auto-created per daily EDGAR poll.
 EDGAR_AUTO_CREATE_CAP: int = int(os.getenv("EDGAR_AUTO_CREATE_CAP", "25"))
 
+# Max new discovery_company rows auto-created per daily Product Hunt poll.
+PH_AUTO_CREATE_CAP: int = int(os.getenv("PH_AUTO_CREATE_CAP", "10"))
+
 # Redis — used to notify the backend worker after company signals are enriched
 REDIS_URL: str = os.getenv("REDIS_URL", "redis://redis:6379")
 

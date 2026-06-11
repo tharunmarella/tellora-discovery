@@ -39,6 +39,7 @@ EVENT_WEIGHTS = {
     "product_launch": 18,
     "pricing_change": 14,
     "news_mention": 10,
+    "gov_contract": 20,
 }
 
 
@@ -378,6 +379,22 @@ def persist_snapshot_and_events(
     """
     snap = snapshot_from_result(result)
     prev = _load_latest_snapshot(session, company_id)
+    if prev is None:
+        baseline = result.get("baseline_fingerprints") or {}
+        if baseline.get("pricing"):
+            prev = {
+                "hiring_count": 0,
+                "hiring_roles": [],
+                "tech_stack": [],
+                "funding_stage": None,
+                "total_raised": None,
+                "headcount": None,
+                "buying_signals": [],
+                "concepts": [],
+                "pricing_model": None,
+                "page_fingerprints": {"pricing": baseline["pricing"], "changelog": ""},
+                "recent_launches": [],
+            }
     events = diff_snapshots(prev, snap)
     write_snapshot(session, company_id, snap)
 

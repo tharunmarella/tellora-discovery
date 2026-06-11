@@ -30,7 +30,7 @@ _API = "https://api.github.com"
 _GH_CACHE: dict[str, tuple[float, dict]] = {}
 _GH_CACHE_TTL = 24 * 3600
 
-_EMPTY = {"org": None, "languages": [], "new_repos": [], "repo_count": 0}
+_EMPTY = {"org": None, "languages": [], "new_repos": [], "repo_count": 0, "new_npm_releases": [], "npm_package_count": 0}
 
 
 def _headers() -> dict:
@@ -117,6 +117,51 @@ async def fetch_github_signals(domain: str) -> dict:
                         })
                 result["languages"] = sorted(langs, key=langs.get, reverse=True)
                 result["repo_count"] = len(repos)
+
+                # npm scope releases (devtools signal) — @{org} search
+                # Use a plain client — GitHub Accept headers break the npm registry API.
+                npm_cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+                org_login = org["login"]
+                try:
+                    async with httpx.AsyncClient(timeout=15) as npm_client:
+                        for query in (f"@{org_login}", f"scope:{org_login}"):
+                            nr = await npm_client.get(
+                                "https://registry.npmjs.org/-/v1/search",
+                                params={"text": query, "size": 30},
+                            )
+                            if nr.status_code != 200:
+                                continue
+                            objects = nr.json().get("objects", [])
+                            if not objects:
+                                continue
+                            result["npm_package_count"] = nr.json().get("total", len(objects))
+                            seen_pkg: set[str] = set()
+                            for obj in objects:
+                                pkg = obj.get("package", {})
+                                name = pkg.get("name", "")
+                                if not name or name in seen_pkg:
+                                    continue
+                                if not (name.startswith(f"@{org_login}/") or name == org_login):
+                                    continue
+                                seen_pkg.add(name)
+                                version = pkg.get("version", "")
+                                date_str = pkg.get("date", "")
+                                if not date_str:
+                                    continue
+                                try:
+                                    pub = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                                except ValueError:
+                                    continue
+                                if pub > npm_cutoff:
+                                    result["new_npm_releases"].append({
+                                        "name": name,
+                                        "version": version,
+                                        "date": date_str,
+                                    })
+                            if result["new_npm_releases"]:
+                                break
+                except Exception as exc:
+                    logger.debug(f"npm search failed for {org_login}: {exc}")
     except Exception as exc:
         logger.warning(f"GitHub signals failed for {domain}: {exc}")
         return dict(_EMPTY)  # don't cache transient failures
@@ -131,7 +176,7 @@ async def fetch_github_signals(domain: str) -> dict:
 
 
 def github_extra_events(gh: dict) -> list[dict]:
-    """Convert new public repos into product_launch extra_events drafts."""
+    """Convert new public repos and npm releases into product_launch extra_events."""
     events = []
     for repo in (gh.get("new_repos") or [])[:3]:
         events.append({
@@ -142,5 +187,18 @@ def github_extra_events(gh: dict) -> list[dict]:
                         "stars": repo.get("stars", 0), "created_at": repo.get("created_at")},
             "source": "github",
             "confidence": 0.7,
+        })
+    for pkg in (gh.get("new_npm_releases") or [])[:3]:
+        events.append({
+            "event_type": "product_launch",
+            "title": f"npm release: {pkg['name']}@{pkg.get('version', '?')}",
+            "payload": {
+                "key": f"npm:{pkg['name']}@{pkg.get('version', '')}",
+                "package": pkg["name"],
+                "version": pkg.get("version"),
+                "date": pkg.get("date"),
+            },
+            "source": "npm",
+            "confidence": 0.6,
         })
     return events

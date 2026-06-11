@@ -295,7 +295,114 @@ async def source5():
 
 # ════════════════════════════════════════════════════════════════════════════
 
-SOURCES = {1: source1, 2: source2, 3: source3, 4: source4, 5: source5}
+# ════════════════════════════════════════════════════════════════════════════
+# 6. ATS expansion — Ashby / SmartRecruiters / Workable
+# ════════════════════════════════════════════════════════════════════════════
+
+async def source6():
+    header(6, "ATS expansion (Ashby / SmartRecruiters / Workable)")
+    from job_posts import fetch_job_board_posts
+
+    for name in ["Ramp", "Deel"]:
+        posts, source = await fetch_job_board_posts(name)
+        print(f"  {name:<12} source={source:<16} posts={len(posts)}")
+        if posts:
+            p = posts[0]
+            print(f"    sample: {p['title'][:55]}  body={len(p.get('body_text') or '')}c")
+    print("\n  => same Gemini extraction + discovery_job_post pipeline as Greenhouse/Lever")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 7. Hacker News (Algolia)
+# ════════════════════════════════════════════════════════════════════════════
+
+async def source7():
+    header(7, "Hacker News mentions + Show HN launches")
+    from hn_signals import fetch_hn_signals, hn_extra_events
+
+    hn = await fetch_hn_signals(DEMO_COMPANY, DEMO_DOMAIN)
+    print(f"  mentions (7d, filtered): {len(hn['mentions'])}")
+    for m in hn["mentions"][:3]:
+        print(f"    • [{m['points']}pts] {m['title'][:70]}")
+    print(f"  Show HN launches: {len(hn['launches'])}")
+    for l in hn["launches"][:2]:
+        print(f"    • {l['title'][:70]}")
+    events = hn_extra_events(hn)
+    print(f"\n  OUTPUT: {len(events)} extra_events")
+    for ev in events[:3]:
+        print(f"    [{ev['event_type']}] {ev['title'][:65]}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 8. Wayback Machine cold-start pricing diff
+# ════════════════════════════════════════════════════════════════════════════
+
+async def source8():
+    header(8, "Wayback Machine pricing baseline (cold-start diff)")
+    from signal_enrichment import fetch_wayback_fingerprint, page_fingerprint, _jina_read
+
+    baseline = await fetch_wayback_fingerprint(DEMO_DOMAIN, "/pricing")
+    live = page_fingerprint(await _jina_read(f"https://{DEMO_DOMAIN}/pricing", max_chars=2000))
+    print(f"  baseline fingerprint (30-90d ago): {baseline or 'none'}")
+    print(f"  live fingerprint:                {live or 'none'}")
+    if baseline and live and baseline != live:
+        print("\n  => first enrichment can emit pricing_change via synthetic prev snapshot")
+    else:
+        print("\n  => fingerprints match or baseline unavailable (no event on first run)")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 9. USAspending gov contracts
+# ════════════════════════════════════════════════════════════════════════════
+
+async def source9():
+    header(9, "USAspending.gov federal contracts")
+    from gov_signals import fetch_gov_awards, gov_extra_events
+
+    awards = await fetch_gov_awards("Palantir")
+    print(f"  awards (90d) for Palantir: {len(awards)}")
+    for a in awards[:3]:
+        print(f"    • ${a['amount']:,.0f}  {a['agency'][:40]}  {a.get('date', '')}")
+    events = gov_extra_events(awards)
+    print(f"\n  OUTPUT: {len(events)} gov_contract events")
+    for ev in events[:2]:
+        print(f"    {ev['title'][:75]}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 10. Product Hunt RSS
+# ════════════════════════════════════════════════════════════════════════════
+
+async def source10():
+    header(10, "Product Hunt daily launches")
+    from news_signals import fetch_product_hunt_launches
+
+    launches = await fetch_product_hunt_launches()
+    print(f"  recent launches: {len(launches)}")
+    for l in launches[:6]:
+        print(f"    • {l['title'][:50]:<50} slug={l['slug'][:30]}")
+    print("\n  => daily cron matches to discovery_company; auto-creates unmatched (cap 10)")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 11. npm registry releases
+# ════════════════════════════════════════════════════════════════════════════
+
+async def source11():
+    header(11, "npm registry releases (GitHub org scope)")
+    from github_signals import fetch_github_signals, github_extra_events
+
+    gh = await fetch_github_signals(DEMO_DOMAIN)
+    print(f"  org={gh.get('org')}  npm_packages={gh.get('npm_package_count', 0)}")
+    print(f"  new releases (30d): {len(gh.get('new_npm_releases') or [])}")
+    for pkg in (gh.get("new_npm_releases") or [])[:4]:
+        print(f"    • {pkg['name']}@{pkg.get('version')}  {pkg.get('date', '')[:10]}")
+    npm_events = [e for e in github_extra_events(gh) if e.get("source") == "npm"]
+    print(f"\n  OUTPUT: {len(npm_events)} npm product_launch events")
+
+
+SOURCES = {1: source1, 2: source2, 3: source3, 4: source4, 5: source5,
+           6: source6, 7: source7, 8: source8, 9: source9, 10: source10, 11: source11}
 
 
 async def main():

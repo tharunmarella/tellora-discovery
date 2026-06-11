@@ -29,6 +29,7 @@ from database import make_engine
 from monitoring_tasks import (
     poll_edgar_form_d_task,
     poll_job_posts_task,
+    poll_product_hunt_task,
     refresh_stale_index_task,
     refresh_watched_companies_task,
 )
@@ -153,6 +154,7 @@ class WorkerSettings:
         refresh_stale_index_task,
         poll_job_posts_task,
         poll_edgar_form_d_task,
+        poll_product_hunt_task,
     ]
     queue_name = "arq:ondemand"
     redis_settings = _redis_settings
@@ -165,4 +167,5 @@ class WorkerSettings:
         cron(refresh_stale_index_task, weekday=0, hour=5, minute=0),
         cron(poll_job_posts_task, hour=6, minute=0),
         cron(poll_edgar_form_d_task, hour=10, minute=0),
+        cron(poll_product_hunt_task, hour=11, minute=0),
     ]

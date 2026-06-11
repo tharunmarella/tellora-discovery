@@ -26,6 +26,12 @@ _HTTP_TIMEOUT = 8.0
 _MAX_BODY_CHARS = 4000
 _MAX_POSTS_EXTRACT = 12
 
+ASHBY_API = "https://api.ashbyhq.com/posting-api/job-board/{slug}"
+SMARTRECRUITERS_LIST = "https://api.smartrecruiters.com/v1/companies/{slug}/postings"
+SMARTRECRUITERS_DETAIL = "https://api.smartrecruiters.com/v1/companies/{slug}/postings/{post_id}"
+WORKABLE_WIDGET = "https://apply.workable.com/api/v1/widget/accounts/{slug}"
+WORKABLE_JOB = "https://apply.workable.com/api/v1/jobs/{shortcode}"
+
 
 def _strip_html(s: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html_lib.unescape(s or ""))).strip()
@@ -81,6 +87,103 @@ async def fetch_job_board_posts(company_name: str) -> tuple[list[dict], str]:
                                 "source": "lever",
                             })
                         return posts, "lever"
+            except Exception:
+                pass
+
+        for slug in variants:
+            try:
+                resp = await client.get(ASHBY_API.format(slug=slug))
+                if resp.status_code == 200:
+                    jobs = resp.json().get("jobs", [])
+                    if jobs:
+                        posts = []
+                        for j in jobs:
+                            body = _strip_html(j.get("descriptionHtml", ""))[:_MAX_BODY_CHARS]
+                            loc = j.get("location") or ""
+                            if isinstance(loc, dict):
+                                loc = loc.get("name", "")
+                            posts.append({
+                                "external_id": str(j.get("id", "")),
+                                "title": j.get("title", ""),
+                                "location": loc,
+                                "body_text": body,
+                                "source": "ashby",
+                            })
+                        return posts, "ashby"
+            except Exception:
+                pass
+
+        for slug in variants:
+            try:
+                resp = await client.get(
+                    SMARTRECRUITERS_LIST.format(slug=slug),
+                    params={"limit": _MAX_POSTS_EXTRACT},
+                )
+                if resp.status_code != 200:
+                    continue
+                listings = resp.json().get("content", [])
+                if not listings:
+                    continue
+                posts = []
+                for item in listings[:_MAX_POSTS_EXTRACT]:
+                    post_id = item.get("id")
+                    if not post_id:
+                        continue
+                    detail_resp = await client.get(
+                        SMARTRECRUITERS_DETAIL.format(slug=slug, post_id=post_id),
+                    )
+                    if detail_resp.status_code != 200:
+                        continue
+                    detail = detail_resp.json()
+                    body = _strip_html(
+                        detail.get("jobAd", {}).get("sections", {}).get("jobDescription", {}).get("text", "")
+                        or detail.get("jobAd", {}).get("jobDescription", "")
+                        or ""
+                    )[:_MAX_BODY_CHARS]
+                    loc = (detail.get("location") or {}).get("city", "")
+                    posts.append({
+                        "external_id": str(post_id),
+                        "title": detail.get("name") or item.get("name", ""),
+                        "location": loc,
+                        "body_text": body,
+                        "source": "smartrecruiters",
+                    })
+                if posts:
+                    return posts, "smartrecruiters"
+            except Exception:
+                pass
+
+        for slug in variants:
+            try:
+                resp = await client.get(WORKABLE_WIDGET.format(slug=slug))
+                if resp.status_code != 200:
+                    continue
+                jobs = resp.json().get("jobs", [])
+                if not jobs:
+                    continue
+                posts = []
+                for j in jobs[:_MAX_POSTS_EXTRACT]:
+                    shortcode = j.get("shortcode")
+                    if not shortcode:
+                        continue
+                    detail_resp = await client.get(WORKABLE_JOB.format(shortcode=shortcode))
+                    if detail_resp.status_code != 200:
+                        continue
+                    detail = detail_resp.json()
+                    body = _strip_html(
+                        detail.get("description", "") or detail.get("full_description", "")
+                    )[:_MAX_BODY_CHARS]
+                    posts.append({
+                        "external_id": str(shortcode),
+                        "title": detail.get("title") or j.get("title", ""),
+                        "location": detail.get("location", {}).get("location_str", "")
+                        if isinstance(detail.get("location"), dict)
+                        else detail.get("location", ""),
+                        "body_text": body,
+                        "source": "workable",
+                    })
+                if posts:
+                    return posts, "workable"
             except Exception:
                 pass
 
