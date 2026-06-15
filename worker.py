@@ -34,9 +34,13 @@ from monitoring_tasks import (
     refresh_watched_companies_task,
 )
 
-logger = logging.getLogger("discovery.worker")
+from axiom_arq import after_job_end, on_job_failure
+from axiom_logger import axiom_logger
+from sentry_init import init_sentry
 
-# ── DB engine (module-level; workers are long-lived processes) ──────────────
+init_sentry(server_name="tellora-discovery-worker")
+
+logger = logging.getLogger("discovery.worker")
 
 _engine = make_engine(
     pool_recycle=300,
@@ -128,10 +132,14 @@ async def enrich_company_task(ctx, company_id: str) -> dict:
 
 async def startup(ctx):
     logger.info("Discovery ARQ worker starting up")
+    from database import create_tables
+    create_tables()
+    axiom_logger.start_background_flush()
 
 
 async def shutdown(ctx):
     logger.info("Discovery ARQ worker shutting down")
+    await axiom_logger.stop()
 
 
 # ── Redis settings ──────────────────────────────────────────────────────────
@@ -160,6 +168,8 @@ class WorkerSettings:
     redis_settings = _redis_settings
     on_startup = startup
     on_shutdown = shutdown
+    on_job_failure = on_job_failure
+    after_job_end = after_job_end
     max_jobs = 5
     job_timeout = 600
     cron_jobs = [

@@ -67,3 +67,12 @@ APOLLO_HEADCOUNT_FACTOR: float = float(os.getenv("APOLLO_HEADCOUNT_FACTOR", "1.0
 
 # Weekly backfill: max Apollo rows to headcount-fill per cron run (rate-limited).
 HEADCOUNT_BACKFILL_LIMIT: int = int(os.getenv("HEADCOUNT_BACKFILL_LIMIT", "1000"))
+
+# Observability (same tokens/dataset as tellora-backend)
+ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")
+AXIOM_TOKEN: str = os.getenv("AXIOM_TOKEN", "")
+AXIOM_ORG_ID: str = os.getenv("AXIOM_ORG_ID", "")
+AXIOM_DATASET: str = os.getenv("AXIOM_DATASET") or (
+    "tellora" if ENVIRONMENT == "production" else "tellora-dev"
+)
+SENTRY_DSN: str = os.getenv("SENTRY_DSN", "")
