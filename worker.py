@@ -27,8 +27,7 @@ from sqlalchemy.orm import Session
 import settings as cfg
 from database import make_engine
 from infra.axiom_arq import after_job_end, on_job_failure
-from infra.axiom_logger import axiom_logger
-from infra.sentry_init import init_sentry
+from infra.lifespan import SERVICE_WORKER, bootstrap, shutdown as lifespan_shutdown, startup as lifespan_startup
 from signals.monitoring import (
     poll_edgar_form_d_task,
     poll_job_posts_task,
@@ -38,7 +37,7 @@ from signals.monitoring import (
     refresh_watched_companies_task,
 )
 
-init_sentry(server_name="tellora-discovery-worker")
+bootstrap(server_name=SERVICE_WORKER)
 
 logger = logging.getLogger("discovery.worker")
 
@@ -162,15 +161,15 @@ async def enrich_company_task(ctx, company_id: str) -> dict:
 # ── ARQ lifecycle hooks ─────────────────────────────────────────────────────
 
 async def startup(ctx):
-    logger.info("Discovery ARQ worker starting up")
-    from database import create_tables
-    create_tables()
-    axiom_logger.start_background_flush()
+    await lifespan_startup(
+        server_name=SERVICE_WORKER,
+        create_tables=True,
+        axiom_background_flush=True,
+    )
 
 
 async def shutdown(ctx):
-    logger.info("Discovery ARQ worker shutting down")
-    await axiom_logger.stop()
+    await lifespan_shutdown(server_name=SERVICE_WORKER)
 
 
 # ── Redis settings ──────────────────────────────────────────────────────────

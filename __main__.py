@@ -19,15 +19,11 @@ import os
 import sys
 import time
 
-from config_logging import setup_logging
 from infra.axiom_logger import axiom_logger
-from infra.sentry_init import init_sentry
+from infra.lifespan import SERVICE_CRON, bootstrap, lifespan
 from infra.sentry_telemetry import capture_task_failure
 
-SERVICE = "tellora-discovery"
-
-setup_logging()
-init_sentry(server_name=SERVICE)
+bootstrap(server_name=SERVICE_CRON)
 logger = logging.getLogger("discovery")
 
 
@@ -57,7 +53,7 @@ async def _run_headcount_backfill(*, run_all: bool) -> None:
             exception_type=type(exc).__name__,
             exception_message=str(exc),
         )
-        capture_task_failure(exc, service=SERVICE, task_name=task)
+        capture_task_failure(exc, service=SERVICE_CRON, task_name=task)
         raise
 
 
@@ -104,7 +100,7 @@ async def _scrape_and_enrich(dry_run: bool) -> None:
             exception_type=type(exc).__name__,
             exception_message=str(exc),
         )
-        capture_task_failure(exc, service=SERVICE, task_name="discovery_weekly", stats=stats or None)
+        capture_task_failure(exc, service=SERVICE_CRON, task_name="discovery_weekly", stats=stats or None)
         raise
 
 
@@ -118,21 +114,7 @@ def main() -> None:
     # Validate env first — fail fast before doing any work
     import settings as cfg  # noqa — triggers _require() validation
 
-    from database import create_tables
-
-    create_tables()
-
-    async def _run_with_flush(coro) -> None:
-        try:
-            await coro
-        finally:
-            await axiom_logger.stop()
-
-    if headcount_only:
-        asyncio.run(_run_with_flush(_run_headcount_backfill(run_all=True)))
-        sys.exit(0)
-
-    if not cfg.GEMINI_API_KEY:
+    if not headcount_only and not cfg.GEMINI_API_KEY:
         logger.error("GEMINI_API_KEY / GOOGLE_API_KEY is not set — cannot enrich signals")
         sys.exit(1)
 
@@ -142,7 +124,14 @@ def main() -> None:
 
         settings.MAX_PAGES_PER_PROFILE = 2
 
-    asyncio.run(_run_with_flush(_scrape_and_enrich(dry_run)))
+    async def _run() -> None:
+        async with lifespan(server_name=SERVICE_CRON):
+            if headcount_only:
+                await _run_headcount_backfill(run_all=True)
+            else:
+                await _scrape_and_enrich(dry_run)
+
+    asyncio.run(_run())
     sys.exit(0)
 
 

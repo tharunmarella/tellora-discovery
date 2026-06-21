@@ -8,11 +8,10 @@ from typing import Any
 from arq.jobs import Job
 
 from infra.axiom_logger import axiom_logger
+from infra.lifespan import SERVICE_WORKER
 from infra.sentry_telemetry import capture_job_failure
 
 logger = logging.getLogger(__name__)
-
-SERVICE = "tellora-discovery-worker"
 
 
 async def after_job_end(ctx: dict[str, Any]) -> None:
@@ -42,9 +41,9 @@ async def after_job_end(ctx: dict[str, Any]) -> None:
 async def on_job_failure(ctx, job_id: str, job_name: str, exc: BaseException) -> None:
     capture_job_failure(
         exc,
-        service=SERVICE,
+        service=SERVICE_WORKER,
         job_id=job_id,
         job_name=job_name,
     )
     await axiom_logger.log_job_failure(job_id=job_id, job_name=job_name, exc=exc)
-    logger.exception("[%s] job %s (%s) failed", SERVICE, job_name, job_id)
+    logger.exception("[%s] job %s (%s) failed", SERVICE_WORKER, job_name, job_id)
