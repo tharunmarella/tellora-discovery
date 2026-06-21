@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import settings as cfg
 from database import make_engine
-from signal_enrichment import normalize_headquarters, normalize_headquarters_batch
+from signals.pipeline import normalize_headquarters, normalize_headquarters_batch
 
 logging.basicConfig(
     level=logging.INFO,

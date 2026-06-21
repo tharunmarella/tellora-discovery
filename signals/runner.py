@@ -14,9 +14,9 @@ In production, enrichment runs in two disjoint places:
   - Signal worker (worker.py, arq:ondemand) → user-triggered on-demand enrich
 
 Usage:
-  python signal_runner.py                 # backfill all pending
-  python signal_runner.py --limit 100     # test run: only 100 companies
-  python signal_runner.py --reset-failed  # retry previously failed
+  python -m signals.runner                 # backfill all pending
+  python -m signals.runner --limit 100     # test run: only 100 companies
+  python -m signals.runner --reset-failed  # retry previously failed
 
 Architecture:
   - Query: signal_enrichment_status = 'pending' AND domain IS NOT NULL AND domain_resolved = true
@@ -41,7 +41,7 @@ from sqlalchemy.orm import Session
 
 import settings as cfg
 from database import make_engine
-from signal_enrichment import enrich_company_signals
+from signals.pipeline import enrich_company_signals
 
 logging.basicConfig(
     level=logging.INFO,
@@ -102,6 +102,29 @@ _UPDATE_SIGNAL = text("""
 
 # ── Shared persist helper (used by both this runner and worker.py) ──────────
 
+def has_signal_payload(result: dict) -> bool:
+    """True when any enrichment source produced usable data worth persisting."""
+    if result.get("company_summary"):
+        return True
+    if result.get("buying_signals"):
+        return True
+    if result.get("tech_stack"):
+        return True
+    if result.get("hiring_count"):
+        return True
+    if result.get("job_posts"):
+        return True
+    if result.get("extra_events"):
+        return True
+    if (result.get("signal_score") or 0) > 0:
+        return True
+    if result.get("funding_stage") or result.get("total_raised"):
+        return True
+    if result.get("description_embedding"):
+        return True
+    return False
+
+
 def persist_result(session: Session, company_id: str, result: dict) -> bool:
     """
     Write a single enrichment result dict to discovery_company.
@@ -134,10 +157,10 @@ def persist_result(session: Session, company_id: str, result: dict) -> bool:
             "signal_enriched_at":       result.get("signal_enriched_at") or datetime.now(timezone.utc),
             "signal_enrichment_status": result.get("signal_enrichment_status", "enriched"),
         })
-        if result.get("signal_enrichment_status") != "failed":
-            from edges import edges_from_enrichment, upsert_edges
-            from job_posts import persist_job_posts
-            from signal_diff import persist_snapshot_and_events
+        if has_signal_payload(result):
+            from signals.edges import edges_from_enrichment, upsert_edges
+            from signals.job_posts import persist_job_posts
+            from signals.diff import persist_snapshot_and_events
             domain = result.get("domain")
             posts = result.get("job_posts") or []
             if posts:
@@ -219,7 +242,7 @@ def _write_batch(session: Session, results: list[dict]) -> tuple[int, int]:
     ok = fail = 0
     for r in results:
         success = persist_result(session, r["id"], r)
-        if success and r.get("signal_enrichment_status") != "failed":
+        if success and r.get("signal_enrichment_status") in ("enriched", "partial"):
             ok += 1
         else:
             fail += 1
@@ -286,7 +309,7 @@ async def run(limit: Optional[int], concurrency: int, batch_size: int, reset_fai
 
         enriched_domains = [
             rows[i]["domain"] for i, r in enumerate(results)
-            if r.get("signal_enrichment_status") != "failed" and rows[i].get("domain")
+            if r.get("signal_enrichment_status") in ("enriched", "partial") and rows[i].get("domain")
         ]
         _notify_signals_ready(enriched_domains)
 

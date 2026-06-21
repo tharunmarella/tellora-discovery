@@ -21,7 +21,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 import settings as cfg
-from edgar_signals import normalize_name
+from signals.sources.edgar import normalize_name
 from llm import get_gemini_client, retry_llm, strip_json_fences
 
 logger = logging.getLogger("discovery.news")
@@ -219,7 +219,7 @@ def match_ph_launches(session: Session, launches: list[dict]) -> list[str]:
 
 async def create_companies_from_launches(session: Session, launches: list[dict]) -> int:
     """Auto-create discovery_company rows for unmatched PH launches (capped)."""
-    from enrichment import lookup_domain
+    from scrape.domain_lookup import lookup_domain
 
     candidates = [
         l for l in launches

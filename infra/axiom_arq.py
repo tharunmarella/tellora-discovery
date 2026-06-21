@@ -7,8 +7,8 @@ from typing import Any
 
 from arq.jobs import Job
 
-from axiom_logger import axiom_logger
-from sentry_telemetry import capture_job_failure
+from infra.axiom_logger import axiom_logger
+from infra.sentry_telemetry import capture_job_failure
 
 logger = logging.getLogger(__name__)
 

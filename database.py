@@ -31,6 +31,8 @@ ALTER TABLE discovery_company_snapshot ADD COLUMN IF NOT EXISTS pricing_model VA
 ALTER TABLE discovery_company_snapshot ADD COLUMN IF NOT EXISTS page_fingerprints JSONB;
 ALTER TABLE discovery_company_snapshot ADD COLUMN IF NOT EXISTS recent_launches JSONB;
 ALTER TABLE discovery_company ADD COLUMN IF NOT EXISTS source VARCHAR NOT NULL DEFAULT 'apollo';
+ALTER TABLE discovery_company ADD COLUMN IF NOT EXISTS signal_attempt_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE discovery_company ADD COLUMN IF NOT EXISTS signal_last_attempt_at TIMESTAMPTZ;
 """
 
 

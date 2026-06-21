@@ -18,11 +18,11 @@ from sqlalchemy.orm import Session
 
 import settings as cfg
 from llm import get_gemini_client, retry_llm, strip_json_fences
-from signal_enrichment import GREENHOUSE_API, LEVER_API, _slug_variants
+from signals.constants import GREENHOUSE_API, HTTP_TIMEOUT, LEVER_API
+from signals.name_match import slug_variants
 
 logger = logging.getLogger("discovery.job_posts")
 
-_HTTP_TIMEOUT = 8.0
 _MAX_BODY_CHARS = 4000
 _MAX_POSTS_EXTRACT = 12
 
@@ -37,13 +37,16 @@ def _strip_html(s: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html_lib.unescape(s or ""))).strip()
 
 
-async def fetch_job_board_posts(company_name: str) -> tuple[list[dict], str]:
+async def fetch_job_board_posts(
+    company_name: str,
+    domain: Optional[str] = None,
+) -> tuple[list[dict], str]:
     """
     Fetch open job posts with bodies from Greenhouse or Lever.
     Returns (posts, source).
     """
-    variants = _slug_variants(company_name)
-    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, follow_redirects=True) as client:
+    variants = slug_variants(company_name, domain)
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
         for slug in variants:
             try:
                 resp = await client.get(

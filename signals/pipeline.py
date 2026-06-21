@@ -27,19 +27,18 @@ from pydantic import BaseModel, Field
 
 import settings as cfg
 from llm import embed_text, get_gemini_client, retry_llm, strip_json_fences
+from signals.cache import TTLLRUCache
+from signals.constants import (
+    CONTEXT_FALLBACK_MAX,
+    GREENHOUSE_API,
+    HTTP_TIMEOUT,
+    JINA_READER,
+    JINA_SEARCH,
+    LEVER_API,
+)
+from signals.name_match import apply_funding_grounding, filter_events_by_relevance, slug_variants
 
 logger = logging.getLogger("discovery.signal")
-
-# ── Constants ──────────────────────────────────────────────────────────────
-
-JINA_READER    = "https://r.jina.ai/"
-JINA_SEARCH    = "https://s.jina.ai/"
-GREENHOUSE_API = "https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
-LEVER_API      = "https://api.lever.co/v0/postings/{slug}?mode=json"
-
-_HTTP_TIMEOUT = 8.0
-_DOMAIN_CACHE: dict[str, tuple[float, dict]] = {}
-_DOMAIN_CACHE_TTL = 3600  # 1 hour
 
 # Apollo's free people-search returns total_entries (contacts Apollo knows at a
 # company). It is NOT headcount, but scales with company size, so we use it as a
@@ -47,6 +46,10 @@ _DOMAIN_CACHE_TTL = 3600  # 1 hour
 # converts "contacts Apollo has" → "approx employees" (rough; tune via env).
 APOLLO_HEADCOUNT_FACTOR = float(getattr(cfg, "APOLLO_HEADCOUNT_FACTOR", 1.0) or 1.0)
 
+_DOMAIN_CACHE: TTLLRUCache[dict] = TTLLRUCache(
+    maxsize=cfg.DOMAIN_CACHE_MAXSIZE,
+    ttl=float(cfg.DOMAIN_CACHE_TTL_S),
+)
 
 # ── Serper Knowledge Graph lookup ──────────────────────────────────────────
 
@@ -134,7 +137,7 @@ async def fetch_apollo_headcount(domain: str) -> dict:
     if not domain or not getattr(cfg, "TELLORA_APOLLO_API_KEY", None):
         return {}
     try:
-        from apollo_client import search_page
+        from scrape.apollo_client import search_page
         data = await search_page(
             cfg.TELLORA_APOLLO_API_KEY,
             {"q_organization_domains_list": [domain]},
@@ -403,11 +406,8 @@ async def fetch_company_context(domain: str) -> dict:
         return empty
 
     cached = _DOMAIN_CACHE.get(domain)
-    if cached:
-        ts, ctx = cached
-        if _time.time() - ts < _DOMAIN_CACHE_TTL and "pricing" in ctx:
-            return ctx
-        del _DOMAIN_CACHE[domain]
+    if cached is not None and "pricing" in cached:
+        return cached
 
     base = f"https://{domain}" if not domain.startswith("http") else domain
 
@@ -422,31 +422,33 @@ async def fetch_company_context(domain: str) -> dict:
         )
     )
 
+    fallback_reads = 0
+
+    async def _fallback(current: str, path: str, *, min_len: int = 200) -> str:
+        nonlocal fallback_reads
+        if len(current) >= min_len or fallback_reads >= CONTEXT_FALLBACK_MAX:
+            return current
+        fallback_reads += 1
+        alt = await _jina_read(f"{base}{path}", max_chars=2000)
+        return alt if len(alt) > len(current) else current
+
     if len(about_text) < 200:
-        about_alt = await _jina_read(f"{base}/about-us", max_chars=2000)
-        if len(about_alt) > len(about_text):
-            about_text = about_alt
+        about_text = await _fallback(about_text, "/about-us")
 
     if len(careers_text) < 200:
         for path in ["/jobs", "/join-us", "/work-with-us", "/open-positions"]:
-            alt = await _jina_read(f"{base}{path}", max_chars=2000)
-            if len(alt) > len(careers_text):
-                careers_text = alt
-            if len(careers_text) >= 200:
+            if fallback_reads >= CONTEXT_FALLBACK_MAX:
                 break
+            careers_text = await _fallback(careers_text, path)
 
     if len(customers_text) < 200:
-        alt = await _jina_read(f"{base}/case-studies", max_chars=2000)
-        if len(alt) > len(customers_text):
-            customers_text = alt
+        customers_text = await _fallback(customers_text, "/case-studies")
 
     if len(changelog_text) < 200:
         for path in ["/blog", "/whats-new", "/releases"]:
-            alt = await _jina_read(f"{base}{path}", max_chars=2000)
-            if len(alt) > len(changelog_text):
-                changelog_text = alt
-            if len(changelog_text) >= 200:
+            if fallback_reads >= CONTEXT_FALLBACK_MAX:
                 break
+            changelog_text = await _fallback(changelog_text, path)
 
     ctx = {
         "homepage": homepage_text,
@@ -456,7 +458,7 @@ async def fetch_company_context(domain: str) -> dict:
         "customers": customers_text,
         "changelog": changelog_text,
     }
-    _DOMAIN_CACHE[domain] = (_time.time(), ctx)
+    _DOMAIN_CACHE.set(domain, ctx)
     logger.info(
         f"Company context for {domain}: "
         f"homepage={len(homepage_text)}c, about={len(about_text)}c, careers={len(careers_text)}c, "
@@ -526,33 +528,18 @@ async def fetch_funding_news(company_name: str) -> list[str]:
 
 # ── Job board helpers ──────────────────────────────────────────────────────
 
-def _slug_variants(company_name: str) -> list[str]:
-    base = company_name.lower().strip()
-    for suffix in [
-        " inc", " inc.", " llc", " ltd", " corp", " corporation",
-        " co", " co.", " technologies", " technology", " tech",
-        " solutions", " group", " labs", " ai", " io", ".io", ".ai",
-    ]:
-        if base.endswith(suffix):
-            base = base[: -len(suffix)].strip()
-    hyphen     = re.sub(r"[^a-z0-9]+", "-", base).strip("-")
-    nospace    = re.sub(r"[^a-z0-9]+", "", base)
-    first_word = hyphen.split("-")[0] if "-" in hyphen else ""
-    variants   = [hyphen]
-    if nospace and nospace != hyphen:
-        variants.append(nospace)
-    if first_word and len(first_word) > 3 and first_word != hyphen:
-        variants.append(first_word)
-    return list(dict.fromkeys(variants))
+def _slug_variants(company_name: str, domain: Optional[str] = None) -> list[str]:
+    """Backward-compatible wrapper — prefer domain-stem slugs when available."""
+    return slug_variants(company_name, domain)
 
 
-async def check_job_boards(company_name: str) -> dict:
+async def check_job_boards(company_name: str, domain: Optional[str] = None) -> dict:
     """
     Check Greenhouse then Lever for open positions.
     Returns {count, roles, source}.
     """
-    variants = _slug_variants(company_name)
-    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, follow_redirects=True) as client:
+    variants = _slug_variants(company_name, domain)
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
         for slug in variants:
             try:
                 resp = await client.get(GREENHOUSE_API.format(slug=slug))
@@ -1015,7 +1002,67 @@ def build_search_tsv(
 
 # ── Main per-company enrichment entry point ────────────────────────────────
 
-async def enrich_company_signals(
+def _company_has_snapshot(company_id: str) -> bool:
+    from sqlalchemy import text as sa_text
+    from sqlalchemy.orm import Session
+    from database import engine
+
+    with Session(engine) as session:
+        row = session.execute(
+            sa_text(
+                "SELECT 1 FROM discovery_company_snapshot "
+                "WHERE company_id = :cid LIMIT 1"
+            ),
+            {"cid": company_id},
+        ).first()
+        return row is not None
+
+
+def _sources_had_data(
+    *,
+    ctx: dict,
+    job_board: dict,
+    tech_stack: list,
+    funding_news: list,
+    serper_kg: dict,
+    github: dict,
+    rss_news: list,
+    hn_data: dict,
+    gov_awards: list,
+) -> bool:
+    if job_board.get("count"):
+        return True
+    if tech_stack:
+        return True
+    if funding_news:
+        return True
+    if serper_kg:
+        return True
+    if github.get("org") or github.get("new_repos") or github.get("languages"):
+        return True
+    if rss_news:
+        return True
+    if hn_data.get("mentions") or hn_data.get("launches"):
+        return True
+    if gov_awards:
+        return True
+    return any(len((ctx.get(k) or "").strip()) >= 200 for k in ctx)
+
+
+def _determine_enrichment_status(
+    result: CompanySignalResult,
+    *,
+    sources_had_data: bool,
+    extra_events: list,
+) -> str:
+    if result.company_summary:
+        return "enriched"
+    if sources_had_data or extra_events:
+        return "partial"
+    return "failed"
+
+
+async def _enrich_company_signals_impl(
     company_id: str,
     company_name: str,
     domain: str,
@@ -1028,51 +1075,62 @@ async def enrich_company_signals(
     """
     Full signal enrichment for one company. Returns a dict ready to write
     back to the discovery_company table.
-
-    Steps:
-      1. Parallel: fetch_company_context + check_job_boards + fetch_funding_news + detect_tech_stack
-      2. Gemini synthesis  (run in thread pool — synchronous Gemini SDK)
-      3. Embed             (run in thread pool)
-      4. Build search_tsv text
     """
     logger.info(f"[{company_name}] Starting signal enrichment")
 
-    # Step 1 — parallel signal gathering
-    from github_signals import fetch_github_signals, github_extra_events
-    from gov_signals import fetch_gov_awards, gov_extra_events
-    from hn_signals import fetch_hn_signals, hn_extra_events
-    from job_posts import fetch_job_board_posts
-    from news_signals import classify_news, fetch_company_news
+    from signals.sources.github import fetch_github_signals, github_extra_events
+    from signals.sources.gov import fetch_gov_awards, gov_extra_events
+    from signals.sources.hn import fetch_hn_signals, hn_extra_events
+    from signals.job_posts import fetch_job_board_posts
+    from signals.sources.news import classify_news, fetch_company_news
 
-    ctx_task     = asyncio.create_task(fetch_company_context(domain))
-    jobs_task    = asyncio.create_task(fetch_job_board_posts(company_name))
-    news_task    = asyncio.create_task(fetch_funding_news(company_name))
-    tech_task    = asyncio.create_task(detect_tech_stack(domain))
+    cold_start = not _company_has_snapshot(company_id)
+
+    ctx_task = asyncio.create_task(fetch_company_context(domain))
+    jobs_task = asyncio.create_task(fetch_job_board_posts(company_name, domain=domain or None))
+    news_task = asyncio.create_task(fetch_funding_news(company_name))
+    tech_task = asyncio.create_task(detect_tech_stack(domain))
     kg_task = asyncio.create_task(fetch_serper_kg(company_name))
     dns_task = asyncio.create_task(detect_dns_tech(domain))
     gh_task = asyncio.create_task(fetch_github_signals(domain))
     rss_task = asyncio.create_task(fetch_company_news(company_name))
     hn_task = asyncio.create_task(fetch_hn_signals(company_name, domain))
     gov_task = asyncio.create_task(fetch_gov_awards(company_name))
-    wayback_task = asyncio.create_task(fetch_wayback_fingerprint(domain, "/pricing"))
+    if cold_start and domain:
+        wayback_task = asyncio.create_task(fetch_wayback_fingerprint(domain, "/pricing"))
+    else:
+        wayback_task = None
+
     need_apollo_hc = not (existing_headcount and existing_headcount > 0)
+    gather_tasks = [
+        ctx_task, jobs_task, news_task, tech_task, kg_task,
+        dns_task, gh_task, rss_task, hn_task, gov_task,
+    ]
+    if wayback_task is not None:
+        gather_tasks.append(wayback_task)
     if need_apollo_hc:
         apollo_task = asyncio.create_task(fetch_apollo_headcount(domain))
-        (ctx, job_posts_result, funding_news, tech_stack, serper_kg,
-         dns_tech, github, rss_news, hn_data, gov_awards, baseline_pricing_fp,
-         apollo_hc) = await asyncio.gather(
-            ctx_task, jobs_task, news_task, tech_task, kg_task,
-            dns_task, gh_task, rss_task, hn_task, gov_task, wayback_task, apollo_task,
-        )
-    else:
-        (ctx, job_posts_result, funding_news, tech_stack, serper_kg,
-         dns_tech, github, rss_news, hn_data, gov_awards, baseline_pricing_fp) = await asyncio.gather(
-            ctx_task, jobs_task, news_task, tech_task, kg_task,
-            dns_task, gh_task, rss_task, hn_task, gov_task, wayback_task,
-        )
-        apollo_hc = {}
+        gather_tasks.append(apollo_task)
 
-    # DNS-verified vendors + GitHub languages beat homepage regex — merge all
+    gathered = await asyncio.gather(*gather_tasks)
+
+    ctx = gathered[0]
+    job_posts_result = gathered[1]
+    funding_news = gathered[2]
+    tech_stack = gathered[3]
+    serper_kg = gathered[4]
+    dns_tech = gathered[5]
+    github = gathered[6]
+    rss_news = gathered[7]
+    hn_data = gathered[8]
+    gov_awards = gathered[9]
+    idx = 10
+    baseline_pricing_fp = ""
+    if wayback_task is not None:
+        baseline_pricing_fp = gathered[idx]
+        idx += 1
+    apollo_hc = gathered[idx] if need_apollo_hc else {}
+
     tech_stack = list(dict.fromkeys(
         list(tech_stack) + list(dns_tech) + list(github.get("languages") or [])
     ))
@@ -1085,13 +1143,12 @@ async def enrich_company_signals(
     }
 
     homepage_text = ctx.get("homepage", "")
-    about_text    = ctx.get("about", "")
-    careers_text  = ctx.get("careers", "")
-    pricing_text  = ctx.get("pricing", "")
+    about_text = ctx.get("about", "")
+    careers_text = ctx.get("careers", "")
+    pricing_text = ctx.get("pricing", "")
     customers_text = ctx.get("customers", "")
     changelog_text = ctx.get("changelog", "")
 
-    # Step 2 — Gemini synthesis (run in executor to keep event loop free)
     loop = asyncio.get_event_loop()
     result: CompanySignalResult = await loop.run_in_executor(
         None,
@@ -1110,7 +1167,6 @@ async def enrich_company_signals(
         changelog_text,
     )
 
-    # News: Google News RSS + Gemini classifier (free); Serper exec-hire as fallback
     news_events: list[dict] = []
     if rss_news:
         news_events = await loop.run_in_executor(None, classify_news, company_name, rss_news)
@@ -1118,10 +1174,9 @@ async def enrich_company_signals(
     else:
         exec_news = await fetch_exec_hire_news(company_name)
 
-    loop2 = asyncio.get_event_loop()
     if job_posts:
-        from job_posts import extract_posts_with_gemini
-        job_posts = await loop2.run_in_executor(None, extract_posts_with_gemini, job_posts)
+        from signals.job_posts import extract_posts_with_gemini
+        job_posts = await loop.run_in_executor(None, extract_posts_with_gemini, job_posts)
 
     concepts: list[str] = []
     for p in job_posts:
@@ -1129,43 +1184,6 @@ async def enrich_company_signals(
     concepts = list(dict.fromkeys(c.lower() for c in concepts if c))
 
     merged_tech = list(dict.fromkeys((result.tech_stack or []) + tech_stack))
-
-    # Step 3 — Re-embed with richer text
-    embedding: Optional[list[float]] = await loop.run_in_executor(
-        None,
-        embed_company,
-        result.company_summary,
-        description,
-        industry,
-        merged_tech,
-        result.recent_launches,
-    )
-
-    # Step 4 — build search_tsv text (Postgres will convert to tsvector via to_tsvector())
-    tsv_text = build_search_tsv(
-        company_summary=result.company_summary,
-        description=description,
-        industry=industry,
-        tech_stack=merged_tech,
-        raw_meta=raw_meta,
-        recent_launches=result.recent_launches,
-        known_customers=result.known_customers,
-    )
-    if concepts:
-        tsv_text = f"{tsv_text} {' '.join(concepts)}".strip()
-
-    logger.info(
-        f"[{company_name}] Done — signal_score={result.signal_score}, "
-        f"signals={len(result.buying_signals)}, hiring={job_board.get('count', 0)}"
-    )
-
-    # Headcount priority: Gemini extraction → Serper KG → Apollo people-count proxy.
-    headcount = (
-        result.headcount
-        or serper_kg.get("headcount")
-        or (existing_headcount if existing_headcount and existing_headcount > 0 else None)
-        or apollo_hc.get("headcount_estimate")
-    )
 
     extra_events = list(news_events)
     extra_events.extend(github_extra_events(github))
@@ -1181,37 +1199,137 @@ async def enrich_company_signals(
         }
         for h in (exec_news or [])[:2]
     ])
+    extra_events = filter_events_by_relevance(extra_events, company_name)
+
+    buying_signals, signal_score, funding_stage, total_raised = apply_funding_grounding(
+        buying_signals=result.buying_signals,
+        signal_score=result.signal_score,
+        funding_stage=result.funding_stage,
+        total_raised=result.total_raised,
+        funding_news=funding_news,
+        extra_events=extra_events,
+    )
+    result = result.model_copy(update={
+        "buying_signals": buying_signals,
+        "signal_score": signal_score,
+        "funding_stage": funding_stage,
+        "total_raised": total_raised,
+    })
+
+    sources_had_data = _sources_had_data(
+        ctx=ctx,
+        job_board=job_board,
+        tech_stack=merged_tech,
+        funding_news=funding_news,
+        serper_kg=serper_kg,
+        github=github,
+        rss_news=rss_news,
+        hn_data=hn_data,
+        gov_awards=gov_awards,
+    )
+    enrichment_status = _determine_enrichment_status(
+        result,
+        sources_had_data=sources_had_data,
+        extra_events=extra_events,
+    )
+
+    embedding: Optional[list[float]] = await loop.run_in_executor(
+        None,
+        embed_company,
+        result.company_summary,
+        description,
+        industry,
+        merged_tech,
+        result.recent_launches,
+    )
+
+    tsv_text = build_search_tsv(
+        company_summary=result.company_summary,
+        description=description,
+        industry=industry,
+        tech_stack=merged_tech,
+        raw_meta=raw_meta,
+        recent_launches=result.recent_launches,
+        known_customers=result.known_customers,
+    )
+    if concepts:
+        tsv_text = f"{tsv_text} {' '.join(concepts)}".strip()
+
+    headcount = (
+        result.headcount
+        or serper_kg.get("headcount")
+        or (existing_headcount if existing_headcount and existing_headcount > 0 else None)
+        or apollo_hc.get("headcount_estimate")
+    )
+
+    logger.info(
+        f"[{company_name}] Done — status={enrichment_status}, signal_score={result.signal_score}, "
+        f"signals={len(result.buying_signals)}, hiring={job_board.get('count', 0)}"
+    )
 
     return {
-        "company_summary":          result.company_summary,
-        "buying_signals":           result.buying_signals,
-        "signal_score":             result.signal_score,
-        "funding_stage":            result.funding_stage,
-        "total_raised":             result.total_raised,
-        "headcount":                headcount,
-        "hiring_roles":             result.hiring_roles or job_board.get("roles", []),
-        "hiring_count":             job_board.get("count") or len(result.hiring_roles),
-        "tech_stack":               merged_tech,
-        "description_embedding":    embedding,
-        "tsv_text":                 tsv_text,
-        "hq_city":                  result.hq_city,
-        "hq_region":                result.hq_region,
-        "hq_country":               result.hq_country,
-        "signal_enriched_at":       datetime.now(timezone.utc),
-        "signal_enrichment_status": "enriched" if result.company_summary else "failed",
-        "job_posts":                job_posts,
-        "job_source":               job_source,
-        "concepts":                 concepts,
-        "pricing_model":            result.pricing_model,
-        "recent_launches":          result.recent_launches,
-        "known_customers":          result.known_customers,
-        "page_fingerprints":        {
+        "company_summary": result.company_summary,
+        "buying_signals": result.buying_signals,
+        "signal_score": result.signal_score,
+        "funding_stage": result.funding_stage,
+        "total_raised": result.total_raised,
+        "headcount": headcount,
+        "hiring_roles": result.hiring_roles or job_board.get("roles", []),
+        "hiring_count": job_board.get("count") or len(result.hiring_roles),
+        "tech_stack": merged_tech,
+        "description_embedding": embedding,
+        "tsv_text": tsv_text,
+        "hq_city": result.hq_city,
+        "hq_region": result.hq_region,
+        "hq_country": result.hq_country,
+        "signal_enriched_at": datetime.now(timezone.utc),
+        "signal_enrichment_status": enrichment_status,
+        "job_posts": job_posts,
+        "job_source": job_source,
+        "concepts": concepts,
+        "pricing_model": result.pricing_model,
+        "recent_launches": result.recent_launches,
+        "known_customers": result.known_customers,
+        "page_fingerprints": {
             "pricing": page_fingerprint(pricing_text),
             "changelog": page_fingerprint(changelog_text),
         },
-        "baseline_fingerprints":    {
+        "baseline_fingerprints": {
             "pricing": baseline_pricing_fp,
         } if baseline_pricing_fp else {},
-        "github_org":               github.get("org"),
-        "extra_events":             extra_events,
+        "github_org": github.get("org"),
+        "extra_events": extra_events,
     }
+
+
+async def enrich_company_signals(
+    company_id: str,
+    company_name: str,
+    domain: str,
+    description: Optional[str],
+    industry: Optional[str],
+    raw_meta: Optional[dict],
+    existing_headcount: Optional[int] = None,
+    existing_headquarters: Optional[str] = None,
+) -> dict:
+    """Public entry point with a per-company timeout budget."""
+    timeout = float(cfg.SIGNAL_ENRICH_TIMEOUT_S)
+    try:
+        return await asyncio.wait_for(
+            _enrich_company_signals_impl(
+                company_id=company_id,
+                company_name=company_name,
+                domain=domain,
+                description=description,
+                industry=industry,
+                raw_meta=raw_meta,
+                existing_headcount=existing_headcount,
+                existing_headquarters=existing_headquarters,
+            ),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.error(
+            f"[{company_name}] Signal enrichment timed out after {timeout:.0f}s"
+        )
+        raise

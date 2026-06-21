@@ -20,9 +20,9 @@ import sys
 import time
 
 from config_logging import setup_logging
-from axiom_logger import axiom_logger
-from sentry_init import init_sentry
-from sentry_telemetry import capture_task_failure
+from infra.axiom_logger import axiom_logger
+from infra.sentry_init import init_sentry
+from infra.sentry_telemetry import capture_task_failure
 
 SERVICE = "tellora-discovery"
 
@@ -32,7 +32,7 @@ logger = logging.getLogger("discovery")
 
 
 async def _run_headcount_backfill(*, run_all: bool) -> None:
-    from headcount_backfill import backfill_apollo_headcounts
+    from scrape.headcount_backfill import backfill_apollo_headcounts
 
     task = "headcount_backfill_all" if run_all else "headcount_backfill_weekly"
     start = time.perf_counter()
@@ -63,7 +63,7 @@ async def _run_headcount_backfill(*, run_all: bool) -> None:
 
 async def _scrape_and_enrich(dry_run: bool) -> None:
     """Run the Apollo scrape, then enrich the newly-pending companies inline."""
-    from service import run_discovery_scrape
+    from scrape.service import run_discovery_scrape
 
     start = time.perf_counter()
     stats: dict = {}
@@ -84,7 +84,7 @@ async def _scrape_and_enrich(dry_run: bool) -> None:
         if total > 0:
             enrich_start = time.perf_counter()
             logger.info("Enriching newly scraped companies inline...")
-            from signal_runner import run as run_enrichment
+            from signals.runner import run as run_enrichment
 
             await run_enrichment(limit=None, concurrency=5, batch_size=50, reset_failed=False)
             await axiom_logger.log_task_run(

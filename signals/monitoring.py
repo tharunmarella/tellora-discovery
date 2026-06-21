@@ -8,14 +8,13 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
-from arq import cron
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 import settings as cfg
 from database import make_engine
-from signal_enrichment import enrich_company_signals
-from signal_runner import persist_result
+from signals.pipeline import enrich_company_signals
+from signals.runner import persist_result
 
 logger = logging.getLogger("discovery.monitoring")
 
@@ -109,7 +108,7 @@ async def poll_edgar_form_d_task(ctx) -> dict:
     Daily SEC EDGAR Form D pipeline:
     index → parse documents → store tech filings → match events → auto-create startups.
     """
-    from edgar_signals import (
+    from signals.sources.edgar import (
         create_companies_from_filings,
         fetch_filing_details,
         fetch_recent_form_d,
@@ -148,7 +147,7 @@ async def poll_edgar_form_d_task(ctx) -> dict:
 
 async def poll_product_hunt_task(ctx) -> dict:
     """Daily: match Product Hunt launches to companies; auto-create unmatched (capped)."""
-    from news_signals import (
+    from signals.sources.news import (
         create_companies_from_launches,
         fetch_product_hunt_launches,
         match_ph_launches,
@@ -175,14 +174,14 @@ async def poll_product_hunt_task(ctx) -> dict:
 
 async def poll_job_posts_task(ctx) -> dict:
     """Daily: poll ATS for watched accounts only."""
-    from job_posts import fetch_job_board_posts, extract_posts_with_gemini, persist_job_posts
+    from signals.job_posts import fetch_job_board_posts, extract_posts_with_gemini, persist_job_posts
 
     with Session(_engine) as session:
         rows = [dict(r) for r in session.execute(_SELECT_WATCHED_FOR_JOBS).mappings().all()]
 
     updated = 0
     for row in rows[:100]:
-        posts, source = await fetch_job_board_posts(row["name"])
+        posts, source = await fetch_job_board_posts(row["name"], domain=row.get("domain"))
         if not posts:
             continue
         posts = extract_posts_with_gemini(posts)
@@ -193,3 +192,78 @@ async def poll_job_posts_task(ctx) -> dict:
         await asyncio.sleep(0.5)
 
     return {"polled": updated}
+
+
+_SELECT_RECONCILE = text("""
+    SELECT id
+    FROM discovery_company
+    WHERE (
+        signal_enrichment_status = 'processing'
+        AND (
+            signal_last_attempt_at IS NULL
+            OR signal_last_attempt_at < NOW() - (:stale_minutes * INTERVAL '1 minute')
+        )
+    )
+    OR (
+        signal_enrichment_status IN ('failed', 'partial')
+        AND COALESCE(signal_attempt_count, 0) < :max_attempts
+        AND (
+            signal_last_attempt_at IS NULL
+            OR signal_last_attempt_at < NOW() - (
+                INTERVAL '1 minute' * POWER(2, LEAST(COALESCE(signal_attempt_count, 0), 4))
+            )
+        )
+    )
+    ORDER BY signal_last_attempt_at NULLS FIRST
+    LIMIT :batch
+""")
+
+_RESET_TO_PENDING = text("""
+    UPDATE discovery_company
+    SET signal_enrichment_status = 'pending', updated_at = NOW()
+    WHERE id = :company_id
+""")
+
+
+async def reconcile_pending_task(ctx) -> dict:
+    """
+    Re-enqueue stuck processing orphans and retryable failed/partial rows.
+    Runs every 10 minutes on the on-demand worker.
+    """
+    import arq
+    from arq.connections import RedisSettings
+
+    stale_minutes = cfg.SIGNAL_PROCESSING_STALE_MINUTES
+    max_attempts = cfg.SIGNAL_RECONCILE_MAX_ATTEMPTS
+    batch = cfg.SIGNAL_RECONCILE_BATCH
+
+    with Session(_engine) as session:
+        rows = session.execute(
+            _SELECT_RECONCILE,
+            {"stale_minutes": stale_minutes, "max_attempts": max_attempts, "batch": batch},
+        ).mappings().all()
+        company_ids = [str(r["id"]) for r in rows]
+
+    if not company_ids:
+        return {"requeued": 0}
+
+    pool = await arq.create_pool(RedisSettings.from_dsn(cfg.REDIS_URL))
+    requeued = 0
+    try:
+        with Session(_engine) as session:
+            for company_id in company_ids:
+                session.execute(_RESET_TO_PENDING, {"company_id": company_id})
+            session.commit()
+
+        for company_id in company_ids:
+            await pool.enqueue_job(
+                "enrich_company_task",
+                company_id,
+                _queue_name="arq:ondemand",
+            )
+            requeued += 1
+    finally:
+        await pool.aclose()
+
+    logger.info(f"Reconcile re-queued {requeued} companies for signal enrichment")
+    return {"requeued": requeued}

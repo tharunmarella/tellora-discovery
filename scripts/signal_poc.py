@@ -38,7 +38,7 @@ import httpx
 
 import settings as cfg
 from llm import embed_text, get_gemini_client, retry_llm, strip_json_fences
-from signal_enrichment import check_job_boards, fetch_funding_news
+from signals.pipeline import check_job_boards, fetch_funding_news
 
 NOW = datetime.now(timezone.utc)
 
@@ -499,7 +499,7 @@ async def phase6() -> None:
     sub(f"LIVE: Apollo free people search at {DEMO_DOMAIN} (current titles)")
     people = []
     try:
-        from apollo_client import search_page
+        from scrape.apollo_client import search_page
         data = await search_page(
             cfg.TELLORA_APOLLO_API_KEY,
             {"q_organization_domains_list": [DEMO_DOMAIN],

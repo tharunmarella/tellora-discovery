@@ -76,3 +76,12 @@ AXIOM_DATASET: str = os.getenv("AXIOM_DATASET") or (
     "tellora" if ENVIRONMENT == "production" else "tellora-dev"
 )
 SENTRY_DSN: str = os.getenv("SENTRY_DSN", "")
+
+# Signal enrichment worker / reconcile
+SIGNAL_ENRICH_MAX_TRIES: int = int(os.getenv("SIGNAL_ENRICH_MAX_TRIES", "3"))
+SIGNAL_RECONCILE_MAX_ATTEMPTS: int = int(os.getenv("SIGNAL_RECONCILE_MAX_ATTEMPTS", "3"))
+SIGNAL_RECONCILE_BATCH: int = int(os.getenv("SIGNAL_RECONCILE_BATCH", "50"))
+SIGNAL_ENRICH_TIMEOUT_S: int = int(os.getenv("SIGNAL_ENRICH_TIMEOUT_S", "480"))
+SIGNAL_PROCESSING_STALE_MINUTES: int = int(os.getenv("SIGNAL_PROCESSING_STALE_MINUTES", "15"))
+DOMAIN_CACHE_MAXSIZE: int = int(os.getenv("DOMAIN_CACHE_MAXSIZE", "5000"))
+DOMAIN_CACHE_TTL_S: int = int(os.getenv("DOMAIN_CACHE_TTL_S", "3600"))

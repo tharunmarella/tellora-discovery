@@ -57,7 +57,7 @@ def gemini_json(prompt):
 
 async def source1():
     header(1, "Extra website pages (pricing / customers / changelog)")
-    from signal_enrichment import _jina_read
+    from signals.pipeline import _jina_read
 
     pages = {}
     for path in ["/pricing", "/customers", "/changelog"]:
@@ -301,7 +301,7 @@ async def source5():
 
 async def source6():
     header(6, "ATS expansion (Ashby / SmartRecruiters / Workable)")
-    from job_posts import fetch_job_board_posts
+    from signals.job_posts import fetch_job_board_posts
 
     for name in ["Ramp", "Deel"]:
         posts, source = await fetch_job_board_posts(name)
@@ -318,7 +318,7 @@ async def source6():
 
 async def source7():
     header(7, "Hacker News mentions + Show HN launches")
-    from hn_signals import fetch_hn_signals, hn_extra_events
+    from signals.sources.hn import fetch_hn_signals, hn_extra_events
 
     hn = await fetch_hn_signals(DEMO_COMPANY, DEMO_DOMAIN)
     print(f"  mentions (7d, filtered): {len(hn['mentions'])}")
@@ -339,7 +339,7 @@ async def source7():
 
 async def source8():
     header(8, "Wayback Machine pricing baseline (cold-start diff)")
-    from signal_enrichment import fetch_wayback_fingerprint, page_fingerprint, _jina_read
+    from signals.pipeline import fetch_wayback_fingerprint, page_fingerprint, _jina_read
 
     baseline = await fetch_wayback_fingerprint(DEMO_DOMAIN, "/pricing")
     live = page_fingerprint(await _jina_read(f"https://{DEMO_DOMAIN}/pricing", max_chars=2000))
@@ -357,7 +357,7 @@ async def source8():
 
 async def source9():
     header(9, "USAspending.gov federal contracts")
-    from gov_signals import fetch_gov_awards, gov_extra_events
+    from signals.sources.gov import fetch_gov_awards, gov_extra_events
 
     awards = await fetch_gov_awards("Palantir")
     print(f"  awards (90d) for Palantir: {len(awards)}")
@@ -375,7 +375,7 @@ async def source9():
 
 async def source10():
     header(10, "Product Hunt daily launches")
-    from news_signals import fetch_product_hunt_launches
+    from signals.sources.news import fetch_product_hunt_launches
 
     launches = await fetch_product_hunt_launches()
     print(f"  recent launches: {len(launches)}")
@@ -390,7 +390,7 @@ async def source10():
 
 async def source11():
     header(11, "npm registry releases (GitHub org scope)")
-    from github_signals import fetch_github_signals, github_extra_events
+    from signals.sources.github import fetch_github_signals, github_extra_events
 
     gh = await fetch_github_signals(DEMO_DOMAIN)
     print(f"  org={gh.get('org')}  npm_packages={gh.get('npm_package_count', 0)}")

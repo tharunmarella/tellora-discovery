@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 import settings as cfg
 from database import make_engine
-from signal_enrichment import fetch_apollo_headcount
+from signals.pipeline import fetch_apollo_headcount
 
 logger = logging.getLogger("discovery.headcount_backfill")
 

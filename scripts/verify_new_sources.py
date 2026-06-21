@@ -7,8 +7,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from signal_diff import diff_snapshots, snapshot_from_result
-from signal_enrichment import enrich_company_signals
+from signals.diff import diff_snapshots, snapshot_from_result
+from signals.pipeline import enrich_company_signals
 
 
 async def main():

@@ -304,7 +304,7 @@ def match_and_insert_events(session: Session, filings: list[dict]) -> list[str]:
            OR LOWER(name) = ANY(:norms)
     """), {"norms": list(by_norm.keys())}).mappings().all()
 
-    from edges import edges_from_filing, upsert_edges
+    from signals.edges import edges_from_filing, upsert_edges
 
     matched_domains: list[str] = []
     for row in rows:
@@ -333,7 +333,7 @@ async def create_companies_from_filings(session: Session, filings: list[dict]) -
     enrichment lookup and insert a discovery_company row (source=sec_edgar).
     The new row enters the normal signal-enrichment pipeline as 'pending'.
     """
-    from enrichment import lookup_domain
+    from scrape.domain_lookup import lookup_domain
 
     candidates = [
         f for f in filings
@@ -404,7 +404,7 @@ async def create_companies_from_filings(session: Session, filings: list[dict]) -
             WHERE accession_no = :acc
         """), {"cid": company_id, "acc": f["accession_no"]})
         _insert_funding_event(session, company_id, f)
-        from edges import edges_from_filing, upsert_edges
+        from signals.edges import edges_from_filing, upsert_edges
         upsert_edges(session, edges_from_filing(company_id, f))
         created += 1
         logger.info(f"EDGAR auto-created: {f['name']} → {domain or 'no domain'} ({amount or 'n/a'})")

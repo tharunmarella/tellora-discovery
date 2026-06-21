@@ -21,7 +21,7 @@ from google import genai
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import settings as cfg
-from enrichment import EXTRACT_PROMPT, INDUSTRY_ENUM
+from scrape.domain_lookup import EXTRACT_PROMPT, INDUSTRY_ENUM
 
 if not cfg.SERPER_API_KEY or not cfg.GEMINI_API_KEY:
     print("Set SERPER_API_KEY and GOOGLE_API_KEY / GEMINI_API_KEY env vars")

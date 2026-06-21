@@ -17,15 +17,25 @@ Queries Apollo's **free** People API Search (`mixed_people/api_search`) across 1
 
 ## Enrichment pipeline (per company)
 
+### Scrape-time (Apollo ingest)
+
 1. **Serper search** `"{company} CEO: {ceo_first_name}"` → Google SERP results
-2. **Gemini** reads knowledgeGraph + organic results → extracts domain, description, industries, CEO name, HQ, founded year, funding, keywords, use_case
-3. **logo_url** constructed from domain via Google Favicon API (no extra call)
-4. **Signal enrichment** (Jina + job boards + funding news + tech stack + Gemini synthesis) → buying signals, embeddings, HQ normalization
-5. DuckDuckGo fallback if Serper is unavailable
+2. **Gemini** reads knowledgeGraph + organic results → domain, description, industries, CEO, HQ, funding
+3. **logo_url** from domain via Google Favicon API
+
+### Signal-time (buying signals)
+
+1. **Jina Reader** — homepage, /about, /careers, /pricing, /customers, /changelog
+2. **Job boards** — Greenhouse, Lever, Ashby, SmartRecruiters, Workable
+3. **Free sources** — GitHub, EDGAR Form D, Google News RSS, HN, USAspending, DNS, Wayback
+4. **Gemini synthesis** → `buying_signals`, `signal_score`, embeddings
+5. **Signal diff** → typed events (`funding_round`, `hiring_surge`, `product_launch`, …)
+
+Statuses: `pending` · `processing` · `enriched` · `partial` · `failed` · `skipped`
 
 ## Crash recovery
 
-After every committed page the service writes a checkpoint to `discovery_progress`. If the process crashes on page 247 of "healthcare", the next run reads the checkpoint and resumes from page 248.
+After every committed page the service writes a checkpoint to `discovery_progress`. Signal enrichment uses a reconcile cron (~10 min) to re-queue stuck `processing` rows and retryable `failed`/`partial` companies.
 
 ## Railway setup
 
@@ -33,11 +43,7 @@ After every committed page the service writes a checkpoint to `discovery_progres
 2. **Root directory:** `tellora-discovery/`
 3. **Start command:** `python __main__.py`
 4. **Cron schedule:** `0 3 * * 0` (every Sunday 3 AM UTC)
-5. Set environment variables (see `.env.example`):
-   - `DATABASE_URL` — same as the main backend
-   - `TELLORA_APOLLO_API_KEY` — Apollo master API key
-   - `GOOGLE_API_KEY` — Gemini extraction + embeddings
-   - `SERPER_API_KEY` — primary web search (falls back to DDG without it)
+5. Set environment variables (see `.env.example`)
 
 For the always-on on-demand worker, deploy a second service with start command `arq worker.WorkerSettings`.
 
@@ -46,44 +52,66 @@ For the always-on on-demand worker, deploy a second service with start command `
 ```bash
 cd tellora-discovery
 pip install -r requirements.txt
-cp .env.example .env  # fill in values
-python __main__.py --dry-run  # 2 pages per profile, skips enrichment + backfill
-python __main__.py             # full run
-python scripts/test_batch.py   # test scrape-time enrichment on a batch of companies
-python scripts/test_search.py  # test semantic search against discovery_company
+cp .env.example .env
+python __main__.py --dry-run
+python __main__.py
+python -m signals.runner --limit 10
+python scripts/test_batch.py
+python scripts/test_search.py
 python scripts/backfill_hq_normalize.py --dry-run
 ```
 
-## File structure
+## Project structure
 
 ```
 tellora-discovery/
-├── __main__.py           # Weekly cron entry point (scrape + inline enrich + headcount cap)
-├── worker.py             # ARQ on-demand worker (arq:ondemand)
-├── service.py            # Apollo scrape orchestration with checkpoint/resume
-├── signal_runner.py      # Batch signal enrichment runner (CLI + inline from cron)
-├── signal_enrichment.py  # Per-company signal pipeline (Jina, job boards, Gemini)
-├── headcount_backfill.py # Apollo people-count headcount backfill job
-├── enrichment.py       # Serper + Gemini domain lookup at scrape time
-├── llm.py                # Shared Gemini client, retry, JSON fence strip, embed
-├── profiles.py           # 17 ICP filter configs
-├── apollo_client.py      # Apollo pagination + rate limiter
-├── models.py             # DiscoveryCompany + DiscoveryProgress SQLModel tables
-├── database.py           # DB engine + session helpers
-├── settings.py           # Env var loading
-├── config_logging.py     # Logging setup
-├── scripts/
-│   ├── backfill_hq_normalize.py  # One-off HQ field normalization
-│   ├── test_batch.py             # Manual scrape enrichment smoke test
-│   └── test_search.py            # Manual semantic search smoke test
-└── requirements.txt
+├── __main__.py              # Weekly cron entry (scrape + inline enrich)
+├── worker.py                # ARQ on-demand worker (arq:ondemand)
+├── settings.py              # Env vars
+├── database.py              # DB engine + migrations
+├── models.py                # SQLModel tables
+├── llm.py                   # Shared Gemini client
+├── config_logging.py
+│
+├── scrape/                  # Apollo ingest + scrape-time domain lookup
+│   ├── service.py           # Checkpointed Apollo scrape orchestration
+│   ├── apollo_client.py     # Pagination + rate limiter
+│   ├── profiles.py          # 17 ICP filter configs
+│   ├── domain_lookup.py     # Serper + Gemini at scrape time
+│   └── headcount_backfill.py
+│
+├── signals/                 # Buying-signal enrichment
+│   ├── pipeline.py          # Per-company orchestration (Jina, Gemini, …)
+│   ├── runner.py            # Batch backfill CLI + persist helper
+│   ├── diff.py              # Snapshot diff → typed events
+│   ├── edges.py             # discovery_edge graph
+│   ├── job_posts.py         # ATS fetch + concept extraction
+│   ├── monitoring.py        # Cron tasks + reconcile_pending
+│   ├── name_match.py        # Slug variants + relevance guards
+│   ├── constants.py         # Shared API URLs / timeouts
+│   ├── cache.py             # TTL LRU for in-process caches
+│   └── sources/
+│       ├── edgar.py         # SEC Form D poller
+│       ├── github.py
+│       ├── gov.py           # USAspending contracts
+│       ├── hn.py            # Hacker News
+│       └── news.py          # Google News RSS + Product Hunt
+│
+├── infra/                   # Observability
+│   ├── axiom_arq.py
+│   ├── axiom_logger.py
+│   ├── sentry_init.py
+│   └── sentry_telemetry.py
+│
+└── scripts/                 # One-off POCs and backfills
 ```
 
 ## Rate limits
 
-- **Apollo:** 200 req/min, 600 req/hour — paces at ~1 req/sec, pauses near ceiling
-- **Serper:** 50 req/sec — no practical limit for this pipeline
-- **Gemini:** 10 concurrent enrichments (`LOOKUP_CONCURRENCY=10`)
+- **Apollo:** 200 req/min, 600 req/hour — paces at ~1 req/sec
+- **Serper:** 50 req/sec
+- **Jina (unauth):** ~20 RPM — use `JINA_API_KEY` in production
+- **Signal worker:** `max_jobs=5`, `job_timeout=600s`, `max_tries=3`
 
 ## Expected output
 

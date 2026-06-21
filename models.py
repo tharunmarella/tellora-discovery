@@ -102,7 +102,14 @@ class DiscoveryCompany(SQLModel, table=True):
     signal_enrichment_status: str = Field(
         default="pending",
         sa_column=Column(String, nullable=False, server_default="pending", index=True),
-        description="pending | enriched | failed | skipped",
+        description="pending | processing | enriched | partial | failed | skipped",
+    )
+    signal_attempt_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default="0"),
+    )
+    signal_last_attempt_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(TIMESTAMP(timezone=True), nullable=True)
     )
     search_tsv: Optional[Any] = Field(default=None, sa_column=Column(TSVECTOR, nullable=True))
 

@@ -26,17 +26,17 @@ from sqlalchemy.orm import Session
 
 import settings as cfg
 from database import make_engine
-from monitoring_tasks import (
+from infra.axiom_arq import after_job_end, on_job_failure
+from infra.axiom_logger import axiom_logger
+from infra.sentry_init import init_sentry
+from signals.monitoring import (
     poll_edgar_form_d_task,
     poll_job_posts_task,
     poll_product_hunt_task,
+    reconcile_pending_task,
     refresh_stale_index_task,
     refresh_watched_companies_task,
 )
-
-from axiom_arq import after_job_end, on_job_failure
-from axiom_logger import axiom_logger
-from sentry_init import init_sentry
 
 init_sentry(server_name="tellora-discovery-worker")
 
@@ -48,14 +48,18 @@ _engine = make_engine(
     max_overflow=5,
 )
 
+_ENRICH_MAX_TRIES = cfg.SIGNAL_ENRICH_MAX_TRIES
+
 # ── Redis helpers ───────────────────────────────────────────────────────────
 
 _CLAIM_AND_LOAD = text("""
     UPDATE discovery_company
     SET    signal_enrichment_status = 'processing',
+           signal_last_attempt_at   = NOW(),
+           signal_attempt_count     = COALESCE(signal_attempt_count, 0) + 1,
            updated_at               = NOW()
     WHERE  id = :company_id
-    AND    signal_enrichment_status = 'pending'
+    AND    signal_enrichment_status IN ('pending', 'processing')
     RETURNING id, name, domain, description, industry, raw_meta, headcount, headquarters
 """)
 
@@ -71,16 +75,24 @@ _MARK_FAILED = text("""
 async def enrich_company_task(ctx, company_id: str) -> dict:
     """
     Enrich a single company. Safe to enqueue multiple times — the atomic
-    'pending → processing' claim ensures only one worker does the work.
+    claim ensures only one worker does the work.
 
     Enqueued by the backend for user-triggered (on-demand) enrichment.
     """
-    logger.info(f"[enrich_company_task] Starting for company_id={company_id}")
+    job_try = int(ctx.get("job_try") or 1)
+    max_tries = int(ctx.get("max_tries") or _ENRICH_MAX_TRIES)
+    logger.info(
+        f"[enrich_company_task] Starting for company_id={company_id} "
+        f"(try {job_try}/{max_tries})"
+    )
 
     with Session(_engine) as session:
         row = session.execute(_CLAIM_AND_LOAD, {"company_id": company_id}).mappings().first()
         if row is None:
-            logger.info(f"[enrich_company_task] Skipping {company_id} — not pending (already claimed or enriched)")
+            logger.info(
+                f"[enrich_company_task] Skipping {company_id} — "
+                "not pending/processing (already claimed or enriched)"
+            )
             return {"ok": False, "skipped": True, "company_id": company_id}
         row = dict(row)
 
@@ -88,7 +100,7 @@ async def enrich_company_task(ctx, company_id: str) -> dict:
     domain = row["domain"]
 
     try:
-        from signal_enrichment import enrich_company_signals
+        from signals.pipeline import enrich_company_signals
         result = await enrich_company_signals(
             company_id=company_id,
             company_name=company_name,
@@ -100,22 +112,33 @@ async def enrich_company_task(ctx, company_id: str) -> dict:
             existing_headquarters=row.get("headquarters"),
         )
     except Exception as exc:
-        logger.error(f"[enrich_company_task] Enrichment failed for {company_name}: {exc}", exc_info=True)
-        with Session(_engine) as session:
-            session.execute(_MARK_FAILED, {"company_id": company_id})
-            session.commit()
-        raise  # let ARQ retry
+        logger.error(
+            f"[enrich_company_task] Enrichment failed for {company_name}: {exc}",
+            exc_info=True,
+        )
+        if job_try >= max_tries:
+            with Session(_engine) as session:
+                session.execute(_MARK_FAILED, {"company_id": company_id})
+                session.commit()
+            logger.error(
+                f"[enrich_company_task] Marked {company_id} failed after {job_try} tries"
+            )
+        else:
+            logger.warning(
+                f"[enrich_company_task] Will retry {company_id} "
+                f"(try {job_try}/{max_tries}); leaving status=processing"
+            )
+        raise
 
     result["domain"] = domain
 
-    # Persist result via the shared helper (also used by the CLI backfill runner)
     with Session(_engine) as session:
-        from signal_runner import persist_result
+        from signals.runner import persist_result
         persist_result(session, company_id, result)
         session.commit()
 
-    # Notify backend so waiting contacts get re-queued
-    if domain and result.get("signal_enrichment_status") != "failed":
+    status = result.get("signal_enrichment_status")
+    if domain and status in ("enriched", "partial"):
         try:
             r = aioredis.from_url(cfg.REDIS_URL, socket_connect_timeout=2)
             await r.rpush(cfg.SIGNALS_READY_KEY, domain)
@@ -124,8 +147,16 @@ async def enrich_company_task(ctx, company_id: str) -> dict:
         except Exception as exc:
             logger.warning(f"[enrich_company_task] Redis notify failed: {exc}")
 
-    logger.info(f"[enrich_company_task] Done for {company_name} ({domain}), score={result.get('signal_score')}")
-    return {"ok": True, "company_id": company_id, "signal_score": result.get("signal_score")}
+    logger.info(
+        f"[enrich_company_task] Done for {company_name} ({domain}), "
+        f"status={status}, score={result.get('signal_score')}"
+    )
+    return {
+        "ok": True,
+        "company_id": company_id,
+        "signal_score": result.get("signal_score"),
+        "status": status,
+    }
 
 
 # ── ARQ lifecycle hooks ─────────────────────────────────────────────────────
@@ -163,6 +194,7 @@ class WorkerSettings:
         poll_job_posts_task,
         poll_edgar_form_d_task,
         poll_product_hunt_task,
+        reconcile_pending_task,
     ]
     queue_name = "arq:ondemand"
     redis_settings = _redis_settings
@@ -171,6 +203,7 @@ class WorkerSettings:
     on_job_failure = on_job_failure
     after_job_end = after_job_end
     max_jobs = 5
+    max_tries = _ENRICH_MAX_TRIES
     job_timeout = 600
     cron_jobs = [
         cron(refresh_watched_companies_task, weekday=0, hour=4, minute=0),
@@ -178,4 +211,5 @@ class WorkerSettings:
         cron(poll_job_posts_task, hour=6, minute=0),
         cron(poll_edgar_form_d_task, hour=10, minute=0),
         cron(poll_product_hunt_task, hour=11, minute=0),
+        cron(reconcile_pending_task, minute={0, 10, 20, 30, 40, 50}),
     ]

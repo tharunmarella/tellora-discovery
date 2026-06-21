@@ -15,20 +15,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time as _time
 from datetime import datetime, timedelta, timezone
 
 import httpx
 
 import settings as cfg
+from signals.cache import TTLLRUCache
 
 logger = logging.getLogger("discovery.github")
 
 _API = "https://api.github.com"
 
-# domain → (ts, result dict). Negative resolutions cached too (org=None).
-_GH_CACHE: dict[str, tuple[float, dict]] = {}
-_GH_CACHE_TTL = 24 * 3600
+# domain → result dict. Negative resolutions cached too (org=None).
+_GH_CACHE: TTLLRUCache[dict] = TTLLRUCache(maxsize=cfg.DOMAIN_CACHE_MAXSIZE, ttl=86400.0)
 
 _EMPTY = {"org": None, "languages": [], "new_repos": [], "repo_count": 0, "new_npm_releases": [], "npm_package_count": 0}
 
@@ -81,8 +80,8 @@ async def fetch_github_signals(domain: str) -> dict:
         return dict(_EMPTY)
 
     cached = _GH_CACHE.get(domain)
-    if cached and _time.time() - cached[0] < _GH_CACHE_TTL:
-        return cached[1]
+    if cached is not None:
+        return cached
 
     result = dict(_EMPTY)
     try:
@@ -166,7 +165,7 @@ async def fetch_github_signals(domain: str) -> dict:
         logger.warning(f"GitHub signals failed for {domain}: {exc}")
         return dict(_EMPTY)  # don't cache transient failures
 
-    _GH_CACHE[domain] = (_time.time(), result)
+    _GH_CACHE.set(domain, result)
     if result["org"]:
         logger.info(
             f"GitHub {domain} → {result['org']}: "

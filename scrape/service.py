@@ -25,10 +25,10 @@ from sqlmodel import select, func
 import settings as cfg
 from database import get_session
 from models import DiscoveryCompany, DiscoveryProgress
-from profiles import ICP_PROFILES
-from apollo_client import ApolloRateLimiter, paginate_profile
-from enrichment import lookup_domain
-from signal_enrichment import fetch_apollo_headcount
+from scrape.apollo_client import ApolloRateLimiter, paginate_profile
+from scrape.domain_lookup import lookup_domain
+from scrape.profiles import ICP_PROFILES
+from signals.pipeline import fetch_apollo_headcount
 
 logger = logging.getLogger("discovery.service")
 
