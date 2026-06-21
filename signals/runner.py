@@ -10,7 +10,7 @@ discovery_company rows. Use this for:
   - Ad-hoc dev/test runs
 
 In production, enrichment runs in two disjoint places:
-  - Weekly discovery cron (__main__.py) → scrapes + enriches inline via run()
+  - Weekly discovery cron (cron/weekly.py) → scrapes + enriches inline via run()
   - Signal worker (worker.py, arq:ondemand) → user-triggered on-demand enrich
 
 Usage:
@@ -349,7 +349,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "One-shot backfill: run signal enrichment on pending discovery_company rows. "
-            "Also used inline by the weekly discovery job (__main__.py)."
+            "Also used inline by the weekly discovery job (cron/weekly.py)."
         )
     )
     parser.add_argument(

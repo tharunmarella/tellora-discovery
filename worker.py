@@ -94,6 +94,7 @@ async def enrich_company_task(ctx, company_id: str) -> dict:
             )
             return {"ok": False, "skipped": True, "company_id": company_id}
         row = dict(row)
+        session.commit()
 
     company_name = row["name"]
     domain = row["domain"]

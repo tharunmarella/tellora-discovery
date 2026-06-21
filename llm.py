@@ -1,5 +1,7 @@
 """Shared LLM helpers for the discovery service."""
 
+from __future__ import annotations
+
 import logging
 import time
 

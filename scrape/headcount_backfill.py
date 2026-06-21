@@ -1,5 +1,7 @@
 """Apollo people-count headcount backfill for discovery_company rows."""
 
+from __future__ import annotations
+
 import asyncio
 import logging
 

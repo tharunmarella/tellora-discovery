@@ -30,9 +30,9 @@ async def startup(
 ) -> None:
     logger.info("[%s] starting up", server_name)
     if create_tables:
-        from database import create_tables
+        from database import create_tables as _create_tables
 
-        create_tables()
+        _create_tables()
     if axiom_background_flush:
         axiom_logger.start_background_flush()
 

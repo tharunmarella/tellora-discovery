@@ -1,0 +1,8 @@
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: tests requiring Docker Postgres (testcontainers)",
+    "live: tests hitting real external APIs (need API keys)",
+]
+addopts = "-m 'not live and not integration'"

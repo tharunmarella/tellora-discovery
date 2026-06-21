@@ -61,11 +61,40 @@ python scripts/test_search.py
 python scripts/backfill_hq_normalize.py --dry-run
 ```
 
+## Testing
+
+```bash
+cd tellora-discovery
+pip install -r requirements-dev.txt
+
+# Fast: pure unit + HTTP-mocked parsing (no Docker, no API keys)
+pytest
+
+# Task integration: real Postgres via testcontainers (Docker required)
+pytest -m integration
+
+# Live smoke: hits Serper/Gemini/Jina (needs API keys in .env)
+pytest -m live
+```
+
+Test layout:
+
+```
+tests/
+├── unit/           # diff, name_match, pipeline helpers, llm, source mappers
+├── parsing/        # respx-mocked HTTP fetchers + Gemini synthesis
+├── integration/    # worker tasks, cron jobs, DB persistence (testcontainers)
+└── live/           # opt-in external API smoke tests
+```
+
 ## Project structure
 
 ```
 tellora-discovery/
 ├── __main__.py              # Weekly cron entry (scrape + inline enrich)
+├── cron/                    # Weekly cron job orchestration
+│   └── weekly.py
+├── tests/                   # pytest suite (unit / parsing / integration / live)
 ├── worker.py                # ARQ on-demand worker (arq:ondemand)
 ├── settings.py              # Env vars
 ├── database.py              # DB engine + migrations
