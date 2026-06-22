@@ -49,3 +49,33 @@ async def test_execute_headcount_only():
     with patch("cron.weekly.run_headcount_backfill", new_callable=AsyncMock) as mock_hc:
         await execute(WeeklyCronArgs(headcount_only=True))
     mock_hc.assert_awaited_once_with(run_all=True)
+
+
+@pytest.mark.asyncio
+async def test_scrape_and_enrich_zero_total_skips_enrichment():
+    with (
+        patch("scrape.service.run_discovery_scrape", new_callable=AsyncMock) as mock_scrape,
+        patch("signals.runner.run", new_callable=AsyncMock) as mock_enrich,
+        patch("cron.weekly.run_headcount_backfill", new_callable=AsyncMock) as mock_hc,
+    ):
+        mock_scrape.return_value = {"total": 0}
+        await scrape_and_enrich(dry_run=False)
+    mock_enrich.assert_not_awaited()
+    mock_hc.assert_awaited_once_with(run_all=False)
+
+
+@pytest.mark.asyncio
+async def test_scrape_and_enrich_failure_logs_and_reraises():
+    boom = RuntimeError("scrape failed")
+    with (
+        patch("scrape.service.run_discovery_scrape", new_callable=AsyncMock) as mock_scrape,
+        patch("cron.weekly.capture_task_failure") as mock_sentry,
+        patch("cron.weekly.axiom_logger.log_task_run", new_callable=AsyncMock) as mock_axiom,
+    ):
+        mock_scrape.side_effect = boom
+        with pytest.raises(RuntimeError, match="scrape failed"):
+            await scrape_and_enrich(dry_run=False)
+    mock_sentry.assert_called_once()
+    assert mock_sentry.call_args.kwargs["task_name"] == "discovery_weekly"
+    mock_axiom.assert_awaited()
+    assert mock_axiom.await_args.kwargs["success"] is False

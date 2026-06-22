@@ -248,3 +248,19 @@ async def test_live_apollo_headcount():
 
     result = await fetch_apollo_headcount("stripe.com")
     assert isinstance(result, dict)
+
+
+@pytest.mark.skipif(not HAS_APOLLO, reason="real TELLORA_APOLLO_API_KEY required")
+async def test_live_apollo_search_page():
+    import settings as cfg
+    from scrape.apollo_client import search_page
+
+    data = await search_page(
+        cfg.TELLORA_APOLLO_API_KEY,
+        {"q_organization_domains_list": ["stripe.com"]},
+        page=1,
+        per_page=1,
+    )
+    assert isinstance(data, dict)
+    total = data.get("total_entries") or (data.get("pagination") or {}).get("total_entries")
+    assert total is not None
