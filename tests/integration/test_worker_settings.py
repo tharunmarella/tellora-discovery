@@ -43,3 +43,23 @@ def test_monitoring_crons_registered():
     assert "refresh_watched_companies_task" in cron_funcs
     assert "refresh_stale_index_task" in cron_funcs
     assert "refresh_headcounts_task" in cron_funcs
+    assert "run_discovery_scrape_task" in cron_funcs
+
+
+def test_scrape_fallback_cron_calculates_next_run():
+    """arq cron weekday must be set/list/tuple — frozenset crashes at runtime."""
+    from datetime import datetime, timezone
+
+    from arq.cron import next_cron
+
+    scrape_cron = next(
+        c for c in WorkerSettings.cron_jobs if c.coroutine.__name__ == "run_discovery_scrape_task"
+    )
+    now = datetime(2026, 6, 22, 2, 0, tzinfo=timezone.utc)  # Monday
+    next_run = next_cron(
+        now,
+        weekday=scrape_cron.weekday,
+        hour=scrape_cron.hour,
+        minute=scrape_cron.minute,
+    )
+    assert next_run.weekday() in scrape_cron.weekday

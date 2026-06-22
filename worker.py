@@ -255,7 +255,8 @@ class WorkerSettings:
         # Fallback discovery scrape — mirrors DISCOVERY_SCRAPE_CRON (default Sun+Wed 3 AM UTC).
         cron(
             run_discovery_scrape_task,
-            weekday=_scrape_schedule.python_weekdays,
+            # arq accepts set/list/tuple for weekday — not frozenset.
+            weekday=set(_scrape_schedule.python_weekdays),
             hour=_scrape_schedule.hour,
             minute=_scrape_schedule.minute,
         ),
