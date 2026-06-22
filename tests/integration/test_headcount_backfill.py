@@ -64,3 +64,36 @@ async def test_backfill_no_eligible_rows(db_session):
         stats = await backfill_apollo_headcounts(limit=10)
 
     assert stats == {"filled": 0, "skipped": 0, "processed": 0, "batches": 1}
+
+
+@pytest.mark.asyncio
+async def test_refresh_stale_headcount_updates_row(db_session, company_factory):
+    from datetime import datetime, timedelta, timezone
+
+    from scrape.headcount_backfill import refresh_stale_apollo_headcounts
+
+    stale = datetime.now(timezone.utc) - timedelta(days=40)
+    company_factory(
+        name="Stale HC Co",
+        domain="stale-hc.com",
+        status="enriched",
+        headcount=100,
+        signal_enriched_at=stale,
+    )
+
+    with (
+        patch(
+            "scrape.headcount_backfill.fetch_apollo_headcount",
+            new_callable=AsyncMock,
+        ) as mock_fetch,
+        patch("scrape.headcount_backfill.asyncio.sleep", new_callable=AsyncMock),
+    ):
+        mock_fetch.return_value = {"headcount_estimate": 250}
+        stats = await refresh_stale_apollo_headcounts(limit=10, stale_days=30)
+
+    assert stats["refreshed"] == 1
+    hc = db_session.execute(
+        text("SELECT headcount FROM discovery_company WHERE domain = :d"),
+        {"d": "stale-hc.com"},
+    ).scalar()
+    assert hc == 250

@@ -245,6 +245,7 @@ async def _scrape_profile(
                     name=name,
                     domain=domain or None,
                     website_url=enrichment.get("website_url"),
+                    linkedin_url=enrichment.get("linkedin_url"),
                     description=enrichment.get("description"),
                     industry=enrichment.get("industry"),
                     ceo_name=enrichment.get("ceo_name"),

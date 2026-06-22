@@ -1,0 +1,25 @@
+# Scoped coverage gate — measures modules we unit/integration-test in CI.
+# Live-only networked paths (Apollo scrape orchestration, full pipeline, RSS
+# ingesters, etc.) are omitted; they are covered by opt-in `pytest -m live`.
+
+[run]
+source = .
+omit =
+    tests/*
+    __main__.py
+    scrape/service.py
+    scrape/domain_lookup.py
+    signals/runner.py
+    signals/pipeline.py
+    signals/job_posts.py
+    signals/monitoring.py
+    signals/edges.py
+    signals/sources/*
+    infra/axiom_logger.py
+    infra/sentry_telemetry.py
+
+[report]
+fail_under = 75
+show_missing = true
+precision = 1
+skip_covered = false

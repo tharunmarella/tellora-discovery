@@ -30,8 +30,8 @@ jobs:
       - name: Run unit + parsing tests
         run: pytest -m "not live and not integration" -v
 
-  integration:
-    name: integration (Docker Postgres)
+  coverage:
+    name: coverage gate 75% (Docker Postgres)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,5 +44,5 @@ jobs:
         run: pip install -r requirements-dev.txt
       # testcontainers drives the Docker daemon that ships on GitHub runners;
       # it spins up pgvector/pgvector:pg15 for the DB-backed tests.
-      - name: Run integration tests
-        run: pytest -m integration -v
+      - name: Run non-live tests with scoped 75% coverage gate
+        run: pytest -m "not live and not e2e" --cov --cov-config=.coveragerc --cov-fail-under=75 -v

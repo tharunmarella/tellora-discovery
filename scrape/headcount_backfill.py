@@ -100,3 +100,69 @@ async def backfill_apollo_headcounts(
         "processed": total_processed,
         "batches": batch_num,
     }
+
+
+async def refresh_stale_apollo_headcounts(
+    limit: int | None = None,
+    *,
+    stale_days: int | None = None,
+) -> dict:
+    """
+    Re-fetch Apollo headcount for rows that already have an estimate but are stale.
+
+    Uses COALESCE(signal_enriched_at, updated_at) as the staleness clock so we
+    don't hammer rows that were fully enriched recently.
+    """
+    cap = limit if limit is not None else int(cfg.HEADCOUNT_REFRESH_LIMIT)
+    days = stale_days if stale_days is not None else int(cfg.HEADCOUNT_REFRESH_STALE_DAYS)
+    engine = make_engine()
+
+    _select = text("""
+        SELECT id, domain, name, headcount
+        FROM   discovery_company
+        WHERE  domain IS NOT NULL
+        AND    headcount IS NOT NULL
+        AND    headcount > 0
+        AND    COALESCE(signal_enriched_at, updated_at)
+               < NOW() - make_interval(days => :stale_days)
+        ORDER  BY COALESCE(signal_enriched_at, updated_at) ASC NULLS FIRST
+        LIMIT  :lim
+    """)
+    _update = text("""
+        UPDATE discovery_company
+        SET    headcount = :hc, updated_at = NOW()
+        WHERE  id = :id
+    """)
+
+    refreshed = skipped = 0
+    with Session(engine) as session:
+        rows = session.execute(_select, {"stale_days": days, "lim": cap}).mappings().all()
+        if not rows:
+            logger.info("[headcount_refresh] no stale headcount rows")
+            return {"refreshed": 0, "skipped": 0, "processed": 0}
+
+        logger.info(f"[headcount_refresh] refreshing {len(rows)} stale headcount rows")
+        for row in rows:
+            domain = row["domain"]
+            if not domain:
+                skipped += 1
+                continue
+            res = await fetch_apollo_headcount(domain)
+            hc = res.get("headcount_estimate")
+            if hc:
+                session.execute(_update, {"hc": hc, "id": row["id"]})
+                refreshed += 1
+                logger.info(
+                    f"[headcount_refresh] {row['name']} ({domain}) "
+                    f"{row['headcount']} → {hc}"
+                )
+            else:
+                skipped += 1
+            await asyncio.sleep(1.1)
+        session.commit()
+
+    logger.info(
+        f"[headcount_refresh] done — refreshed={refreshed}, "
+        f"skipped={skipped}, processed={len(rows)}"
+    )
+    return {"refreshed": refreshed, "skipped": skipped, "processed": len(rows)}

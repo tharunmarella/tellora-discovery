@@ -11,15 +11,18 @@ Fallback: DuckDuckGo if Serper is not configured or returns nothing.
 Requires: GOOGLE_API_KEY. Optional: SERPER_API_KEY.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
+import re
 import time
 
 import httpx
 
 import settings as cfg
-from llm import get_gemini_client, retry_llm, strip_json_fences
+from llm import get_router, retry_llm, strip_json_fences
 
 logger = logging.getLogger("discovery.enrichment")
 
@@ -43,6 +46,7 @@ Extract as many fields as possible and return a single JSON object matching this
   "headquarters": "city and state/country e.g. San Francisco, CA (null if not found)",
   "founded_year": "4-digit year as string e.g. 2018 (null if not found)",
   "funding": "funding stage and/or amount e.g. Series B · $25M (null if not found)",
+  "linkedin_url": "full LinkedIn company page URL e.g. https://www.linkedin.com/company/acme (null if not found)",
   "keywords": ["3-5 short tags describing the company space"],
   "use_case": "one sentence: what type of company would buy or benefit from this company's product (null if unclear)"
 }}
@@ -55,6 +59,49 @@ Search result JSON:
 
 Return only valid JSON. No explanation, no markdown fences."""
 
+_LINKEDIN_COMPANY_RE = re.compile(
+    r"https?://(?:[a-z]{2,3}\.)?linkedin\.com/company/([a-zA-Z0-9_-]+)",
+    re.IGNORECASE,
+)
+
+
+def _normalize_linkedin_company_url(url: str) -> str | None:
+    """Return canonical https://www.linkedin.com/company/<slug> or None."""
+    if not url:
+        return None
+    m = _LINKEDIN_COMPANY_RE.search(url.strip())
+    if not m:
+        return None
+    slug = m.group(1).strip("/")
+    if not slug:
+        return None
+    return f"https://www.linkedin.com/company/{slug}"
+
+
+def extract_linkedin_url(serper_data: dict) -> str | None:
+    """
+    Deterministic LinkedIn company URL from Serper organic / knowledgeGraph links.
+    Ignores personal /in/ profile URLs.
+    """
+    candidates: list[str] = []
+
+    kg = serper_data.get("knowledgeGraph") or {}
+    for key in ("linkedin", "linkedinUrl", "linkedin_url", "website"):
+        val = kg.get(key)
+        if isinstance(val, str):
+            candidates.append(val)
+
+    for item in serper_data.get("organic") or []:
+        link = item.get("link") or item.get("url") or ""
+        if isinstance(link, str) and "linkedin.com" in link.lower():
+            candidates.append(link)
+
+    for raw in candidates:
+        normalized = _normalize_linkedin_company_url(raw)
+        if normalized:
+            return normalized
+    return None
+
 
 def _call_gemini(company_name: str, serper_data: dict) -> dict:
     trimmed = {
@@ -66,11 +113,14 @@ def _call_gemini(company_name: str, serper_data: dict) -> dict:
         serper_json=json.dumps(trimmed, indent=2),
         industry_list=", ".join(INDUSTRY_ENUM),
     )
-    client = get_gemini_client()
-
     def _do():
-        resp = client.models.generate_content(model=cfg.ENRICHMENT_GEMINI_MODEL, contents=prompt)
-        return json.loads(strip_json_fences(resp.text))
+        raw = get_router().complete_text(
+            prompt,
+            models=get_router().enrichment_models,
+            temperature=0.0,
+            json_mode=True,
+        )
+        return json.loads(strip_json_fences(raw))
 
     return retry_llm(_do)
 
@@ -161,10 +211,21 @@ def _run_lookup(company_name: str, ceo_first_name: str, serper_api_key: str) -> 
     # Map Gemini output → enrichment dict (only include non-null values)
     enrichment: dict = {}
     for field in ("name", "domain", "website_url", "description",
-                  "ceo_name", "headquarters", "founded_year", "funding"):
+                  "ceo_name", "headquarters", "founded_year", "funding", "linkedin_url"):
         val = extracted.get(field)
         if val:
             enrichment[field] = val
+
+    # Prefer deterministic LinkedIn company URL from search results over Gemini guess.
+    linkedin = extract_linkedin_url(serper_data) or enrichment.get("linkedin_url")
+    if linkedin:
+        enrichment["linkedin_url"] = linkedin
+    elif "linkedin_url" in enrichment:
+        normalized = _normalize_linkedin_company_url(enrichment["linkedin_url"])
+        if normalized:
+            enrichment["linkedin_url"] = normalized
+        else:
+            enrichment.pop("linkedin_url", None)
 
     # industries: array from Gemini → store as comma-joined string in `industry` column
     industries = extracted.get("industries") or []

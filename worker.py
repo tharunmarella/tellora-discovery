@@ -28,11 +28,19 @@ import settings as cfg
 from database import make_engine
 from infra.axiom_arq import after_job_end, on_job_failure
 from infra.lifespan import SERVICE_WORKER, bootstrap, shutdown as lifespan_shutdown, startup as lifespan_startup
+from cron.scrape_schedule import (
+    DEFAULT_DISCOVERY_SCRAPE_CRON,
+    discovery_scrape_recently_active,
+    parse_scrape_cron,
+    should_run_discovery_scrape,
+)
+from cron.weekly import WeeklyCronArgs, execute as run_weekly_cron, validate_args as validate_weekly_args
 from signals.monitoring import (
     poll_edgar_form_d_task,
     poll_job_posts_task,
     poll_product_hunt_task,
     reconcile_pending_task,
+    refresh_headcounts_task,
     refresh_stale_index_task,
     refresh_watched_companies_task,
 )
@@ -159,6 +167,39 @@ async def enrich_company_task(ctx, company_id: str) -> dict:
     }
 
 
+async def run_discovery_scrape_task(ctx) -> dict:
+    """
+    Fallback scrape cron on the worker when the Railway cron service is absent
+    or misconfigured. Skips if a scrape already ran recently (Railway path).
+    """
+    if not cfg.DISCOVERY_SCRAPE_WORKER_FALLBACK:
+        logger.info("[run_discovery_scrape_task] Worker fallback disabled — skipping")
+        return {"ok": True, "skipped": True, "reason": "worker_fallback_disabled"}
+
+    if discovery_scrape_recently_active():
+        logger.info("[run_discovery_scrape_task] Scrape already active/recent — skipping")
+        return {"ok": True, "skipped": True, "reason": "recent_run"}
+
+    if not should_run_discovery_scrape(
+        cron_expr=cfg.DISCOVERY_SCRAPE_CRON,
+        schedule_disabled=cfg.DISCOVERY_SCRAPE_SCHEDULE_DISABLED,
+    ):
+        logger.info(
+            "[run_discovery_scrape_task] Outside schedule %s — skipping",
+            cfg.DISCOVERY_SCRAPE_CRON,
+        )
+        return {"ok": True, "skipped": True, "reason": "off_schedule"}
+
+    args = WeeklyCronArgs()
+    validate_weekly_args(args)
+    logger.info(
+        "[run_discovery_scrape_task] Starting worker fallback scrape (%s)",
+        cfg.DISCOVERY_SCRAPE_CRON,
+    )
+    await run_weekly_cron(args)
+    return {"ok": True, "skipped": False}
+
+
 # ── ARQ lifecycle hooks ─────────────────────────────────────────────────────
 
 async def startup(ctx):
@@ -189,8 +230,10 @@ class WorkerSettings:
     """
     functions = [
         enrich_company_task,
+        run_discovery_scrape_task,
         refresh_watched_companies_task,
         refresh_stale_index_task,
+        refresh_headcounts_task,
         poll_job_posts_task,
         poll_edgar_form_d_task,
         poll_product_hunt_task,
@@ -205,10 +248,22 @@ class WorkerSettings:
     max_jobs = 5
     max_tries = _ENRICH_MAX_TRIES
     job_timeout = 600
+    _scrape_schedule = parse_scrape_cron(
+        cfg.DISCOVERY_SCRAPE_CRON or DEFAULT_DISCOVERY_SCRAPE_CRON
+    )
     cron_jobs = [
-        cron(refresh_watched_companies_task, weekday=0, hour=4, minute=0),
-        cron(refresh_stale_index_task, weekday=0, hour=5, minute=0),
+        # Fallback discovery scrape — mirrors DISCOVERY_SCRAPE_CRON (default Sun+Wed 3 AM UTC).
+        cron(
+            run_discovery_scrape_task,
+            weekday=_scrape_schedule.python_weekdays,
+            hour=_scrape_schedule.hour,
+            minute=_scrape_schedule.minute,
+        ),
+        # Daily freshness (UTC) — watched + index re-enrich, then ingest polls.
+        cron(refresh_watched_companies_task, hour=4, minute=0),
+        cron(refresh_stale_index_task, hour=5, minute=0),
         cron(poll_job_posts_task, hour=6, minute=0),
+        cron(refresh_headcounts_task, hour=7, minute=0),
         cron(poll_edgar_form_d_task, hour=10, minute=0),
         cron(poll_product_hunt_task, hour=11, minute=0),
         cron(reconcile_pending_task, minute={0, 10, 20, 30, 40, 50}),

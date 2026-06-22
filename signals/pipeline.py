@@ -26,7 +26,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 import settings as cfg
-from llm import embed_text, get_gemini_client, retry_llm, strip_json_fences
+from llm import embed_text, get_router, retry_llm, signal_model_chain, strip_json_fences
 from signals.cache import TTLLRUCache
 from signals.constants import (
     CONTEXT_FALLBACK_MAX,
@@ -36,7 +36,12 @@ from signals.constants import (
     JINA_SEARCH,
     LEVER_API,
 )
-from signals.name_match import apply_funding_grounding, filter_events_by_relevance, slug_variants
+from signals.name_match import (
+    apply_funding_grounding,
+    filter_events_by_relevance,
+    slug_variants,
+    title_mentions_company,
+)
 
 logger = logging.getLogger("discovery.signal")
 
@@ -114,6 +119,45 @@ async def fetch_serper_kg(company_name: str) -> dict:
 
 
 # ── Apollo free people-count headcount proxy ───────────────────────────────
+
+def sanitize_headcount(
+    value: Optional[int],
+    *,
+    founded_year: Optional[int] = None,
+    now_year: Optional[int] = None,
+    year_floor: Optional[int] = None,
+) -> Optional[int]:
+    """
+    Drop headcounts that are actually mis-extracted calendar years.
+
+    The synthesis LLM occasionally maps a year ("© 2019", "Founded 2025", "since
+    2021") into the employee count. Any value inside the year band is treated as
+    a leak and discarded (callers fall back to a trusted source).
+
+    year_floor controls how aggressive the year-band guard is:
+      - LLM-synthesized values: pass year_floor=1900 — a "count" equal to any
+        plausible calendar year is almost certainly a leak.
+      - Structured sources (Apollo / Serper "Number of employees"): leave
+        year_floor=None — only guard the founding year and the current year.
+    """
+    if not value or value <= 0:
+        return None
+    try:
+        value_int = int(value)
+    except (TypeError, ValueError):
+        return None
+    if founded_year:
+        try:
+            if value_int == int(founded_year):
+                return None
+        except (TypeError, ValueError):
+            pass
+    current_year = now_year or datetime.now(timezone.utc).year
+    floor = year_floor if year_floor is not None else current_year - 1
+    if floor <= value_int <= current_year + 1:
+        return None
+    return value_int
+
 
 def _round_headcount(n: int) -> int:
     """Round to a tidy magnitude so an estimate doesn't look falsely precise."""
@@ -514,12 +558,21 @@ async def fetch_funding_news(company_name: str) -> list[str]:
             resp.raise_for_status()
             data = resp.json()
             snippets = []
-            for hit in data.get("data", [])[:4]:
+            # Pull a wider pool, then keep only results whose title actually names
+            # this company. Whole-word matching prevents same-name collisions
+            # (e.g. "Guardrail Technologies" must not absorb "Guardrails AI" news).
+            for hit in data.get("data", [])[:8]:
                 title = hit.get("title", "").strip()
                 desc  = hit.get("description", "").strip()[:300]
                 url   = hit.get("url", "")
-                if title and desc:
-                    snippets.append(f"{title} — {desc} ({url})")
+                if not (title and desc):
+                    continue
+                if not title_mentions_company(title, company_name):
+                    logger.debug(f"Dropping off-company funding hit for '{company_name}': {title!r}")
+                    continue
+                snippets.append(f"{title} — {desc} ({url})")
+                if len(snippets) >= 4:
+                    break
             return snippets
     except Exception as exc:
         logger.warning(f"Funding news search failed for '{company_name}': {exc}")
@@ -711,9 +764,12 @@ def _call_hq_llm(prompt: str, *, provider: str, model: str) -> str:
         )
         return resp.choices[0].message.content or ""
 
-    client = get_gemini_client()
-    resp = client.models.generate_content(model=model, contents=prompt)
-    return resp.text
+    return get_router().complete_text(
+        prompt,
+        models=signal_model_chain(primary=model),
+        temperature=0.0,
+        json_mode=True,
+    )
 
 
 def _build_hq_batch_prompt(inputs: list[str]) -> str:
@@ -797,6 +853,28 @@ def normalize_headquarters(
         return dict(_EMPTY_HQ)
     batch = normalize_headquarters_batch([raw], provider=provider, model=model)
     return batch.get(raw) or dict(_EMPTY_HQ)
+
+
+def backfill_hq_fields(
+    hq_city: Optional[str],
+    hq_region: Optional[str],
+    hq_country: Optional[str],
+    existing_headquarters: Optional[str],
+    *,
+    normalizer=normalize_headquarters,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    When synthesis left hq_city empty but scrape-time headquarters text exists,
+    run HQ normalization as a fallback.
+    """
+    if hq_city or not (existing_headquarters or "").strip():
+        return hq_city, hq_region, hq_country
+    normalized = normalizer(existing_headquarters.strip())
+    return (
+        normalized.get("hq_city") or hq_city,
+        normalized.get("hq_region") or hq_region,
+        normalized.get("hq_country") or hq_country,
+    )
 
 
 def synthesize_company_signals(
@@ -913,9 +991,11 @@ Respond with ONLY valid JSON matching this exact schema. No markdown, no explana
 {_JSON_SCHEMA}"""
 
     def _do():
-        client = get_gemini_client()
-        resp = client.models.generate_content(model=cfg.SIGNAL_GEMINI_MODEL, contents=prompt)
-        data = json.loads(strip_json_fences(resp.text))
+        # Route through the LiteLLM gateway: Gemini primary → Gemini fallback →
+        # Anthropic (when configured), so a single-provider outage doesn't drop
+        # the whole synthesis batch.
+        raw = get_router().complete_text(prompt, temperature=0.0)
+        data = json.loads(strip_json_fences(raw))
         return CompanySignalResult(**{
             k: data.get(k)
             for k in CompanySignalResult.model_fields
@@ -1216,6 +1296,23 @@ async def _enrich_company_signals_impl(
         "total_raised": total_raised,
     })
 
+    hq_city, hq_region, hq_country = backfill_hq_fields(
+        result.hq_city,
+        result.hq_region,
+        result.hq_country,
+        existing_headquarters,
+    )
+    if (
+        hq_city != result.hq_city
+        or hq_region != result.hq_region
+        or hq_country != result.hq_country
+    ):
+        result = result.model_copy(update={
+            "hq_city": hq_city,
+            "hq_region": hq_region,
+            "hq_country": hq_country,
+        })
+
     sources_had_data = _sources_had_data(
         ctx=ctx,
         job_board=job_board,
@@ -1255,9 +1352,17 @@ async def _enrich_company_signals_impl(
     if concepts:
         tsv_text = f"{tsv_text} {' '.join(concepts)}".strip()
 
+    _founded = serper_kg.get("founded")
+    _founded_year = None
+    if _founded:
+        _year_match = re.search(r"(19|20)\d{2}", str(_founded))
+        if _year_match:
+            _founded_year = int(_year_match.group(0))
     headcount = (
-        result.headcount
-        or serper_kg.get("headcount")
+        # LLM-synthesized count: reject any plausible-year value (e.g. 2019).
+        sanitize_headcount(result.headcount, founded_year=_founded_year, year_floor=1900)
+        # Serper "Number of employees" is structured — only guard founded/current year.
+        or sanitize_headcount(serper_kg.get("headcount"), founded_year=_founded_year)
         or (existing_headcount if existing_headcount and existing_headcount > 0 else None)
         or apollo_hc.get("headcount_estimate")
     )

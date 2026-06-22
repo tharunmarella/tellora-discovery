@@ -37,13 +37,37 @@ Statuses: `pending` · `processing` · `enriched` · `partial` · `failed` · `s
 
 After every committed page the service writes a checkpoint to `discovery_progress`. Signal enrichment uses a reconcile cron (~10 min) to re-queue stuck `processing` rows and retryable `failed`/`partial` companies.
 
+## Scheduled jobs (freshness)
+
+| Job | Schedule (UTC) | What it refreshes |
+|-----|----------------|-------------------|
+| **Apollo scrape** (Railway) | Sun + Wed 3:00 | New companies + inline enrich + missing headcount (≤1000) |
+| **Watched re-enrich** (worker) | Daily 4:00 | Active research accounts stale >6d (≤300) |
+| **Index re-enrich** (worker) | Daily 5:00 | Full signals for rows stale >30d (≤2000) |
+| **Job posts** (worker) | Daily 6:00 | ATS hiring on watched accounts (≤100) |
+| **Headcount refresh** (worker) | Daily 7:00 | Re-fetch Apollo headcount when stale >30d (≤500) |
+| **EDGAR / Product Hunt** | Daily 10:00 / 11:00 | New funding/launch discovery |
+| **Reconcile** | Every 10 min | Stuck/failed enrichment retries |
+
+Tune via env: `REFRESH_STALE_DAYS`, `REFRESH_BATCH_CAP`, `WATCHED_STALE_DAYS`, `WATCHED_REFRESH_LIMIT`, `HEADCOUNT_REFRESH_*`.
+
+**One-time index backfill** (scrape metadata → signal re-enrich on all ~8.7K enriched rows):
+
+```bash
+./scripts/run_index_reenrich.sh             # scrape backfill + full re-enrich
+./scripts/run_index_reenrich.sh --limit 50  # sample both steps
+python scripts/backfill_scrape_fields.py --dry-run  # count eligible rows only
+```
+
 ## Railway setup
 
 1. Add a new service in your Railway project.
 2. **Root directory:** `tellora-discovery/`
 3. **Start command:** `python __main__.py`
-4. **Cron schedule:** `0 3 * * 0` (every Sunday 3 AM UTC)
+4. **Cron schedule:** `0 3 * * 0,3` (Sunday + Wednesday 3 AM UTC — Apollo scrape twice weekly)
 5. Set environment variables (see `.env.example`)
+
+**Observability:** set `SENTRY_DSN` and `ENVIRONMENT=production` on **both** Railway services (weekly cron and on-demand worker). Without `SENTRY_DSN`, Sentry is disabled. Events are flushed on shutdown so the short-lived cron job does not drop captured errors.
 
 For the always-on on-demand worker, deploy a second service with start command `arq worker.WorkerSettings`.
 
@@ -75,7 +99,30 @@ pytest -m integration
 
 # Live smoke: hits Serper/Gemini/Jina (needs API keys in .env)
 pytest -m live
+
+# Coverage gate (same as pre-push step 1): non-live suite, 75% on scoped modules
+pytest -m "not live and not e2e" --cov --cov-config=.coveragerc --cov-fail-under=75
+
+# E2E pipeline quality gate (pre-push step 2; needs SERPER + GOOGLE keys in .env)
+pytest -m e2e -v
 ```
+
+**Pre-push hook** (requires Docker + API keys in `.env`):
+
+```bash
+./scripts/install-git-hooks.sh   # once per clone
+```
+
+Blocks `git push` if:
+1. Non-live tests fail or scoped coverage drops below 75%
+2. E2E pipeline quality judge scores below threshold (per-company floor 7, mean >= 8)
+
+Judge model: `E2E_JUDGE_MODEL` (default `gemini-3.5-flash`) runs with **Google Search grounding**
+and is told today's date, so it verifies recent funding/launches/headcount against live search
+instead of its training memory (which would otherwise flag accurate recent facts as
+"hallucinations"). CI does **not** run e2e (no secrets in GitHub Actions).
+
+Omitted from the coverage gate (live-only): `scrape/service.py`, `signals/pipeline.py`, `signals/runner.py`, `signals/sources/*`, etc. — see `.coveragerc`.
 
 Test layout:
 
@@ -84,7 +131,8 @@ tests/
 ├── unit/           # diff, name_match, pipeline helpers, llm, source mappers
 ├── parsing/        # respx-mocked HTTP fetchers + Gemini synthesis
 ├── integration/    # worker tasks, cron jobs, DB persistence (testcontainers)
-└── live/           # opt-in external API smoke tests
+├── live/           # opt-in external API smoke tests
+└── e2e/            # LLM-judged pipeline quality gate (pre-push)
 ```
 
 ## Project structure

@@ -14,9 +14,11 @@ In production, enrichment runs in two disjoint places:
   - Signal worker (worker.py, arq:ondemand) → user-triggered on-demand enrich
 
 Usage:
-  python -m signals.runner                 # backfill all pending
-  python -m signals.runner --limit 100     # test run: only 100 companies
-  python -m signals.runner --reset-failed  # retry previously failed
+  python -m signals.runner                       # backfill all pending
+  python -m signals.runner --limit 100           # test run: only 100 companies
+  python -m signals.runner --reset-failed        # retry previously failed
+  python -m signals.runner --reset-enriched --limit 50  # re-enrich 50 random enriched rows
+  python -m signals.runner --reset-enriched      # re-enrich ALL enriched rows (big spend)
 
 Architecture:
   - Query: signal_enrichment_status = 'pending' AND domain IS NOT NULL AND domain_resolved = true
@@ -75,6 +77,30 @@ _SKIP_NO_DOMAIN = text("""
     SET    signal_enrichment_status = 'skipped', updated_at = NOW()
     WHERE  signal_enrichment_status = 'pending'
     AND    (domain IS NULL OR domain_resolved = false)
+""")
+
+_RESET_ENRICHED_ALL = text("""
+    UPDATE discovery_company
+    SET    signal_enrichment_status = 'pending', updated_at = NOW()
+    WHERE  signal_enrichment_status = 'enriched'
+    AND    domain IS NOT NULL
+    AND    domain_resolved = true
+""")
+
+# Limit-aware reset: only flips a random sample of N enriched rows back to
+# pending, so a `--limit N --reset-enriched` sample run doesn't leave the other
+# ~8.7K rows stuck as 'pending'.
+_RESET_ENRICHED_SAMPLE = text("""
+    UPDATE discovery_company
+    SET    signal_enrichment_status = 'pending', updated_at = NOW()
+    WHERE  id IN (
+        SELECT id FROM discovery_company
+        WHERE  signal_enrichment_status = 'enriched'
+        AND    domain IS NOT NULL
+        AND    domain_resolved = true
+        ORDER  BY random()
+        LIMIT  :n
+    )
 """)
 
 _UPDATE_SIGNAL = text("""
@@ -252,7 +278,13 @@ def _write_batch(session: Session, results: list[dict]) -> tuple[int, int]:
 
 # ── Main runner (one-shot backfill) ────────────────────────────────────────
 
-async def run(limit: Optional[int], concurrency: int, batch_size: int, reset_failed: bool) -> None:
+async def run(
+    limit: Optional[int],
+    concurrency: int,
+    batch_size: int,
+    reset_failed: bool,
+    reset_enriched: bool = False,
+) -> None:
     engine = make_engine()
 
     with Session(engine) as session:
@@ -263,6 +295,14 @@ async def run(limit: Optional[int], concurrency: int, batch_size: int, reset_fai
             )).rowcount
             session.commit()
             logger.info(f"Reset {count} failed companies to pending")
+
+        if reset_enriched:
+            if limit:
+                count = session.execute(_RESET_ENRICHED_SAMPLE, {"n": limit}).rowcount
+            else:
+                count = session.execute(_RESET_ENRICHED_ALL).rowcount
+            session.commit()
+            logger.info(f"Reset {count} enriched companies to pending for re-enrichment")
 
         skipped = session.execute(_SKIP_NO_DOMAIN).rowcount
         session.commit()
@@ -368,6 +408,14 @@ def main() -> None:
         "--reset-failed", action="store_true",
         help="Reset companies with status=failed back to pending before running"
     )
+    parser.add_argument(
+        "--reset-enriched", action="store_true",
+        help=(
+            "Re-enrich already-enriched companies. With --limit N, resets a random "
+            "sample of N enriched rows; without --limit, resets ALL enriched rows "
+            "(large API spend). Use to backfill pipeline improvements."
+        )
+    )
     args = parser.parse_args()
 
     if not cfg.GEMINI_API_KEY:
@@ -379,6 +427,7 @@ def main() -> None:
         concurrency=args.concurrency,
         batch_size=args.batch_size,
         reset_failed=args.reset_failed,
+        reset_enriched=args.reset_enriched,
     ))
 
 

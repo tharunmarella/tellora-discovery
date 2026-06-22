@@ -52,3 +52,27 @@ async def test_refresh_stale_index_skips_fresh(db_session, company_factory):
 
     assert result["refreshed"] == 0
     mock_enrich.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_refresh_company_captures_sentry_on_failure(db_session, watched_company_factory):
+    stale = datetime.now(timezone.utc) - timedelta(days=7)
+    watched_company_factory(
+        name="Fail Co",
+        domain="fail-refresh.com",
+        status="enriched",
+        signal_enriched_at=stale,
+    )
+
+    boom = RuntimeError("enrich blew up")
+    with (
+        patch("signals.monitoring.enrich_company_signals", new_callable=AsyncMock) as mock_enrich,
+        patch("signals.monitoring.capture_task_failure") as mock_sentry,
+    ):
+        mock_enrich.side_effect = boom
+        result = await refresh_watched_companies_task({})
+
+    assert result["refreshed"] >= 1
+    mock_sentry.assert_called_once()
+    assert mock_sentry.call_args.kwargs["task_name"] == "refresh_company"
+    assert mock_sentry.call_args.args[0] is boom

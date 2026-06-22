@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 
 import settings as cfg
 from signals.sources.edgar import normalize_name
-from llm import get_gemini_client, retry_llm, strip_json_fences
+from llm import get_router, retry_llm, strip_json_fences
 
 logger = logging.getLogger("discovery.news")
 
@@ -82,9 +82,13 @@ HEADLINES:
 Respond with ONLY valid JSON: {{"results": [{{"i": 0, "category": "...", "relevant": true}}]}}"""
 
     def _do():
-        client = get_gemini_client()
-        resp = client.models.generate_content(model=cfg.SIGNAL_GEMINI_MODEL, contents=prompt)
-        return json.loads(strip_json_fences(resp.text))
+        raw = get_router().complete_text(
+            prompt,
+            models=get_router().signal_models,
+            temperature=0.0,
+            json_mode=True,
+        )
+        return json.loads(strip_json_fences(raw))
 
     try:
         verdicts = retry_llm(_do)

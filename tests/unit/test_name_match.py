@@ -73,3 +73,31 @@ def test_apply_funding_grounding_strips_uncorroborated():
     assert raised is None
     assert "Series B" not in " ".join(signals)
     assert score <= 35
+
+
+def test_apply_funding_grounding_strips_fabricated_stage_despite_news():
+    # News exists but mentions an older round; LLM fabricated "Series F".
+    signals, score, stage, raised = apply_funding_grounding(
+        buying_signals=["Series F raised $500M", "Launched new product"],
+        signal_score=90,
+        funding_stage="Series F",
+        total_raised="$500M",
+        funding_news=["Acme closed a Series C round in 2021"],
+        extra_events=[],
+    )
+    assert stage is None
+    assert raised is None
+    assert "Series F" not in " ".join(signals)
+
+
+def test_apply_funding_grounding_keeps_corroborated_via_event():
+    signals, score, stage, raised = apply_funding_grounding(
+        buying_signals=["Series D raised $100M"],
+        signal_score=85,
+        funding_stage="Series D",
+        total_raised="$100M",
+        funding_news=[],
+        extra_events=[{"event_type": "funding_round", "title": "Acme raises Series D"}],
+    )
+    assert stage == "Series D"
+    assert score == 85

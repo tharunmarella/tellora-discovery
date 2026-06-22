@@ -41,3 +41,5 @@ def test_monitoring_crons_registered():
     assert "reconcile_pending_task" in cron_funcs
     assert "poll_edgar_form_d_task" in cron_funcs
     assert "refresh_watched_companies_task" in cron_funcs
+    assert "refresh_stale_index_task" in cron_funcs
+    assert "refresh_headcounts_task" in cron_funcs

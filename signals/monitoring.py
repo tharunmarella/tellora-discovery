@@ -13,6 +13,8 @@ from sqlalchemy.orm import Session
 
 import settings as cfg
 from database import make_engine
+from infra.lifespan import SERVICE_WORKER
+from infra.sentry_telemetry import capture_task_failure
 from signals.pipeline import enrich_company_signals
 from signals.runner import persist_result
 
@@ -29,9 +31,9 @@ _SELECT_WATCHED_STALE = text("""
       AND dc.domain_resolved = true
       AND (
           dc.signal_enriched_at IS NULL
-          OR dc.signal_enriched_at < NOW() - INTERVAL '6 days'
+          OR dc.signal_enriched_at < NOW() - make_interval(days => :stale_days)
       )
-    LIMIT 200
+    LIMIT :lim
 """)
 
 _SELECT_STALE_INDEX = text("""
@@ -41,10 +43,10 @@ _SELECT_STALE_INDEX = text("""
       AND domain_resolved = true
       AND (
           signal_enriched_at IS NULL
-          OR signal_enriched_at < NOW() - INTERVAL '90 days'
+          OR signal_enriched_at < NOW() - make_interval(days => :stale_days)
       )
     ORDER BY signal_enriched_at NULLS FIRST
-    LIMIT :cap
+    LIMIT :lim
 """)
 
 _SELECT_WATCHED_FOR_JOBS = text("""
@@ -74,13 +76,28 @@ async def _refresh_company(row: dict, sem: asyncio.Semaphore) -> None:
                 persist_result(session, company_id, result)
                 session.commit()
         except Exception as exc:
-            logger.error(f"Refresh failed for {row.get('name')}: {exc}")
+            logger.error(f"Refresh failed for {row.get('name')}: {exc}", exc_info=True)
+            capture_task_failure(
+                exc,
+                service=SERVICE_WORKER,
+                task_name="refresh_company",
+                stats={"company_id": company_id, "name": row.get("name"), "domain": row.get("domain")},
+            )
 
 
 async def refresh_watched_companies_task(ctx) -> dict:
-    """Weekly: re-enrich watched accounts older than 6 days."""
+    """Daily: re-enrich watched accounts older than WATCHED_STALE_DAYS."""
     with Session(_engine) as session:
-        rows = [dict(r) for r in session.execute(_SELECT_WATCHED_STALE).mappings().all()]
+        rows = [
+            dict(r)
+            for r in session.execute(
+                _SELECT_WATCHED_STALE,
+                {
+                    "stale_days": cfg.WATCHED_STALE_DAYS,
+                    "lim": cfg.WATCHED_REFRESH_LIMIT,
+                },
+            ).mappings().all()
+        ]
     if not rows:
         return {"refreshed": 0}
     sem = asyncio.Semaphore(5)
@@ -90,12 +107,18 @@ async def refresh_watched_companies_task(ctx) -> dict:
 
 
 async def refresh_stale_index_task(ctx) -> dict:
-    """Weekly: refresh stale index companies (90d cap)."""
-    cap = cfg.REFRESH_BATCH_CAP
+    """Daily: refresh index companies stale beyond REFRESH_STALE_DAYS."""
     with Session(_engine) as session:
-        rows = [dict(r) for r in session.execute(
-            _SELECT_STALE_INDEX, {"cap": cap},
-        ).mappings().all()]
+        rows = [
+            dict(r)
+            for r in session.execute(
+                _SELECT_STALE_INDEX,
+                {
+                    "stale_days": cfg.REFRESH_STALE_DAYS,
+                    "lim": cfg.REFRESH_BATCH_CAP,
+                },
+            ).mappings().all()
+        ]
     if not rows:
         return {"refreshed": 0}
     sem = asyncio.Semaphore(5)
@@ -192,6 +215,13 @@ async def poll_job_posts_task(ctx) -> dict:
         await asyncio.sleep(0.5)
 
     return {"polled": updated}
+
+
+async def refresh_headcounts_task(ctx) -> dict:
+    """Daily: re-fetch Apollo headcount estimates for rows with stale values."""
+    from scrape.headcount_backfill import refresh_stale_apollo_headcounts
+
+    return await refresh_stale_apollo_headcounts()
 
 
 _SELECT_RECONCILE = text("""

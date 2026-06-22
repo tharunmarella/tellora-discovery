@@ -15,7 +15,7 @@ _GENERIC_TOKENS = frozenset({
 })
 
 _FUNDING_KEYWORDS = re.compile(
-    r"\b(series\s*[a-e]|seed\s*round|raised\s+\$|funding\s+round|\$\d+[\d,.]*\s*[mbk]?)\b",
+    r"\b(series\s*[a-j]|seed\s*round|pre-seed|raised\s+\$|funding\s+round|\$\d+[\d,.]*\s*[mbk]?)\b",
     re.IGNORECASE,
 )
 
@@ -128,12 +128,24 @@ def apply_funding_grounding(
 ) -> tuple[list[str], int, Optional[str], Optional[str]]:
     """
     Drop or downrank funding claims not corroborated by structured sources.
+
+    Beyond "is there any funding evidence", the specific funding_stage must
+    actually appear in the corroborating text — otherwise an LLM-fabricated
+    stage (e.g. a "Series F" that no source mentions) is stripped.
     """
-    has_corroboration = bool(funding_news) or any(
-        e.get("event_type") == "funding_round" for e in extra_events
-    )
+    funding_event_titles = [
+        e.get("title", "") for e in extra_events if e.get("event_type") == "funding_round"
+    ]
+    corroboration_text = " ".join(list(funding_news) + funding_event_titles).lower()
+    has_corroboration = bool(corroboration_text.strip())
+
     if has_corroboration:
-        return buying_signals, signal_score, funding_stage, total_raised
+        stage = (funding_stage or "").strip().lower()
+        # Keep as-is when there is no specific stage to verify, or the stage is
+        # actually present in the corroborating sources.
+        if not stage or stage in corroboration_text:
+            return buying_signals, signal_score, funding_stage, total_raised
+        # Stage claimed but uncorroborated → fall through and strip funding.
 
     funding_signals = [s for s in buying_signals if _FUNDING_KEYWORDS.search(s)]
     non_funding_signals = [s for s in buying_signals if s not in funding_signals]

@@ -8,7 +8,7 @@ from typing import AsyncIterator
 
 from config_logging import setup_logging
 from infra.axiom_logger import axiom_logger
-from infra.sentry_init import init_sentry
+from infra.sentry_init import flush_sentry, init_sentry
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,7 @@ async def startup(
 async def shutdown(*, server_name: str) -> None:
     logger.info("[%s] shutting down", server_name)
     await axiom_logger.stop()
+    flush_sentry()
 
 
 @asynccontextmanager

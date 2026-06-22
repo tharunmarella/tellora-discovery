@@ -67,7 +67,6 @@ class DiscoveryCompany(SQLModel, table=True):
     description_embedding: Optional[List[float]] = Field(
         default=None, sa_column=Column(Vector(768), nullable=True)
     )
-    location: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
     employee_range: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
 
     # Which ICP profiles matched this company

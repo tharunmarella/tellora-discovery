@@ -17,7 +17,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 import settings as cfg
-from llm import get_gemini_client, retry_llm, strip_json_fences
+from llm import get_router, retry_llm, strip_json_fences
 from signals.constants import GREENHOUSE_API, HTTP_TIMEOUT, LEVER_API
 from signals.name_match import slug_variants
 
@@ -216,9 +216,13 @@ Respond ONLY with valid JSON:
 "concepts": ["..."], "tech": ["..."], "initiatives": ["..."]}}]}}"""
 
     def _do():
-        client = get_gemini_client()
-        resp = client.models.generate_content(model=cfg.SIGNAL_GEMINI_MODEL, contents=prompt)
-        data = json.loads(strip_json_fences(resp.text))
+        raw = get_router().complete_text(
+            prompt,
+            models=get_router().signal_models,
+            temperature=0.0,
+            json_mode=True,
+        )
+        data = json.loads(strip_json_fences(raw))
         return data.get("posts", [])
 
     try:

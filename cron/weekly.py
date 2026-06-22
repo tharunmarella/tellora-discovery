@@ -1,7 +1,7 @@
 """
 Weekly discovery cron — scrape Apollo, enrich inline, headcount backfill.
 
-Invoked by `python __main__.py` (Railway cron: 0 3 * * 0).
+Invoked by `python __main__.py` (Railway cron: 0 3 * * 0,3 — Sun + Wed).
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ logger = logging.getLogger("discovery.cron.weekly")
 class WeeklyCronArgs:
     dry_run: bool = False
     headcount_only: bool = False
+    force: bool = False
 
 
 def parse_args(argv: list[str] | None = None) -> WeeklyCronArgs:
@@ -33,7 +34,35 @@ def parse_args(argv: list[str] | None = None) -> WeeklyCronArgs:
             "--headcount-backfill-only" in args
             or os.getenv("HEADCOUNT_BACKFILL_ONLY", "").strip() == "1"
         ),
+        force="--force" in args or os.getenv("DISCOVERY_SCRAPE_FORCE", "").strip() == "1",
     )
+
+
+def ensure_scheduled_or_skip(args: WeeklyCronArgs) -> bool:
+    """
+    Return True to proceed. False when outside DISCOVERY_SCRAPE_CRON (logged).
+
+    Manual override: ``--force`` or ``DISCOVERY_SCRAPE_FORCE=1``.
+    """
+    if args.headcount_only:
+        return True
+
+    import settings as cfg
+    from cron.scrape_schedule import should_run_discovery_scrape
+
+    if should_run_discovery_scrape(
+        cron_expr=cfg.DISCOVERY_SCRAPE_CRON,
+        force=args.force,
+        schedule_disabled=cfg.DISCOVERY_SCRAPE_SCHEDULE_DISABLED,
+    ):
+        return True
+
+    logger.info(
+        "Skipping discovery scrape — outside schedule %s "
+        "(use --force or DISCOVERY_SCRAPE_FORCE=1)",
+        cfg.DISCOVERY_SCRAPE_CRON,
+    )
+    return False
 
 
 def validate_args(args: WeeklyCronArgs) -> None:

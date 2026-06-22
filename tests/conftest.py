@@ -52,7 +52,22 @@ def gemini_stub(monkeypatch):
         mock_client.models.generate_content.return_value = mock_resp
         monkeypatch.setattr("llm._gemini_client", None)
         monkeypatch.setattr("llm.get_gemini_client", lambda: mock_client)
-        monkeypatch.setattr("signals.pipeline.get_gemini_client", lambda: mock_client)
+
+        # LLM text paths route through the LiteLLM gateway — stub complete_text.
+        # complete_text so tests never hit the network.
+        mock_router = MagicMock()
+        mock_router.complete_text.return_value = text_body
+        mock_router.enrichment_models = ["gemini/test-enrichment"]
+        mock_router.signal_models = ["gemini/test-signal"]
+        mock_router.synthesis_models = ["gemini/test-signal"]
+        for target in (
+            "llm.get_router",
+            "signals.pipeline.get_router",
+            "scrape.domain_lookup.get_router",
+            "signals.job_posts.get_router",
+            "signals.sources.news.get_router",
+        ):
+            monkeypatch.setattr(target, lambda _r=mock_router: _r)
         return mock_client
 
     return _apply
