@@ -1,0 +1,22 @@
+meta {
+  name: SmartRecruiters Postings
+  type: http
+  seq: 4
+}
+
+get {
+  url: https://api.smartrecruiters.com/v1/companies/{{smartrecruiters_slug}}/postings
+  body: none
+  auth: none
+}
+
+settings {
+  followRedirects: true
+}
+
+docs {
+  content[] list; detail fetched per posting id at:
+  /v1/companies/{slug}/postings/{post_id}
+
+  Fields: name (title), location, jobAd.sections (HTML body).
+}

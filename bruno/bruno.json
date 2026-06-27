@@ -1,0 +1,6 @@
+{
+  "version": "1",
+  "name": "Tellora Discovery — Sources",
+  "type": "collection",
+  "ignore": ["node_modules", ".git"]
+}

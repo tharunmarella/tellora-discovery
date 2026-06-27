@@ -76,23 +76,30 @@ def should_run_discovery_scrape(
     return True
 
 
-def discovery_scrape_recently_active(within_hours: int = 20) -> bool:
+def discovery_scrape_recently_active(
+    within_hours: int = 20,
+    *,
+    active_hours: int | None = None,
+) -> bool:
     """
     True when a scrape run is in progress or finished within ``within_hours``.
 
     Used by the worker fallback cron so it does not duplicate a Railway run.
     """
+    import settings as cfg
     from sqlmodel import select
 
     from database import get_session
     from models import DiscoveryProgress
 
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=within_hours)
+    active_h = active_hours if active_hours is not None else cfg.SCRAPE_ACTIVE_HOURS
+    cutoff_active = datetime.now(timezone.utc) - timedelta(hours=active_h)
+    cutoff_completed = datetime.now(timezone.utc) - timedelta(hours=within_hours)
     with get_session() as db:
         running = db.exec(
             select(DiscoveryProgress)
             .where(DiscoveryProgress.status == "running")
-            .where(DiscoveryProgress.started_at >= cutoff)
+            .where(DiscoveryProgress.started_at >= cutoff_active)
             .limit(1)
         ).first()
         if running:
@@ -101,7 +108,7 @@ def discovery_scrape_recently_active(within_hours: int = 20) -> bool:
         completed = db.exec(
             select(DiscoveryProgress)
             .where(DiscoveryProgress.status == "completed")
-            .where(DiscoveryProgress.completed_at >= cutoff)
+            .where(DiscoveryProgress.completed_at >= cutoff_completed)
             .limit(1)
         ).first()
         return completed is not None

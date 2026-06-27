@@ -1,4 +1,5 @@
 .env
+bruno/environments/Local.bru
 .venv/
 venv/
 __pycache__/

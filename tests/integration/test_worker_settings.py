@@ -39,11 +39,16 @@ def test_retry_and_concurrency_bounds():
 def test_monitoring_crons_registered():
     cron_funcs = {c.coroutine.__name__ for c in WorkerSettings.cron_jobs}
     assert "reconcile_pending_task" in cron_funcs
-    assert "poll_edgar_form_d_task" in cron_funcs
-    assert "refresh_watched_companies_task" in cron_funcs
-    assert "refresh_stale_index_task" in cron_funcs
-    assert "refresh_headcounts_task" in cron_funcs
     assert "run_discovery_scrape_task" in cron_funcs
+    assert "daily_discovery_maintenance_task" in cron_funcs
+    assert "log_scheduler_health_task" in cron_funcs
+    assert "enqueue_scrape_pending_task" in cron_funcs
+    assert "import_jobhive_slugs_task" in cron_funcs
+
+
+def test_max_jobs_uses_setting():
+    import settings as cfg
+    assert WorkerSettings.max_jobs == cfg.SIGNAL_ENRICH_MAX_JOBS
 
 
 def test_scrape_fallback_cron_calculates_next_run():

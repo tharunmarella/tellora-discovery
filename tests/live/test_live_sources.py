@@ -9,9 +9,7 @@ Gating:
     job boards, tech-stack, DNS, Jina unauth) run with NO keys — they execute
     immediately under `-m live`.
   * Keyed sources skip cleanly until the relevant key is exported:
-        SERPER_API_KEY          → Serper KG + exec-hire news
-        GOOGLE_API_KEY          → Gemini synthesis + embeddings
-        JINA_API_KEY            → funding-news search (Jina)
+        SERPER_API_KEY          → Serper KG + exec-hire + funding news
         GITHUB_TOKEN            → GitHub org technographics (higher rate limit)
         TELLORA_APOLLO_API_KEY  → Apollo headcount
 
@@ -120,7 +118,7 @@ async def test_live_usaspending_awards():
 
 async def test_live_job_boards():
     """Greenhouse/Lever job-board probe returns the documented dict shape."""
-    from signals.pipeline import check_job_boards
+    from signals.job_posts import check_job_boards
 
     result = await check_job_boards("Stripe", "stripe.com")
     assert isinstance(result, dict)
@@ -176,12 +174,11 @@ async def test_live_serper_exec_hire_news():
         assert news[0]["title"]
 
 
-# ── Jina search (needs JINA_API_KEY) ─────────────────────────────────────────
+# ── Funding news (Serper or Google News RSS) ─────────────────────────────────
 
 
-@pytest.mark.skipif(not HAS_JINA, reason="JINA_API_KEY required")
-async def test_live_jina_funding_news():
-    from signals.pipeline import fetch_funding_news
+async def test_live_funding_news():
+    from signals.sources.funding_news import fetch_funding_news
 
     snippets = await fetch_funding_news("Stripe")
     assert isinstance(snippets, list)

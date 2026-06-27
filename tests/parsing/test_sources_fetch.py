@@ -131,6 +131,79 @@ async def test_fetch_job_board_posts_greenhouse():
             ]
         })
     )
-    posts, source = await fetch_job_board_posts("Acme", domain="acme.com")
+    posts, source, ats_board = await fetch_job_board_posts("Acme", domain="acme.com")
     assert source == "greenhouse"
     assert posts[0]["title"] == "Engineer"
+    assert ats_board is not None
+    assert ats_board["slug"] == "acme"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_fetch_job_board_posts_workable_details_true():
+    respx.get(url__regex=r"https://apply\.workable\.com/api/v1/widget/accounts/acme.*").mock(
+        return_value=httpx.Response(200, json={
+            "name": "Acme Inc",
+            "jobs": [
+                {
+                    "shortcode": "ABC123",
+                    "title": "Designer",
+                    "description": "<p>Design things</p>",
+                    "location": {"location_str": "NYC"},
+                }
+            ],
+        })
+    )
+    posts, source, _ = await fetch_job_board_posts(
+        "Acme",
+        careers_html="https://apply.workable.com/acme",
+    )
+    assert source == "workable"
+    assert posts[0]["title"] == "Designer"
+    assert "Design" in posts[0]["body_text"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_fetch_job_board_posts_uses_jobhive_pre_enrich(monkeypatch):
+    from pathlib import Path
+
+    from signals import jobhive_import as jhi
+    from signals.jobhive_import import parse_jobhive_csv
+
+    fixtures = Path(__file__).resolve().parent.parent / "fixtures"
+    index = parse_jobhive_csv("greenhouse", (fixtures / "jobhive_sample.csv").read_text())
+    monkeypatch.setattr(jhi, "get_jobhive_index", lambda **_: index)
+
+    respx.get(url__regex=r"https://boards-api\.greenhouse\.io/v1/boards/stripe/.*").mock(
+        return_value=httpx.Response(200, json={
+            "jobs": [{"id": 1, "title": "Engineer", "location": {"name": "SF"}, "content": ""}],
+        })
+    )
+    posts, source, ats_board = await fetch_job_board_posts(
+        "Stripe Inc",
+        domain="stripe.com",
+    )
+    assert source == "greenhouse"
+    assert len(posts) == 1
+    assert ats_board is not None
+    assert ats_board["slug"] == "stripe"
+    assert ats_board["source"] == "greenhouse"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_fetch_job_board_posts_uses_cached_ats_board():
+    respx.get(url__regex=r"https://boards-api\.greenhouse\.io/v1/boards/stripe/.*").mock(
+        return_value=httpx.Response(200, json={
+            "jobs": [{"id": 1, "title": "PM", "location": {"name": "SF"}, "content": ""}],
+        })
+    )
+    posts, source, ats_board = await fetch_job_board_posts(
+        "Stripe",
+        domain="stripe.com",
+        ats_board={"source": "greenhouse", "slug": "stripe"},
+    )
+    assert source == "greenhouse"
+    assert len(posts) == 1
+    assert ats_board["slug"] == "stripe"

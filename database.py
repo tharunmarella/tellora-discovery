@@ -33,6 +33,7 @@ ALTER TABLE discovery_company_snapshot ADD COLUMN IF NOT EXISTS recent_launches 
 ALTER TABLE discovery_company ADD COLUMN IF NOT EXISTS source VARCHAR NOT NULL DEFAULT 'apollo';
 ALTER TABLE discovery_company ADD COLUMN IF NOT EXISTS signal_attempt_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE discovery_company ADD COLUMN IF NOT EXISTS signal_last_attempt_at TIMESTAMPTZ;
+ALTER TABLE discovery_company ADD COLUMN IF NOT EXISTS ats_board JSONB;
 ALTER TABLE discovery_company DROP COLUMN IF EXISTS location;
 """
 

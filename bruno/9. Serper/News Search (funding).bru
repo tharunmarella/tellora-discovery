@@ -1,0 +1,32 @@
+meta {
+  name: News Search (funding)
+  type: http
+  seq: 3
+}
+
+post {
+  url: https://google.serper.dev/news
+  body: json
+  auth: none
+}
+
+headers {
+  X-API-KEY: {{serper_api_key}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "q": "\"{{company_name}}\" funding OR raised OR \"Series\" OR investment OR \"seed round\"",
+    "num": 8,
+    "tbs": "qdr:m6"
+  }
+}
+
+docs {
+  Primary path for fetch_funding_news() in signals/sources/funding_news.py.
+  news[] → title, snippet, link
+
+  Hits are filtered with title_mentions_company() before Gemini synthesis.
+  Falls back to Google News RSS when SERPER_API_KEY is unset.
+}

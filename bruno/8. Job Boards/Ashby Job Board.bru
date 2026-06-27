@@ -1,0 +1,19 @@
+meta {
+  name: Ashby Job Board
+  type: http
+  seq: 3
+}
+
+get {
+  url: https://api.ashbyhq.com/posting-api/job-board/{{ashby_slug}}
+  body: none
+  auth: none
+}
+
+settings {
+  followRedirects: true
+}
+
+docs {
+  jobs[] with title, location, descriptionHtml → body_text.
+}

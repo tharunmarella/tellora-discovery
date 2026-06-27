@@ -1,0 +1,29 @@
+meta {
+  name: Greenhouse Jobs
+  type: http
+  seq: 1
+}
+
+get {
+  url: https://boards-api.greenhouse.io/v1/boards/{{greenhouse_slug}}/jobs
+  body: none
+  auth: none
+}
+
+params:query {
+  content: true
+}
+
+settings {
+  followRedirects: true
+}
+
+docs {
+  jobs[] → posts:
+  - id / internal_job_id → external_id
+  - title
+  - location.name → location
+  - content (HTML) → body_text (stripped)
+
+  Tried first via slug_variants(company_name, domain).
+}

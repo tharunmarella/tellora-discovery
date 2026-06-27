@@ -1,5 +1,5 @@
 """
-Weekly discovery cron — scrape Apollo, enrich inline, headcount backfill.
+Weekly discovery cron — scrape Apollo, enrich (inline or enqueue), headcount backfill.
 
 Invoked by `python __main__.py` (Railway cron: 0 3 * * 0,3 — Sun + Wed).
 """
@@ -114,6 +114,7 @@ async def run_headcount_backfill(*, run_all: bool) -> None:
 
 async def scrape_and_enrich(*, dry_run: bool) -> None:
     """Run the Apollo scrape, then enrich the newly-pending companies inline."""
+    import settings as cfg
     from scrape.service import run_discovery_scrape
 
     start = time.perf_counter()
@@ -134,15 +135,24 @@ async def scrape_and_enrich(*, dry_run: bool) -> None:
 
         if total > 0:
             enrich_start = time.perf_counter()
-            logger.info("Enriching newly scraped companies inline...")
-            from signals.runner import run as run_enrichment
+            enrich_stats: dict = {}
+            if cfg.DISCOVERY_INLINE_ENRICH:
+                logger.info("Enriching newly scraped companies inline...")
+                from signals.runner import run as run_enrichment
 
-            await run_enrichment(limit=None, concurrency=5, batch_size=50, reset_failed=False)
+                await run_enrichment(limit=None, concurrency=5, batch_size=50, reset_failed=False)
+                task_name = "discovery_enrich_inline"
+            else:
+                logger.info("Enqueueing newly scraped companies for async enrichment...")
+                from signals.enqueue import enqueue_pending_enrichment
+
+                enrich_stats = await enqueue_pending_enrichment(limit=None)
+                task_name = "discovery_enrich_enqueue"
             await axiom_logger.log_task_run(
-                task_name="discovery_enrich_inline",
+                task_name=task_name,
                 success=True,
                 duration_ms=(time.perf_counter() - enrich_start) * 1000,
-                stats={"scraped_total": total},
+                stats={"scraped_total": total, **enrich_stats},
             )
 
         await run_headcount_backfill(run_all=False)

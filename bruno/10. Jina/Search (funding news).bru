@@ -1,0 +1,26 @@
+meta {
+  name: Search (funding news) [deprecated]
+  type: http
+  seq: 2
+}
+
+get {
+  url: https://s.jina.ai/{{company_name}}%20funding%20raised%20investment%20round
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{jina_api_key}}
+}
+
+headers {
+  Accept: application/json
+}
+
+docs {
+  DEPRECATED — funding news now uses Serper News + Google News RSS fallback.
+  See bruno/9. Serper/News Search (funding).bru
+
+  Legacy Jina Search reference only.
+}

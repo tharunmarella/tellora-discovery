@@ -304,7 +304,7 @@ async def source6():
     from signals.job_posts import fetch_job_board_posts
 
     for name in ["Ramp", "Deel"]:
-        posts, source = await fetch_job_board_posts(name)
+        posts, source, _ = await fetch_job_board_posts(name)
         print(f"  {name:<12} source={source:<16} posts={len(posts)}")
         if posts:
             p = posts[0]

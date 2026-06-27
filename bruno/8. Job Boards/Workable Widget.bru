@@ -1,0 +1,20 @@
+meta {
+  name: Workable Widget
+  type: http
+  seq: 5
+}
+
+get {
+  url: https://apply.workable.com/api/v1/widget/accounts/{{workable_slug}}
+  body: none
+  auth: none
+}
+
+settings {
+  followRedirects: true
+}
+
+docs {
+  jobs[] with title, shortcode, location.
+  Detail: GET /api/v1/jobs/{shortcode} for full description.
+}

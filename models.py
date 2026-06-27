@@ -110,6 +110,11 @@ class DiscoveryCompany(SQLModel, table=True):
     signal_last_attempt_at: Optional[datetime] = Field(
         default=None, sa_column=Column(TIMESTAMP(timezone=True), nullable=True)
     )
+    ats_board: Optional[Dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+        description="Cached ATS match: {source, slug, verified_at}",
+    )
     search_tsv: Optional[Any] = Field(default=None, sa_column=Column(TSVECTOR, nullable=True))
 
     raw_meta: Optional[Dict[str, Any]] = Field(

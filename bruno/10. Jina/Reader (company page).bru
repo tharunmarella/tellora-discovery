@@ -1,0 +1,26 @@
+meta {
+  name: Reader (company page)
+  type: http
+  seq: 1
+}
+
+get {
+  url: https://r.jina.ai/https://{{company_domain}}/pricing
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{jina_api_key}}
+}
+
+headers {
+  Accept: text/plain
+}
+
+docs {
+  Returns markdown/plain text of the page (pricing, /about, /careers, etc.).
+  Used for tech_stack regex, pricing_change fingerprints, company context.
+
+  Also used via _jina_read() with max_chars cap in pipeline.
+}

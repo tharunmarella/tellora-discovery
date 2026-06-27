@@ -1,0 +1,31 @@
+meta {
+  name: News Search (exec hires)
+  type: http
+  seq: 2
+}
+
+post {
+  url: https://google.serper.dev/news
+  body: json
+  auth: none
+}
+
+headers {
+  X-API-KEY: {{serper_api_key}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "q": "\"{{company_name}}\" hires OR appoints OR \"joins as\" VP OR Chief OR Head",
+    "num": 4,
+    "tbs": "qdr:m3"
+  }
+}
+
+docs {
+  news[] → exec hire candidates:
+  - title, link → url, date
+
+  Fed into exec_hire signal path (fetch_exec_hire_news).
+}

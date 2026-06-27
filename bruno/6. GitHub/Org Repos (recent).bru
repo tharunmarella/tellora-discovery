@@ -1,0 +1,29 @@
+meta {
+  name: Org Repos (recent)
+  type: http
+  seq: 2
+}
+
+get {
+  url: https://api.github.com/orgs/{{github_org}}/repos
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/vnd.github+json
+  ~Authorization: Bearer {{github_token}}
+}
+
+params:query {
+  sort: pushed
+  per_page: 30
+}
+
+docs {
+  repos[] fields:
+  - name, language, stargazers_count, created_at, pushed_at
+
+  new_repos: created_at within last 30 days → product_launch extra_event
+  languages aggregated → tech_stack
+}

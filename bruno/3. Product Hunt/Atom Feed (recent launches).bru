@@ -1,0 +1,28 @@
+meta {
+  name: Atom Feed (recent launches)
+  type: http
+  seq: 1
+}
+
+get {
+  url: https://www.producthunt.com/feed
+  body: none
+  auth: none
+}
+
+settings {
+  followRedirects: true
+}
+
+docs {
+  Atom XML → launches[] (max 30):
+  - entry/title → title
+  - entry/link@href → url
+  - entry/updated → date (YYYY-MM-DD)
+  - slug from posts/{slug} path
+
+  Normalized launch object:
+  { title, slug, url, date }
+
+  No upvote count in this feed. Auto-create capped at PH_AUTO_CREATE_CAP (10/day).
+}

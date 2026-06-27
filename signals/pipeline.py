@@ -3,8 +3,8 @@ Company Signal Enrichment Pipeline.
 
 Gathers buying signals for a single discovery_company record:
   1. Jina Reader  — homepage + /about + /careers (clean text)
-  2. Job boards   — Greenhouse then Lever (public, free)
-  3. Funding news — Jina Search for recent rounds
+  2. Job boards   — Greenhouse, Lever, Ashby, SmartRecruiters, Workable (public APIs)
+  3. Funding news — Serper News (or Google News RSS fallback)
   4. Tech stack   — regex on homepage HTML/headers (no API needed)
   5. Gemini synthesis — company-only prompt using gemini-3.1-flash-lite
 
@@ -30,17 +30,14 @@ from llm import embed_text, get_router, retry_llm, signal_model_chain, strip_jso
 from signals.cache import TTLLRUCache
 from signals.constants import (
     CONTEXT_FALLBACK_MAX,
-    GREENHOUSE_API,
     HTTP_TIMEOUT,
     JINA_READER,
-    JINA_SEARCH,
-    LEVER_API,
 )
+from signals.sources.funding_news import fetch_funding_news
+from signals.http_fetch import fetch_html
 from signals.name_match import (
     apply_funding_grounding,
     filter_events_by_relevance,
-    slug_variants,
-    title_mentions_company,
 )
 
 logger = logging.getLogger("discovery.signal")
@@ -240,7 +237,7 @@ async def detect_tech_stack(domain: str) -> list[str]:
     """
     Fetch homepage HTML + headers, regex-match known tech.
     Returns list of detected technology keys e.g. ["hubspot", "stripe"].
-    Zero cost — pure HTTP + regex.
+    Zero cost — pure HTTP + regex; optional httpcloak fallback on WAF block.
     """
     if not domain:
         return []
@@ -249,11 +246,16 @@ async def detect_tech_stack(domain: str) -> list[str]:
         async with httpx.AsyncClient(
             timeout=8.0,
             follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; TelloraSalesBot/1.0)"},
         ) as client:
-            resp = await client.get(url)
-            search_text = resp.text + " " + " ".join(
-                f"{k}: {v}" for k, v in resp.headers.items()
+            result = await fetch_html(client, url, timeout=8.0)
+            if result.status_code != 200 or not result.text:
+                logger.warning(
+                    "Tech stack fetch failed for %s (status=%s via=%s)",
+                    domain, result.status_code, result.via,
+                )
+                return []
+            search_text = result.text + " " + " ".join(
+                f"{k}: {v}" for k, v in result.headers.items()
             )
     except Exception as exc:
         logger.warning(f"Tech stack fetch failed for {domain}: {exc}")
@@ -538,84 +540,6 @@ async def fetch_exec_hire_news(company_name: str) -> list[dict]:
     except Exception as exc:
         logger.warning(f"Exec hire news failed for '{company_name}': {exc}")
         return []
-
-
-async def fetch_funding_news(company_name: str) -> list[str]:
-    """
-    Jina Search for recent funding news. Returns up to 4 snippets.
-    Requires JINA_API_KEY.
-    """
-    if not company_name or not cfg.JINA_API_KEY:
-        return []
-    query = f"{company_name} funding raised investment round"
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {cfg.JINA_API_KEY}",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=25.0) as client:
-            resp = await client.get(f"{JINA_SEARCH}{query}", headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            snippets = []
-            # Pull a wider pool, then keep only results whose title actually names
-            # this company. Whole-word matching prevents same-name collisions
-            # (e.g. "Guardrail Technologies" must not absorb "Guardrails AI" news).
-            for hit in data.get("data", [])[:8]:
-                title = hit.get("title", "").strip()
-                desc  = hit.get("description", "").strip()[:300]
-                url   = hit.get("url", "")
-                if not (title and desc):
-                    continue
-                if not title_mentions_company(title, company_name):
-                    logger.debug(f"Dropping off-company funding hit for '{company_name}': {title!r}")
-                    continue
-                snippets.append(f"{title} — {desc} ({url})")
-                if len(snippets) >= 4:
-                    break
-            return snippets
-    except Exception as exc:
-        logger.warning(f"Funding news search failed for '{company_name}': {exc}")
-        return []
-
-
-# ── Job board helpers ──────────────────────────────────────────────────────
-
-def _slug_variants(company_name: str, domain: Optional[str] = None) -> list[str]:
-    """Backward-compatible wrapper — prefer domain-stem slugs when available."""
-    return slug_variants(company_name, domain)
-
-
-async def check_job_boards(company_name: str, domain: Optional[str] = None) -> dict:
-    """
-    Check Greenhouse then Lever for open positions.
-    Returns {count, roles, source}.
-    """
-    variants = _slug_variants(company_name, domain)
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-        for slug in variants:
-            try:
-                resp = await client.get(GREENHOUSE_API.format(slug=slug))
-                if resp.status_code == 200:
-                    jobs = resp.json().get("jobs", [])
-                    if jobs:
-                        roles = [j.get("title", "") for j in jobs[:10]]
-                        return {"count": len(jobs), "roles": roles, "source": "greenhouse"}
-            except Exception:
-                pass
-
-        for slug in variants:
-            try:
-                resp = await client.get(LEVER_API.format(slug=slug))
-                if resp.status_code == 200:
-                    jobs = resp.json()
-                    if isinstance(jobs, list) and jobs:
-                        roles = [j.get("text", "") for j in jobs[:10]]
-                        return {"count": len(jobs), "roles": roles, "source": "lever"}
-            except Exception:
-                pass
-
-    return {"count": 0, "roles": [], "source": "none"}
 
 
 # ── Gemini synthesis ───────────────────────────────────────────────────────
@@ -1151,6 +1075,7 @@ async def _enrich_company_signals_impl(
     raw_meta: Optional[dict],
     existing_headcount: Optional[int] = None,
     existing_headquarters: Optional[str] = None,
+    existing_ats_board: Optional[dict] = None,
 ) -> dict:
     """
     Full signal enrichment for one company. Returns a dict ready to write
@@ -1167,7 +1092,6 @@ async def _enrich_company_signals_impl(
     cold_start = not _company_has_snapshot(company_id)
 
     ctx_task = asyncio.create_task(fetch_company_context(domain))
-    jobs_task = asyncio.create_task(fetch_job_board_posts(company_name, domain=domain or None))
     news_task = asyncio.create_task(fetch_funding_news(company_name))
     tech_task = asyncio.create_task(detect_tech_stack(domain))
     kg_task = asyncio.create_task(fetch_serper_kg(company_name))
@@ -1183,7 +1107,7 @@ async def _enrich_company_signals_impl(
 
     need_apollo_hc = not (existing_headcount and existing_headcount > 0)
     gather_tasks = [
-        ctx_task, jobs_task, news_task, tech_task, kg_task,
+        ctx_task, news_task, tech_task, kg_task,
         dns_task, gh_task, rss_task, hn_task, gov_task,
     ]
     if wayback_task is not None:
@@ -1195,27 +1119,35 @@ async def _enrich_company_signals_impl(
     gathered = await asyncio.gather(*gather_tasks)
 
     ctx = gathered[0]
-    job_posts_result = gathered[1]
-    funding_news = gathered[2]
-    tech_stack = gathered[3]
-    serper_kg = gathered[4]
-    dns_tech = gathered[5]
-    github = gathered[6]
-    rss_news = gathered[7]
-    hn_data = gathered[8]
-    gov_awards = gathered[9]
-    idx = 10
+    funding_news = gathered[1]
+    tech_stack = gathered[2]
+    serper_kg = gathered[3]
+    dns_tech = gathered[4]
+    github = gathered[5]
+    rss_news = gathered[6]
+    hn_data = gathered[7]
+    gov_awards = gathered[8]
+    idx = 9
     baseline_pricing_fp = ""
     if wayback_task is not None:
         baseline_pricing_fp = gathered[idx]
         idx += 1
     apollo_hc = gathered[idx] if need_apollo_hc else {}
 
+    careers_html = "\n".join(
+        part for part in (ctx.get("careers", ""), ctx.get("homepage", "")) if part
+    )
+    job_posts, job_source, resolved_ats_board = await fetch_job_board_posts(
+        company_name,
+        domain=domain or None,
+        ats_board=existing_ats_board,
+        careers_html=careers_html,
+    )
+
     tech_stack = list(dict.fromkeys(
         list(tech_stack) + list(dns_tech) + list(github.get("languages") or [])
     ))
 
-    job_posts, job_source = job_posts_result if isinstance(job_posts_result, tuple) else ([], "none")
     job_board = {
         "count": len(job_posts),
         "roles": [p.get("title", "") for p in job_posts[:10]],
@@ -1391,6 +1323,7 @@ async def _enrich_company_signals_impl(
         "signal_enrichment_status": enrichment_status,
         "job_posts": job_posts,
         "job_source": job_source,
+        "ats_board": resolved_ats_board,
         "concepts": concepts,
         "pricing_model": result.pricing_model,
         "recent_launches": result.recent_launches,
@@ -1416,6 +1349,7 @@ async def enrich_company_signals(
     raw_meta: Optional[dict],
     existing_headcount: Optional[int] = None,
     existing_headquarters: Optional[str] = None,
+    existing_ats_board: Optional[dict] = None,
 ) -> dict:
     """Public entry point with a per-company timeout budget."""
     timeout = float(cfg.SIGNAL_ENRICH_TIMEOUT_S)
@@ -1430,6 +1364,7 @@ async def enrich_company_signals(
                 raw_meta=raw_meta,
                 existing_headcount=existing_headcount,
                 existing_headquarters=existing_headquarters,
+                existing_ats_board=existing_ats_board,
             ),
             timeout=timeout,
         )

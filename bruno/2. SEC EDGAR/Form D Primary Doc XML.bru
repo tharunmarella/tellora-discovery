@@ -1,0 +1,26 @@
+meta {
+  name: Form D Primary Doc XML
+  type: http
+  seq: 2
+}
+
+get {
+  url: https://www.sec.gov/Archives/edgar/data/{{edgar_cik}}/{{edgar_accession_nodash}}/{{edgar_doc}}
+  body: none
+  auth: none
+}
+
+headers {
+  User-Agent: {{edgar_user_agent}}
+}
+
+docs {
+  XML parsed by parse_form_d_xml() into:
+  - industryGroupType → industry_group, is_tech (TECH_INDUSTRY_GROUPS)
+  - totalOfferingAmount, totalAmountSold
+  - revenueRange, dateOfFirstSale, stateOrCountryDescription
+  - related persons: firstName, lastName, relationship
+
+  Replace edgar_cik / edgar_accession_nodash / edgar_doc from a search-index hit.
+  Example path: /Archives/edgar/data/{cik}/{accession_no without dashes}/{doc}
+}

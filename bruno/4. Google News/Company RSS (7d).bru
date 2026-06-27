@@ -1,0 +1,32 @@
+meta {
+  name: Company RSS (7d)
+  type: http
+  seq: 1
+}
+
+get {
+  url: https://news.google.com/rss/search
+  body: none
+  auth: none
+}
+
+params:query {
+  q: "{{company_name}}" when:7d -stock -shares
+  hl: en-US
+  gl: US
+  ceid: US:en
+}
+
+settings {
+  followRedirects: true
+}
+
+docs {
+  RSS item → headlines[]:
+  - item/title
+  - item/link → url
+  - item/pubDate → date
+  - item/source → source (publisher)
+
+  Then Gemini classifies → news_mention | funding_round | exec_hire | ...
+}

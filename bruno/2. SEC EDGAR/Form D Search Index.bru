@@ -1,0 +1,32 @@
+meta {
+  name: Form D Search Index
+  type: http
+  seq: 1
+}
+
+get {
+  url: https://efts.sec.gov/LATEST/search-index
+  body: none
+  auth: none
+}
+
+headers {
+  User-Agent: {{edgar_user_agent}}
+}
+
+params:query {
+  q:
+  forms: D
+  startdt: {{edgar_start_date}}
+  enddt: {{edgar_end_date}}
+}
+
+docs {
+  Parsed into filings[] (fetch_recent_form_d):
+  - hits.hits[]._source.display_names[0] → company name (+ CIK in parens)
+  - hits.hits[]._source.file_date → filed_at
+  - hits.hits[]._id → "{accession}:{doc}" e.g. primary_doc.xml
+  - hits.hits[]._source.ciks (optional)
+
+  Update edgar_start_date / edgar_end_date in Local env (default window: 2 days).
+}

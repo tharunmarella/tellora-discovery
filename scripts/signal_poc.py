@@ -8,7 +8,7 @@ in-memory and printed to stdout.
 
 Live data sources used (same keys as production):
   - Greenhouse public API (job posts WITH bodies, content=true)
-  - Jina Search           (funding news)
+  - Serper News            (funding news; RSS fallback)
   - Serper                (social posts, exec-hire news)
   - Apollo free search    (people + titles for job-change detection)
   - Gemini flash-lite     (JD extraction, relevance filtering)
@@ -38,7 +38,8 @@ import httpx
 
 import settings as cfg
 from llm import embed_text, get_gemini_client, retry_llm, strip_json_fences
-from signals.pipeline import check_job_boards, fetch_funding_news
+from signals.job_posts import check_job_boards
+from signals.pipeline import fetch_funding_news
 
 NOW = datetime.now(timezone.utc)
 
@@ -191,7 +192,7 @@ async def phase1() -> None:
     header(1, "Snapshot diff → typed signal events")
     print(f"Company: {DEMO_COMPANY} ({DEMO_DOMAIN})")
 
-    sub("LIVE: current state (Greenhouse/Lever + Jina funding news, right now)")
+    sub("LIVE: current state (Greenhouse/Lever + funding news, right now)")
     jobs, news = await asyncio.gather(
         check_job_boards(DEMO_COMPANY), fetch_funding_news(DEMO_COMPANY),
     )

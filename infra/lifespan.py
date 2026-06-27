@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 SERVICE_CRON = "tellora-discovery"
 SERVICE_WORKER = "tellora-discovery-worker"
+SERVICE_ADMIN = "tellora-discovery-admin"
 
 
 def bootstrap(*, server_name: str) -> None:

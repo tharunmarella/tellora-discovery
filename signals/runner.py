@@ -56,7 +56,7 @@ logger = logging.getLogger("signal_runner")
 # ── SQL statements ──────────────────────────────────────────────────────────
 
 _SELECT_PENDING = text("""
-    SELECT id, name, domain, description, industry, raw_meta, headcount, headquarters
+    SELECT id, name, domain, description, industry, raw_meta, headcount, headquarters, ats_board
     FROM   discovery_company
     WHERE  signal_enrichment_status = 'pending'
     AND    domain IS NOT NULL
@@ -119,6 +119,7 @@ _UPDATE_SIGNAL = text("""
         hq_city                  = :hq_city,
         hq_region                = :hq_region,
         hq_country               = :hq_country,
+        ats_board                = CAST(:ats_board AS jsonb),
         signal_enriched_at       = :signal_enriched_at,
         signal_enrichment_status = :signal_enrichment_status,
         updated_at               = NOW()
@@ -180,6 +181,7 @@ def persist_result(session: Session, company_id: str, result: dict) -> bool:
             "hq_city":                  result.get("hq_city"),
             "hq_region":                result.get("hq_region"),
             "hq_country":               result.get("hq_country"),
+            "ats_board":                _json.dumps(result.get("ats_board")) if result.get("ats_board") else None,
             "signal_enriched_at":       result.get("signal_enriched_at") or datetime.now(timezone.utc),
             "signal_enrichment_status": result.get("signal_enrichment_status", "enriched"),
         })
@@ -234,6 +236,7 @@ async def _process_company(row: dict, sem: asyncio.Semaphore) -> dict:
                 raw_meta=row.get("raw_meta"),
                 existing_headcount=row.get("headcount"),
                 existing_headquarters=row.get("headquarters"),
+                existing_ats_board=row.get("ats_board"),
             )
         except Exception as exc:
             logger.error(f"[{company_name}] Unhandled error: {exc}", exc_info=True)

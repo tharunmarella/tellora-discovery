@@ -1,0 +1,34 @@
+meta {
+  name: Web Search (domain lookup)
+  type: http
+  seq: 1
+}
+
+post {
+  url: https://google.serper.dev/search
+  body: json
+  auth: none
+}
+
+headers {
+  X-API-KEY: {{serper_api_key}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "q": "{{company_name}} CEO",
+    "gl": "us",
+    "hl": "en",
+    "num": 10
+  }
+}
+
+docs {
+  Used by lookup_domain() + fetch_serper_kg():
+  - knowledgeGraph.description, .attributes (Founded, Headquarters, CEO, Number of employees)
+  - organic[].title, .link, .snippet (LinkedIn company URL extraction)
+  - answerBox (optional)
+
+  Gemini reads this + builds discovery_company fields.
+}

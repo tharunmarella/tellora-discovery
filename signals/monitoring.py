@@ -38,19 +38,56 @@ _SELECT_WATCHED_STALE = text("""
 
 _SELECT_STALE_INDEX = text("""
     SELECT id, name, domain, description, industry, raw_meta, headcount, headquarters
-    FROM discovery_company
+    FROM discovery_company dc
     WHERE domain IS NOT NULL
       AND domain_resolved = true
       AND (
           signal_enriched_at IS NULL
           OR signal_enriched_at < NOW() - make_interval(days => :stale_days)
       )
+      AND NOT EXISTS (
+          SELECT 1 FROM org_research_company orc WHERE orc.company_id = dc.id
+      )
+      AND NOT (
+          (source_profiles IS NOT NULL AND cardinality(source_profiles) > 0)
+          OR last_seen_at > NOW() - INTERVAL '90 days'
+      )
     ORDER BY signal_enriched_at NULLS FIRST
     LIMIT :lim
 """)
 
+_SELECT_ICP_HOT_STALE = text("""
+    SELECT id, name, domain, description, industry, raw_meta, headcount, headquarters
+    FROM discovery_company dc
+    WHERE domain IS NOT NULL
+      AND domain_resolved = true
+      AND (
+          signal_enriched_at IS NULL
+          OR signal_enriched_at < NOW() - make_interval(days => :stale_days)
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM org_research_company orc WHERE orc.company_id = dc.id
+      )
+      AND (
+          (source_profiles IS NOT NULL AND cardinality(source_profiles) > 0)
+          OR last_seen_at > NOW() - INTERVAL '90 days'
+      )
+    ORDER BY last_seen_at DESC NULLS LAST
+    LIMIT :lim
+""")
+
+_SELECT_ATS_CACHED = text("""
+    SELECT id, name, domain, ats_board
+    FROM discovery_company
+    WHERE domain IS NOT NULL
+      AND domain_resolved = true
+      AND ats_board IS NOT NULL
+    ORDER BY signal_enriched_at DESC NULLS LAST
+    LIMIT :lim
+""")
+
 _SELECT_WATCHED_FOR_JOBS = text("""
-    SELECT DISTINCT dc.id, dc.name
+    SELECT DISTINCT dc.id, dc.name, dc.domain, dc.ats_board
     FROM discovery_company dc
     JOIN org_research_company orc ON orc.company_id = dc.id
     WHERE dc.domain IS NOT NULL
@@ -85,6 +122,15 @@ async def _refresh_company(row: dict, sem: asyncio.Semaphore) -> None:
             )
 
 
+async def _refresh_rows(rows: list[dict], *, label: str) -> dict:
+    if not rows:
+        return {"refreshed": 0}
+    sem = asyncio.Semaphore(5)
+    await asyncio.gather(*[_refresh_company(r, sem) for r in rows])
+    logger.info("Refreshed %d %s companies", len(rows), label)
+    return {"refreshed": len(rows)}
+
+
 async def refresh_watched_companies_task(ctx) -> dict:
     """Daily: re-enrich watched accounts older than WATCHED_STALE_DAYS."""
     with Session(_engine) as session:
@@ -98,16 +144,35 @@ async def refresh_watched_companies_task(ctx) -> dict:
                 },
             ).mappings().all()
         ]
-    if not rows:
-        return {"refreshed": 0}
-    sem = asyncio.Semaphore(5)
-    await asyncio.gather(*[_refresh_company(r, sem) for r in rows])
-    logger.info(f"Refreshed {len(rows)} watched companies")
-    return {"refreshed": len(rows)}
+    return await _refresh_rows(rows, label="watched")
 
 
-async def refresh_stale_index_task(ctx) -> dict:
-    """Daily: refresh index companies stale beyond REFRESH_STALE_DAYS."""
+async def refresh_icp_hot_task(ctx) -> dict:
+    """Daily: refresh ICP-hot index companies (source_profiles or recent scrape)."""
+    with Session(_engine) as session:
+        rows = [
+            dict(r)
+            for r in session.execute(
+                _SELECT_ICP_HOT_STALE,
+                {
+                    "stale_days": cfg.REFRESH_ICP_STALE_DAYS,
+                    "lim": cfg.REFRESH_ICP_CAP,
+                },
+            ).mappings().all()
+        ]
+    result = await _refresh_rows(rows, label="icp-hot")
+    result["tier"] = "icp_hot"
+    return result
+
+
+async def refresh_cold_index_task(ctx) -> dict:
+    """Daily: refresh cold index companies beyond REFRESH_STALE_DAYS."""
+    cold_cap = max(
+        0,
+        cfg.REFRESH_BATCH_CAP - cfg.WATCHED_REFRESH_LIMIT - cfg.REFRESH_ICP_CAP,
+    )
+    if cold_cap == 0:
+        return {"refreshed": 0, "tier": "cold"}
     with Session(_engine) as session:
         rows = [
             dict(r)
@@ -115,15 +180,24 @@ async def refresh_stale_index_task(ctx) -> dict:
                 _SELECT_STALE_INDEX,
                 {
                     "stale_days": cfg.REFRESH_STALE_DAYS,
-                    "lim": cfg.REFRESH_BATCH_CAP,
+                    "lim": cold_cap,
                 },
             ).mappings().all()
         ]
-    if not rows:
-        return {"refreshed": 0}
-    sem = asyncio.Semaphore(5)
-    await asyncio.gather(*[_refresh_company(r, sem) for r in rows])
-    return {"refreshed": len(rows)}
+    result = await _refresh_rows(rows, label="cold")
+    result["tier"] = "cold"
+    return result
+
+
+async def refresh_stale_index_task(ctx) -> dict:
+    """Backward-compatible alias — runs ICP-hot then cold tiers."""
+    icp = await refresh_icp_hot_task(ctx)
+    cold = await refresh_cold_index_task(ctx)
+    return {
+        "refreshed": icp.get("refreshed", 0) + cold.get("refreshed", 0),
+        "icp_hot": icp.get("refreshed", 0),
+        "cold": cold.get("refreshed", 0),
+    }
 
 
 async def poll_edgar_form_d_task(ctx) -> dict:
@@ -196,25 +270,144 @@ async def poll_product_hunt_task(ctx) -> dict:
 
 
 async def poll_job_posts_task(ctx) -> dict:
-    """Daily: poll ATS for watched accounts only."""
-    from signals.job_posts import fetch_job_board_posts, extract_posts_with_gemini, persist_job_posts
+    """
+    Daily: cheap ATS-board poll (index) + full re-enrich path for watched accounts.
+    """
+    from signals.job_posts import (
+        extract_posts_with_gemini,
+        fetch_cached_ats_board_posts,
+        fetch_job_board_posts,
+        persist_job_posts,
+    )
+
+    ats_updated = 0
+    with Session(_engine) as session:
+        ats_rows = [
+            dict(r)
+            for r in session.execute(
+                _SELECT_ATS_CACHED, {"lim": cfg.JOB_POLL_ATS_CAP}
+            ).mappings().all()
+        ]
+
+    for row in ats_rows:
+        ats_board = row.get("ats_board")
+        if not isinstance(ats_board, dict):
+            continue
+        posts, source = await fetch_cached_ats_board_posts(ats_board)
+        if not posts:
+            continue
+
+        with Session(_engine) as session:
+            existing = session.execute(
+                text("""
+                    SELECT external_id, title
+                    FROM discovery_job_post
+                    WHERE company_id = :cid AND closed_at IS NULL
+                """),
+                {"cid": row["id"]},
+            ).mappings().all()
+            known = {str(r["external_id"]): r["title"] for r in existing}
+
+        new_or_changed = [
+            p for p in posts
+            if str(p.get("external_id") or "") not in known
+            or known.get(str(p.get("external_id") or "")) != p.get("title")
+        ]
+        if new_or_changed:
+            enriched = extract_posts_with_gemini(new_or_changed)
+            by_id = {str(p.get("external_id")): p for p in enriched}
+            for p in posts:
+                ext = str(p.get("external_id") or "")
+                if ext in by_id:
+                    p.update(by_id[ext])
+
+        with Session(_engine) as session:
+            persist_job_posts(session, row["id"], posts, source)
+            session.commit()
+        ats_updated += 1
+        await asyncio.sleep(0.25)
 
     with Session(_engine) as session:
-        rows = [dict(r) for r in session.execute(_SELECT_WATCHED_FOR_JOBS).mappings().all()]
+        watched_rows = [
+            dict(r) for r in session.execute(_SELECT_WATCHED_FOR_JOBS).mappings().all()
+        ]
 
-    updated = 0
-    for row in rows[:100]:
-        posts, source = await fetch_job_board_posts(row["name"], domain=row.get("domain"))
+    watched_updated = 0
+    for row in watched_rows[: cfg.JOB_POLL_FULL_ENRICH_CAP]:
+        posts, source, _ = await fetch_job_board_posts(
+            row["name"],
+            domain=row.get("domain"),
+            ats_board=row.get("ats_board"),
+        )
         if not posts:
             continue
         posts = extract_posts_with_gemini(posts)
         with Session(_engine) as session:
             persist_job_posts(session, row["id"], posts, source)
             session.commit()
-        updated += 1
+        watched_updated += 1
         await asyncio.sleep(0.5)
 
-    return {"polled": updated}
+    return {
+        "ats_polled": ats_updated,
+        "watched_polled": watched_updated,
+        "polled": ats_updated + watched_updated,
+    }
+
+
+async def import_jobhive_slugs_task(ctx) -> dict:
+    """Weekly: warm ats_board from jobhive CSVs before scrape enrich wave."""
+    from signals.jobhive_import import apply_jobhive_import, get_jobhive_index
+
+    limit = cfg.JOBHIVE_IMPORT_LIMIT or None
+    index = get_jobhive_index(force_reload=True)
+    if index is None:
+        return {"scanned": 0, "matched": 0, "applied": 0, "error": "index_load_failed"}
+    with Session(_engine) as session:
+        stats = apply_jobhive_import(
+            session,
+            index=index,
+            limit=limit,
+            only_missing=True,
+        )
+    logger.info("[jobhive_import] %s", stats)
+    return stats
+
+
+async def daily_discovery_maintenance_task(ctx) -> dict:
+    """Daily consolidated maintenance — ordered steps with per-step stats."""
+    import time
+
+    from signals.scheduler_metrics import log_scheduler_health
+
+    steps: dict = {}
+    for name, coro in (
+        ("scheduler_health", log_scheduler_health()),
+        ("watched", refresh_watched_companies_task(ctx)),
+        ("icp_hot", refresh_icp_hot_task(ctx)),
+        ("cold", refresh_cold_index_task(ctx)),
+        ("job_posts", poll_job_posts_task(ctx)),
+        ("headcounts", refresh_headcounts_task(ctx)),
+        ("edgar", poll_edgar_form_d_task(ctx)),
+        ("product_hunt", poll_product_hunt_task(ctx)),
+    ):
+        start = time.perf_counter()
+        try:
+            steps[name] = await coro
+            steps[name]["duration_ms"] = (time.perf_counter() - start) * 1000
+        except Exception as exc:
+            steps[name] = {
+                "error": str(exc),
+                "duration_ms": (time.perf_counter() - start) * 1000,
+            }
+            logger.error("[daily_maintenance] step %s failed: %s", name, exc, exc_info=True)
+            capture_task_failure(
+                exc,
+                service=SERVICE_WORKER,
+                task_name=f"daily_maintenance_{name}",
+            )
+    logger.info("[daily_maintenance] complete — steps=%s", list(steps.keys()))
+    return steps
 
 
 async def refresh_headcounts_task(ctx) -> dict:
@@ -244,8 +437,20 @@ _SELECT_RECONCILE = text("""
             )
         )
     )
-    ORDER BY signal_last_attempt_at NULLS FIRST
+    ORDER BY
+        CASE WHEN signal_enrichment_status = 'processing' THEN 0 ELSE 1 END,
+        signal_last_attempt_at NULLS FIRST
     LIMIT :batch
+""")
+
+_COUNT_STUCK_PROCESSING = text("""
+    SELECT COUNT(*) AS cnt
+    FROM discovery_company
+    WHERE signal_enrichment_status = 'processing'
+      AND (
+          signal_last_attempt_at IS NULL
+          OR signal_last_attempt_at < NOW() - (:stale_minutes * INTERVAL '1 minute')
+      )
 """)
 
 _RESET_TO_PENDING = text("""
@@ -263,9 +468,13 @@ async def reconcile_pending_task(ctx) -> dict:
     import arq
     from arq.connections import RedisSettings
 
+    from signals.scheduler_metrics import log_scheduler_health
+
     stale_minutes = cfg.SIGNAL_PROCESSING_STALE_MINUTES
     max_attempts = cfg.SIGNAL_RECONCILE_MAX_ATTEMPTS
     batch = cfg.SIGNAL_RECONCILE_BATCH
+
+    health = await log_scheduler_health(extra={"phase": "pre_reconcile"})
 
     with Session(_engine) as session:
         rows = session.execute(
@@ -273,9 +482,17 @@ async def reconcile_pending_task(ctx) -> dict:
             {"stale_minutes": stale_minutes, "max_attempts": max_attempts, "batch": batch},
         ).mappings().all()
         company_ids = [str(r["id"]) for r in rows]
+        still_stuck = session.execute(
+            _COUNT_STUCK_PROCESSING,
+            {"stale_minutes": stale_minutes},
+        ).scalar() or 0
 
     if not company_ids:
-        return {"requeued": 0}
+        return {
+            "requeued": 0,
+            "still_stuck_count": int(still_stuck),
+            "pending_enrich": health.get("pending_enrich"),
+        }
 
     pool = await arq.create_pool(RedisSettings.from_dsn(cfg.REDIS_URL))
     requeued = 0
@@ -295,5 +512,19 @@ async def reconcile_pending_task(ctx) -> dict:
     finally:
         await pool.aclose()
 
-    logger.info(f"Reconcile re-queued {requeued} companies for signal enrichment")
-    return {"requeued": requeued}
+    with Session(_engine) as session:
+        still_stuck_after = session.execute(
+            _COUNT_STUCK_PROCESSING,
+            {"stale_minutes": stale_minutes},
+        ).scalar() or 0
+
+    logger.info(
+        "Reconcile re-queued %d companies (still_stuck=%d)",
+        requeued,
+        still_stuck_after,
+    )
+    return {
+        "requeued": requeued,
+        "reconciled_count": requeued,
+        "still_stuck_count": int(still_stuck_after),
+    }

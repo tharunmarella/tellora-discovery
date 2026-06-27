@@ -1,0 +1,46 @@
+meta {
+  name: Spending By Award
+  type: http
+  seq: 1
+}
+
+post {
+  url: https://api.usaspending.gov/api/v2/search/spending_by_award/
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "filters": {
+      "award_type_codes": ["A", "B", "C", "D"],
+      "time_period": [
+        {
+          "start_date": "2026-03-01",
+          "end_date": "2026-06-23"
+        }
+      ],
+      "recipient_search_text": ["{{company_name}}"]
+    },
+    "fields": [
+      "Award ID",
+      "Recipient Name",
+      "Award Amount",
+      "Awarding Agency",
+      "Start Date"
+    ],
+    "limit": 5,
+    "page": 1
+  }
+}
+
+docs {
+  results[] → awards[] (max 3 kept):
+  - Award ID → award_id
+  - Recipient Name → recipient
+  - Award Amount → amount (float, skip <= 0)
+  - Awarding Agency → agency
+  - Start Date → date
+
+  Emits gov_contract extra_events (confidence 0.9).
+}

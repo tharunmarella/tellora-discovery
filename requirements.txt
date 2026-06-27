@@ -11,6 +11,8 @@ groq>=0.37.0
 pgvector>=0.3.0
 redis>=5.0.0
 arq>=0.26.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
 axiom-py
 sentry-sdk>=2.0.0
 dnspython>=2.6.0

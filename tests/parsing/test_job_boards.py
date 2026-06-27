@@ -5,7 +5,7 @@ import pytest
 import respx
 
 from signals.constants import GREENHOUSE_API, LEVER_API
-from signals.pipeline import check_job_boards
+from signals.job_posts import check_job_boards
 
 
 @pytest.mark.asyncio

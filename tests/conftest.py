@@ -98,10 +98,14 @@ def _patch_engines(engine) -> None:
     import database
     import worker
     import signals.monitoring as monitoring
+    import signals.scheduler_metrics as scheduler_metrics
+    import signals.enqueue as enqueue
 
     database.engine = engine
     worker._engine = engine
     monitoring._engine = engine
+    scheduler_metrics._engine = engine
+    enqueue._engine = engine
 
 
 def _ensure_org_research_table(conn) -> None:

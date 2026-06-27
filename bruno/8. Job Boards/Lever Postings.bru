@@ -1,0 +1,27 @@
+meta {
+  name: Lever Postings
+  type: http
+  seq: 2
+}
+
+get {
+  url: https://api.lever.co/v0/postings/{{lever_slug}}
+  body: none
+  auth: none
+}
+
+params:query {
+  mode: json
+}
+
+settings {
+  followRedirects: true
+}
+
+docs {
+  Array of postings (not wrapped in jobs key):
+  - id → external_id
+  - text → title
+  - categories.location → location
+  - descriptionPlain or description → body_text
+}

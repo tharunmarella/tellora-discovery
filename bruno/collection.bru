@@ -1,0 +1,13 @@
+meta {
+  name: Tellora Discovery — Sources
+}
+
+docs {
+  External APIs that tellora-discovery ingests. Use to inspect raw response shape
+  and fields before they are normalized into discovery_company / discovery_signal_event.
+
+  Set secrets in environments/Local.bru — copy from Local.bru.example and fill from tellora-discovery/.env:
+  TELLORA_APOLLO_API_KEY → apollo_api_key, SERPER_API_KEY → serper_api_key, JINA_API_KEY → jina_api_key.
+  GITHUB_TOKEN → github_token (optional; 60 req/hr unauthenticated).
+  Free/no-key sources: SEC EDGAR, Product Hunt, Google News RSS, HN Algolia, USAspending, job boards.
+}

@@ -17,6 +17,7 @@ Running:
 """
 
 import logging
+import time
 
 import redis.asyncio as aioredis
 from arq import cron
@@ -27,6 +28,7 @@ from sqlalchemy.orm import Session
 import settings as cfg
 from database import make_engine
 from infra.axiom_arq import after_job_end, on_job_failure
+from infra.axiom_logger import axiom_logger
 from infra.lifespan import SERVICE_WORKER, bootstrap, shutdown as lifespan_shutdown, startup as lifespan_startup
 from cron.scrape_schedule import (
     DEFAULT_DISCOVERY_SCRAPE_CRON,
@@ -35,7 +37,10 @@ from cron.scrape_schedule import (
     should_run_discovery_scrape,
 )
 from cron.weekly import WeeklyCronArgs, execute as run_weekly_cron, validate_args as validate_weekly_args
+from signals.enqueue import enqueue_scrape_pending_task
 from signals.monitoring import (
+    daily_discovery_maintenance_task,
+    import_jobhive_slugs_task,
     poll_edgar_form_d_task,
     poll_job_posts_task,
     poll_product_hunt_task,
@@ -44,6 +49,7 @@ from signals.monitoring import (
     refresh_stale_index_task,
     refresh_watched_companies_task,
 )
+from signals.scheduler_metrics import log_scheduler_health_task
 
 bootstrap(server_name=SERVICE_WORKER)
 
@@ -67,7 +73,7 @@ _CLAIM_AND_LOAD = text("""
            updated_at               = NOW()
     WHERE  id = :company_id
     AND    signal_enrichment_status IN ('pending', 'processing')
-    RETURNING id, name, domain, description, industry, raw_meta, headcount, headquarters
+    RETURNING id, name, domain, description, industry, raw_meta, headcount, headquarters, ats_board
 """)
 
 _MARK_FAILED = text("""
@@ -118,6 +124,7 @@ async def enrich_company_task(ctx, company_id: str) -> dict:
             raw_meta=row.get("raw_meta"),
             existing_headcount=row.get("headcount"),
             existing_headquarters=row.get("headquarters"),
+            existing_ats_board=row.get("ats_board"),
         )
     except Exception as exc:
         logger.error(
@@ -172,23 +179,30 @@ async def run_discovery_scrape_task(ctx) -> dict:
     Fallback scrape cron on the worker when the Railway cron service is absent
     or misconfigured. Skips if a scrape already ran recently (Railway path).
     """
+    start = time.perf_counter()
+
+    async def _skip(reason: str) -> dict:
+        logger.info("[run_discovery_scrape_task] Skipping — %s", reason)
+        await axiom_logger.log_task_run(
+            task_name="discovery_scrape_fallback",
+            success=True,
+            duration_ms=(time.perf_counter() - start) * 1000,
+            service=SERVICE_WORKER,
+            stats={"skipped": True, "skipped_reason": reason},
+        )
+        return {"ok": True, "skipped": True, "reason": reason}
+
     if not cfg.DISCOVERY_SCRAPE_WORKER_FALLBACK:
-        logger.info("[run_discovery_scrape_task] Worker fallback disabled — skipping")
-        return {"ok": True, "skipped": True, "reason": "worker_fallback_disabled"}
+        return await _skip("worker_fallback_disabled")
 
     if discovery_scrape_recently_active():
-        logger.info("[run_discovery_scrape_task] Scrape already active/recent — skipping")
-        return {"ok": True, "skipped": True, "reason": "recent_run"}
+        return await _skip("recent_run")
 
     if not should_run_discovery_scrape(
         cron_expr=cfg.DISCOVERY_SCRAPE_CRON,
         schedule_disabled=cfg.DISCOVERY_SCRAPE_SCHEDULE_DISABLED,
     ):
-        logger.info(
-            "[run_discovery_scrape_task] Outside schedule %s — skipping",
-            cfg.DISCOVERY_SCRAPE_CRON,
-        )
-        return {"ok": True, "skipped": True, "reason": "off_schedule"}
+        return await _skip("off_schedule")
 
     args = WeeklyCronArgs()
     validate_weekly_args(args)
@@ -197,6 +211,13 @@ async def run_discovery_scrape_task(ctx) -> dict:
         cfg.DISCOVERY_SCRAPE_CRON,
     )
     await run_weekly_cron(args)
+    await axiom_logger.log_task_run(
+        task_name="discovery_scrape_fallback",
+        success=True,
+        duration_ms=(time.perf_counter() - start) * 1000,
+        service=SERVICE_WORKER,
+        stats={"skipped": False},
+    )
     return {"ok": True, "skipped": False}
 
 
@@ -238,6 +259,10 @@ class WorkerSettings:
         poll_edgar_form_d_task,
         poll_product_hunt_task,
         reconcile_pending_task,
+        log_scheduler_health_task,
+        enqueue_scrape_pending_task,
+        import_jobhive_slugs_task,
+        daily_discovery_maintenance_task,
     ]
     queue_name = "arq:ondemand"
     redis_settings = _redis_settings
@@ -245,27 +270,27 @@ class WorkerSettings:
     on_shutdown = shutdown
     on_job_failure = on_job_failure
     after_job_end = after_job_end
-    max_jobs = 5
+    max_jobs = cfg.SIGNAL_ENRICH_MAX_JOBS
     max_tries = _ENRICH_MAX_TRIES
     job_timeout = 600
     _scrape_schedule = parse_scrape_cron(
         cfg.DISCOVERY_SCRAPE_CRON or DEFAULT_DISCOVERY_SCRAPE_CRON
     )
     cron_jobs = [
+        # Jobhive slug warm-up — Sunday 2:30 UTC (before Sun 3 AM scrape).
+        cron(import_jobhive_slugs_task, weekday={6}, hour=2, minute=30),
+        # Safety net: enqueue pending rows from last 24h.
+        cron(enqueue_scrape_pending_task, hour=3, minute=30),
+        # Scheduler health snapshot before daily maintenance block.
+        cron(log_scheduler_health_task, hour=3, minute=55),
         # Fallback discovery scrape — mirrors DISCOVERY_SCRAPE_CRON (default Sun+Wed 3 AM UTC).
         cron(
             run_discovery_scrape_task,
-            # arq accepts set/list/tuple for weekday — not frozenset.
             weekday=set(_scrape_schedule.python_weekdays),
             hour=_scrape_schedule.hour,
             minute=_scrape_schedule.minute,
         ),
-        # Daily freshness (UTC) — watched + index re-enrich, then ingest polls.
-        cron(refresh_watched_companies_task, hour=4, minute=0),
-        cron(refresh_stale_index_task, hour=5, minute=0),
-        cron(poll_job_posts_task, hour=6, minute=0),
-        cron(refresh_headcounts_task, hour=7, minute=0),
-        cron(poll_edgar_form_d_task, hour=10, minute=0),
-        cron(poll_product_hunt_task, hour=11, minute=0),
+        # Consolidated daily maintenance (watched → tiered refresh → jobs → headcount → ingest).
+        cron(daily_discovery_maintenance_task, hour=4, minute=0),
         cron(reconcile_pending_task, minute={0, 10, 20, 30, 40, 50}),
     ]

@@ -27,9 +27,10 @@ Queries Apollo's **free** People API Search (`mixed_people/api_search`) across 1
 
 1. **Jina Reader** — homepage, /about, /careers, /pricing, /customers, /changelog
 2. **Job boards** — Greenhouse, Lever, Ashby, SmartRecruiters, Workable
-3. **Free sources** — GitHub, EDGAR Form D, Google News RSS, HN, USAspending, DNS, Wayback
-4. **Gemini synthesis** → `buying_signals`, `signal_score`, embeddings
-5. **Signal diff** → typed events (`funding_round`, `hiring_surge`, `product_launch`, …)
+3. **Funding news** — Serper News (Google News RSS fallback)
+4. **Free sources** — GitHub, EDGAR Form D, Google News RSS, HN, USAspending, DNS, Wayback
+5. **Gemini synthesis** → `buying_signals`, `signal_score`, embeddings
+6. **Signal diff** → typed events (`funding_round`, `hiring_surge`, `product_launch`, …)
 
 Statuses: `pending` · `processing` · `enriched` · `partial` · `failed` · `skipped`
 
@@ -188,6 +189,7 @@ tellora-discovery/
 - **Apollo:** 200 req/min, 600 req/hour — paces at ~1 req/sec
 - **Serper:** 50 req/sec
 - **Jina (unauth):** ~20 RPM — use `JINA_API_KEY` in production
+- **httpcloak (optional):** set `HTTPCLOAK_FALLBACK=true` + `pip install httpcloak` for JazzHR/iCIMS/tech-stack WAF bypass
 - **Signal worker:** `max_jobs=5`, `job_timeout=600s`, `max_tries=3`
 
 ## Expected output

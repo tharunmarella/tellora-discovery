@@ -1,0 +1,27 @@
+vars {
+  company_name: Vercel
+  company_domain: vercel.com
+  github_org: vercel
+  greenhouse_slug: ramp
+  lever_slug: netflix
+  ashby_slug: ramp
+  smartrecruiters_slug: SmartRecruiters
+  workable_slug: ramp
+  edgar_user_agent: Tellora Research research@tellora.ai
+  edgar_start_date: 2026-06-20
+  edgar_end_date: 2026-06-23
+  edgar_cik: 320193
+  edgar_accession_nodash: 000032019324000123
+  edgar_doc: primary_doc.xml
+  apollo_api_key: your_apollo_master_key_here
+  serper_api_key: your_serper_api_key_here
+  jina_api_key: your_jina_api_key_here
+  github_token:
+}
+
+vars:secret [
+  apollo_api_key,
+  serper_api_key,
+  jina_api_key,
+  github_token
+]

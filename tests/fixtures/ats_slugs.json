@@ -1,0 +1,22 @@
+[
+  {"company": "Stripe", "domain": "stripe.com", "expected_ats": "greenhouse", "expected_slug": "stripe"},
+  {"company": "Ramp", "domain": "ramp.com", "expected_ats": "ashby", "expected_slug": "ramp"},
+  {"company": "Netflix", "domain": "netflix.com", "expected_ats": "lever", "expected_slug": "netflix"},
+  {"company": "Notion", "domain": "notion.so", "expected_ats": "greenhouse", "expected_slug": "notion"},
+  {"company": "Linear", "domain": "linear.app", "expected_ats": "ashby", "expected_slug": "linear"},
+  {"company": "Figma", "domain": "figma.com", "expected_ats": "greenhouse", "expected_slug": "figma"},
+  {"company": "Datadog", "domain": "datadoghq.com", "expected_ats": "greenhouse", "expected_slug": "datadog"},
+  {"company": "HubSpot", "domain": "hubspot.com", "expected_ats": "greenhouse", "expected_slug": "hubspot"},
+  {"company": "Shopify", "domain": "shopify.com", "expected_ats": "lever", "expected_slug": "shopify"},
+  {"company": "Vercel", "domain": "vercel.com", "expected_ats": "ashby", "expected_slug": "vercel"},
+  {"company": "Plaid", "domain": "plaid.com", "expected_ats": "ashby", "expected_slug": "plaid"},
+  {"company": "Coinbase", "domain": "coinbase.com", "expected_ats": "greenhouse", "expected_slug": "coinbase", "note": "branded careers page"},
+  {"company": "Nebius", "domain": "nebius.com", "expected_ats": "greenhouse", "expected_slug": "nebius", "note": "branded GH embed"},
+  {"company": "C3.ai", "domain": "c3.ai", "expected_ats": "greenhouse", "expected_slug": "c3iot", "note": "slug != domain"},
+  {"company": "Arize AI", "domain": "arize.com", "expected_ats": "greenhouse", "expected_slug": "arizeai", "note": "slug != domain"},
+  {"company": "OpenAI", "domain": "openai.com", "expected_ats": "greenhouse", "expected_slug": "openai"},
+  {"company": "Anthropic", "domain": "anthropic.com", "expected_ats": "greenhouse", "expected_slug": "anthropic"},
+  {"company": "Deel", "domain": "deel.com", "expected_ats": "ashby", "expected_slug": "deel"},
+  {"company": "Brex", "domain": "brex.com", "expected_ats": "greenhouse", "expected_slug": "brex"},
+  {"company": "Scale AI", "domain": "scale.com", "expected_ats": "greenhouse", "expected_slug": "scaleai", "note": "generic token collision risk"}
+]

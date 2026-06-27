@@ -1,0 +1,23 @@
+meta {
+  name: Resolve Org by domain stem
+  type: http
+  seq: 1
+}
+
+get {
+  url: https://api.github.com/orgs/{{github_org}}
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/vnd.github+json
+  ~Authorization: Bearer {{github_token}}
+}
+
+docs {
+  Strategy 1: GET /orgs/{domain_stem} — e.g. vercel.com → /orgs/vercel
+  Accept only if response.blog contains company domain.
+
+  Fields: login, blog, description, public_repos, html_url
+}

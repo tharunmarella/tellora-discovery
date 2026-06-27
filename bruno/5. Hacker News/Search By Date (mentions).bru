@@ -1,0 +1,29 @@
+meta {
+  name: Search By Date (mentions)
+  type: http
+  seq: 1
+}
+
+get {
+  url: https://hn.algolia.com/api/v1/search_by_date
+  body: none
+  auth: none
+}
+
+params:query {
+  query: {{company_name}}
+  tags: story
+  numericFilters: created_at_i>1718409600
+  hitsPerPage: 15
+}
+
+docs {
+  hits[] fields we use:
+  - title, url, points, num_comments, objectID, created_at, story_id
+
+  Filters in code:
+  - mentions: points >= 10 OR num_comments >= 5 → news_mention
+  - Show HN + domain match in url host → product_launch
+
+  Update numericFilters timestamp (Unix) for last 7 days.
+}
