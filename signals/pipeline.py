@@ -976,6 +976,10 @@ def build_search_tsv(
     raw_meta: Optional[dict],
     recent_launches: Optional[list[str]] = None,
     known_customers: Optional[list[str]] = None,
+    *,
+    hiring_roles: Optional[list[str]] = None,
+    buying_signals: Optional[list[str]] = None,
+    funding_stage: Optional[str] = None,
 ) -> str:
     """
     Build a concatenated plain-text string to be converted to tsvector in Postgres.
@@ -988,6 +992,12 @@ def build_search_tsv(
         parts.append(description)
     if industry:
         parts.append(industry)
+    if funding_stage:
+        parts.append(funding_stage)
+    if hiring_roles:
+        parts.append(" ".join(hiring_roles))
+    if buying_signals:
+        parts.append(" ".join(buying_signals))
     if tech_stack:
         parts.append(" ".join(tech_stack))
     if recent_launches:
@@ -1280,6 +1290,9 @@ async def _enrich_company_signals_impl(
         raw_meta=raw_meta,
         recent_launches=result.recent_launches,
         known_customers=result.known_customers,
+        hiring_roles=result.hiring_roles or job_board.get("roles", []),
+        buying_signals=result.buying_signals,
+        funding_stage=result.funding_stage,
     )
     if concepts:
         tsv_text = f"{tsv_text} {' '.join(concepts)}".strip()

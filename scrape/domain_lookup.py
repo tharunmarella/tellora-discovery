@@ -242,8 +242,16 @@ def _run_lookup(company_name: str, ceo_first_name: str, serper_api_key: str) -> 
     if extracted.get("use_case"):
         enrichment["use_case"] = extracted["use_case"]
 
-    # Embedding is handled by signal_runner.py with richer context
-    # (company_summary + industry + tech_stack). No need to embed here.
+    # Scrape-time embedding so new rows are searchable before signal enrichment.
+    from llm import embed_text
+
+    embed_parts = [
+        p for p in (enrichment.get("description"), enrichment.get("industry")) if p
+    ]
+    if embed_parts and cfg.GEMINI_API_KEY:
+        vec = embed_text(" ".join(embed_parts))
+        if vec:
+            enrichment["description_embedding"] = vec
 
     return enrichment
 

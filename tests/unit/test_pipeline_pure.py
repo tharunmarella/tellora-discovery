@@ -46,10 +46,15 @@ def test_build_search_tsv():
         raw_meta={"keywords": ["crm"], "use_case": "outbound"},
         recent_launches=["Launch 1"],
         known_customers=["Acme"],
+        hiring_roles=["SDR", "Account Executive"],
+        buying_signals=["Series B raised $20M"],
+        funding_stage="Series B",
     )
     assert "AI sales platform" in tsv
     assert "stripe" in tsv
     assert "Launch 1" in tsv
+    assert "SDR" in tsv
+    assert "Series B" in tsv
 
 
 def test_sources_had_data_from_job_board():
