@@ -1,11 +1,65 @@
 """Synchronous + async DB engines for the discovery service."""
 
 import logging
+import time
+from typing import Callable, TypeVar
+
 from sqlmodel import create_engine, SQLModel, Session
 
 import settings as cfg
 
 logger = logging.getLogger("discovery.db")
+
+T = TypeVar("T")
+
+_TRANSIENT_DB_MARKERS = (
+    "starting up",
+    "connection refused",
+    "could not connect",
+    "server closed the connection",
+    "connection reset",
+    "too many connections",
+    "timeout expired",
+    "broken pipe",
+    "terminating connection",
+)
+
+
+def is_transient_db_error(exc: BaseException) -> bool:
+    """True when Postgres/Redis infra is briefly unavailable (safe to retry)."""
+    msg = str(exc).lower()
+    exc_name = type(exc).__name__.lower()
+    if "operationalerror" in exc_name or "interfaceerror" in exc_name:
+        return any(marker in msg for marker in _TRANSIENT_DB_MARKERS)
+    return any(marker in msg for marker in ("starting up", "connection refused"))
+
+
+def run_with_db_retry(
+    fn: Callable[[], T],
+    *,
+    max_attempts: int = 5,
+    base_delay: float = 1.0,
+) -> T:
+    """Run a DB operation with exponential backoff on transient connection errors."""
+    last_exc: BaseException | None = None
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            if not is_transient_db_error(exc) or attempt == max_attempts - 1:
+                raise
+            last_exc = exc
+            delay = base_delay * (2 ** attempt)
+            logger.warning(
+                "Transient DB error (attempt %s/%s), retrying in %.1fs: %s",
+                attempt + 1,
+                max_attempts,
+                delay,
+                exc,
+            )
+            time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
 
 
 def make_engine(*, pool_pre_ping: bool = True, **kwargs):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -26,6 +27,38 @@ def get_gemini_client():
 
 
 # ── LiteLLM gateway (multi-provider fallback) ───────────────────────────────
+
+
+def configure_litellm() -> None:
+    """One-time LiteLLM globals (idempotent)."""
+    import litellm
+
+    litellm.suppress_debug_info = True
+    litellm.drop_params = True
+
+
+async def drain_litellm(timeout: float = 5.0) -> None:
+    """
+    Drain LiteLLM logging and close cached aiohttp clients.
+
+    Sync litellm.completion() run via run_in_executor can leave aiohttp sessions
+    open on the worker event loop — asyncio then logs 'Unclosed connector'.
+    """
+    configure_litellm()
+    try:
+        from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+        await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=timeout)
+    except Exception:
+        logger.debug("LiteLLM logging drain skipped", exc_info=True)
+    try:
+        import litellm
+
+        close_fn = getattr(litellm, "close_litellm_async_clients", None)
+        if close_fn is not None:
+            await asyncio.wait_for(close_fn(), timeout=timeout)
+    except Exception:
+        logger.debug("LiteLLM async client close skipped", exc_info=True)
 
 
 def to_litellm_model(model: str) -> str:
@@ -114,7 +147,7 @@ class LLMRouter:
         """Synchronous completion with fallbacks. Returns the message text."""
         import litellm
 
-        litellm.suppress_debug_info = True
+        configure_litellm()
 
         chain = models or self.synthesis_models
         if not chain:
@@ -142,19 +175,55 @@ def get_router() -> LLMRouter:
     return LLMRouter()
 
 
+_TRANSIENT_LLM_MARKERS = (
+    "429",
+    "rate",
+    "quota",
+    "resource_exhausted",
+    "503",
+    "timeout",
+    "unavailable",
+    "serviceunavailable",
+    "high demand",
+    # Transient network / DNS (Railway container blips)
+    "name or service not known",
+    "temporary failure in name resolution",
+    "connection refused",
+    "connection reset",
+    "network is unreachable",
+    "connect error",
+    "errno -2",
+    "errno -3",
+    "getaddrinfo failed",
+)
+
+
+def is_transient_llm_error(exc: BaseException) -> bool:
+    """True when the provider or network is briefly unavailable (safe to retry)."""
+    if isinstance(exc, TimeoutError):
+        return True
+    exc_str = str(exc).lower()
+    exc_type = type(exc).__name__.lower()
+    if "connecterror" in exc_type or "retryerror" in exc_type:
+        return any(marker in exc_str for marker in _TRANSIENT_LLM_MARKERS)
+    return any(marker in exc_str for marker in _TRANSIENT_LLM_MARKERS)
+
+
 def retry_llm(fn, max_retries: int = 3):
     backoff = 5
     for attempt in range(max_retries):
         try:
             return fn()
         except Exception as exc:
-            exc_str = str(exc).lower()
-            is_retryable = any(
-                s in exc_str for s in ("429", "rate", "quota", "resource_exhausted", "503", "timeout")
-            )
-            if not is_retryable or attempt == max_retries - 1:
+            if not is_transient_llm_error(exc) or attempt == max_retries - 1:
                 raise
-            logger.warning(f"Gemini retryable error (attempt {attempt+1}): {exc} — backing off {backoff}s")
+            logger.warning(
+                "LLM retryable error (attempt %s/%s): %s — backing off %ss",
+                attempt + 1,
+                max_retries,
+                exc,
+                backoff,
+            )
             time.sleep(backoff)
             backoff *= 2
 

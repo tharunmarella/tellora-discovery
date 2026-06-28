@@ -269,6 +269,10 @@ async def lookup_domain(company_name: str, ceo_first_name: str = "") -> dict:
     if not serper_api_key:
         logger.info("SERPER_API_KEY not set — using DDG only")
 
-    return await asyncio.get_event_loop().run_in_executor(
+    result = await asyncio.get_event_loop().run_in_executor(
         None, _run_lookup, company_name, ceo_first_name, serper_api_key
     )
+    from llm import drain_litellm
+
+    await drain_litellm()
+    return result

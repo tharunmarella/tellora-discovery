@@ -76,9 +76,15 @@ async def log_scheduler_health(
     extra: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Collect metrics and emit to Axiom as task_run scheduler_health."""
+    from database import run_with_db_retry
+
     start = time.perf_counter()
-    with Session(_engine) as session:
-        metrics = collect_scheduler_metrics(session)
+
+    def _collect() -> dict[str, Any]:
+        with Session(_engine) as session:
+            return collect_scheduler_metrics(session)
+
+    metrics = run_with_db_retry(_collect)
     if extra:
         metrics.update(extra)
 

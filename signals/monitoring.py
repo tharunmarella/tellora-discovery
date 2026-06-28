@@ -12,7 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 import settings as cfg
-from database import make_engine
+from database import make_engine, run_with_db_retry
 from infra.lifespan import SERVICE_WORKER
 from infra.sentry_telemetry import capture_task_failure
 from signals.pipeline import enrich_company_signals
@@ -476,16 +476,20 @@ async def reconcile_pending_task(ctx) -> dict:
 
     health = await log_scheduler_health(extra={"phase": "pre_reconcile"})
 
-    with Session(_engine) as session:
-        rows = session.execute(
-            _SELECT_RECONCILE,
-            {"stale_minutes": stale_minutes, "max_attempts": max_attempts, "batch": batch},
-        ).mappings().all()
-        company_ids = [str(r["id"]) for r in rows]
-        still_stuck = session.execute(
-            _COUNT_STUCK_PROCESSING,
-            {"stale_minutes": stale_minutes},
-        ).scalar() or 0
+    def _load_candidates() -> tuple[list[str], int]:
+        with Session(_engine) as session:
+            rows = session.execute(
+                _SELECT_RECONCILE,
+                {"stale_minutes": stale_minutes, "max_attempts": max_attempts, "batch": batch},
+            ).mappings().all()
+            company_ids = [str(r["id"]) for r in rows]
+            still_stuck = session.execute(
+                _COUNT_STUCK_PROCESSING,
+                {"stale_minutes": stale_minutes},
+            ).scalar() or 0
+            return company_ids, int(still_stuck)
+
+    company_ids, still_stuck = run_with_db_retry(_load_candidates)
 
     if not company_ids:
         return {
@@ -497,10 +501,13 @@ async def reconcile_pending_task(ctx) -> dict:
     pool = await arq.create_pool(RedisSettings.from_dsn(cfg.REDIS_URL))
     requeued = 0
     try:
-        with Session(_engine) as session:
-            for company_id in company_ids:
-                session.execute(_RESET_TO_PENDING, {"company_id": company_id})
-            session.commit()
+        def _reset_to_pending() -> None:
+            with Session(_engine) as session:
+                for company_id in company_ids:
+                    session.execute(_RESET_TO_PENDING, {"company_id": company_id})
+                session.commit()
+
+        run_with_db_retry(_reset_to_pending)
 
         for company_id in company_ids:
             await pool.enqueue_job(
@@ -512,11 +519,16 @@ async def reconcile_pending_task(ctx) -> dict:
     finally:
         await pool.aclose()
 
-    with Session(_engine) as session:
-        still_stuck_after = session.execute(
-            _COUNT_STUCK_PROCESSING,
-            {"stale_minutes": stale_minutes},
-        ).scalar() or 0
+    def _count_stuck_after() -> int:
+        with Session(_engine) as session:
+            return int(
+                session.execute(
+                    _COUNT_STUCK_PROCESSING,
+                    {"stale_minutes": stale_minutes},
+                ).scalar() or 0
+            )
+
+    still_stuck_after = run_with_db_retry(_count_stuck_after)
 
     logger.info(
         "Reconcile re-queued %d companies (still_stuck=%d)",

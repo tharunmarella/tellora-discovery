@@ -1,5 +1,7 @@
 """Unit tests for the LiteLLM gateway router (no network)."""
 
+import asyncio
+
 import pytest
 
 from llm import LLMRouter, model_chain, to_litellm_model
@@ -110,3 +112,18 @@ def test_complete_text_uses_primary_and_fallbacks(monkeypatch):
     assert captured["model"] == "gemini/a"
     assert captured["fallbacks"] == ["gemini/b", "anthropic/c"]
     assert captured["num_retries"] == 3
+
+
+def test_configure_litellm_sets_drop_params():
+    import litellm
+
+    from llm import configure_litellm
+
+    configure_litellm()
+    assert litellm.drop_params is True
+
+
+def test_drain_litellm_noop_without_clients():
+    from llm import drain_litellm
+
+    asyncio.run(drain_litellm())

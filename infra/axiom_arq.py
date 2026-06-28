@@ -15,6 +15,9 @@ logger = logging.getLogger(__name__)
 
 
 async def after_job_end(ctx: dict[str, Any]) -> None:
+    from llm import drain_litellm
+
+    await drain_litellm()
     job_id = ctx.get("job_id")
     redis = ctx.get("redis")
     if not job_id or not redis:

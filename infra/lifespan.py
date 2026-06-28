@@ -40,6 +40,9 @@ async def startup(
 
 async def shutdown(*, server_name: str) -> None:
     logger.info("[%s] shutting down", server_name)
+    from llm import drain_litellm
+
+    await drain_litellm()
     await axiom_logger.stop()
     flush_sentry()
 

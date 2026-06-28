@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from llm import retry_llm, strip_json_fences
+from llm import is_transient_llm_error, retry_llm, strip_json_fences
 
 
 def test_strip_json_fences_plain():
@@ -47,3 +47,21 @@ def test_retry_llm_non_retryable_raises():
 
     with pytest.raises(ValueError, match="bad input"):
         retry_llm(fn, max_retries=3)
+
+
+def test_is_transient_llm_error_dns():
+    assert is_transient_llm_error(Exception("[Errno -2] Name or service not known"))
+
+
+def test_retry_llm_retries_on_dns_error():
+    calls = {"n": 0}
+
+    def fn():
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise Exception("[Errno -2] Name or service not known")
+        return "ok"
+
+    with patch("llm.time.sleep"):
+        assert retry_llm(fn, max_retries=3) == "ok"
+    assert calls["n"] == 2
