@@ -89,6 +89,9 @@ ALTER TABLE discovery_company ADD COLUMN IF NOT EXISTS signal_attempt_count INTE
 ALTER TABLE discovery_company ADD COLUMN IF NOT EXISTS signal_last_attempt_at TIMESTAMPTZ;
 ALTER TABLE discovery_company ADD COLUMN IF NOT EXISTS ats_board JSONB;
 ALTER TABLE discovery_company DROP COLUMN IF EXISTS location;
+ALTER TABLE discovery_signal_event ADD COLUMN IF NOT EXISTS evidence_url VARCHAR;
+ALTER TABLE discovery_signal_event ADD COLUMN IF NOT EXISTS event_date TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS ix_discovery_signal_event_event_date ON discovery_signal_event (event_date);
 """
 
 

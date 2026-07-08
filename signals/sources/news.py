@@ -21,6 +21,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 import settings as cfg
+from signals.diff import parse_event_date
 from signals.sources.edgar import normalize_name
 from llm import get_router, retry_llm, strip_json_fences
 
@@ -118,6 +119,8 @@ Respond with ONLY valid JSON: {{"results": [{{"i": 0, "category": "...", "releva
             },
             "source": "google_news",
             "confidence": 0.75,
+            "evidence_url": it.get("url"),
+            "event_date": it.get("date"),
         })
     return events[:5]
 
@@ -167,10 +170,10 @@ def _insert_ph_launch_event(session: Session, company_id: str, launch: dict) -> 
     session.execute(text("""
         INSERT INTO discovery_signal_event
             (id, company_id, event_type, title, payload, source,
-             observed_at, confidence, dedupe_key, created_at)
+             observed_at, confidence, dedupe_key, evidence_url, event_date, created_at)
         VALUES
             (:id, :company_id, 'product_launch', :title, CAST(:payload AS jsonb),
-             'product_hunt', :observed_at, 0.8, :dedupe_key, NOW())
+             'product_hunt', :observed_at, 0.8, :dedupe_key, :evidence_url, :event_date, NOW())
         ON CONFLICT (dedupe_key) DO NOTHING
     """), {
         "id": str(uuid.uuid4()),
@@ -184,6 +187,8 @@ def _insert_ph_launch_event(session: Session, company_id: str, launch: dict) -> 
         }),
         "observed_at": datetime.now(timezone.utc),
         "dedupe_key": f"{company_id}:product_launch:ph:{launch['slug']}",
+        "evidence_url": launch.get("url"),
+        "event_date": parse_event_date(launch.get("date")) if launch.get("date") else None,
     })
 
 

@@ -151,13 +151,6 @@ def judge_pipeline_output(company_name: str, domain: str, result: dict) -> dict:
 def _e2e_keys_required():
     _require_keys()
 
-
-@pytest.fixture(autouse=True)
-def _e2e_no_db(monkeypatch):
-    """E2E enrichment should not require a live Postgres connection."""
-    monkeypatch.setattr("signals.pipeline._company_has_snapshot", lambda _cid: False)
-
-
 async def test_pipeline_quality_golden_companies():
     scores: list[int] = []
     verdicts: list[dict] = []

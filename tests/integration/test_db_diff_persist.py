@@ -52,7 +52,18 @@ def test_persist_snapshot_and_events_writes_snapshot_and_event(db_session, compa
         {"cid": company_id},
     ).scalar()
     assert snap_count == 2
-    assert "funding_round" in inserted
+    assert "hiring_surge" in inserted
+
+    row = db_session.execute(
+        text("""
+            SELECT evidence_url FROM discovery_signal_event
+            WHERE company_id = :cid AND event_type = 'hiring_surge'
+            LIMIT 1
+        """),
+        {"cid": company_id},
+    ).first()
+    assert row is not None
+    assert row[0] == "https://acme.com/careers"
 
 
 def test_persist_snapshot_dedupes_events(db_session, company_factory):
@@ -68,9 +79,11 @@ def test_persist_snapshot_dedupes_events(db_session, company_factory):
         "extra_events": [{
             "event_type": "product_launch",
             "title": "Launch A",
-            "payload": {"key": "launch-a"},
+            "payload": {"key": "launch-a", "url": "https://acme.com/launch-a"},
             "source": "test",
             "confidence": 0.9,
+            "evidence_url": "https://acme.com/launch-a",
+            "event_date": "2025-06-01",
         }],
     }
     persist_snapshot_and_events(db_session, company_id, None, result)

@@ -11,6 +11,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Optional
 
 from sqlalchemy import text
@@ -18,28 +19,48 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger("discovery.signal_diff")
 
-# High-weight events that trigger instant alerts for watched accounts
-INSTANT_ALERT_TYPES = frozenset({"funding_round", "exec_hire"})
+# Tier 1 — alertable when grounded with evidence_url
+TIER1_ALERTABLE = frozenset({
+    "funding_round",
+    "exec_hire",
+    "job_change",
+    "product_launch",
+    "gov_contract",
+})
+
+# Tier 2 — context only; feeds heat score, never instant alerts
+TIER2_CONTEXT = frozenset({
+    "hiring_surge",
+    "role_spike",
+    "role_first_seen",
+    "concept_spike",
+    "concept_first_seen",
+    "news_mention",
+    "tech_first_seen",
+    "social_post",
+    "competitor_touch",
+    "engagement",
+})
+
+# Only EDGAR-grounded funding triggers instant alerts (via edgar.push_instant_alerts)
+INSTANT_ALERT_TYPES = frozenset({"funding_round"})
 
 EVENT_WEIGHTS = {
     "funding_round": 30,
-    "role_first_seen": 18,
-    "role_spike": 22,
-    "concept_first_seen": 15,
-    "concept_spike": 20,
-    "tech_first_seen": 10,
-    "tech_investment": 14,
-    "headcount_jump": 16,
-    "hiring_surge": 20,
-    "social_post": 8,
-    "job_change": 15,
     "exec_hire": 18,
+    "job_change": 15,
+    "product_launch": 18,
+    "gov_contract": 20,
+    "role_spike": 14,
+    "hiring_surge": 14,
+    "concept_spike": 20,
+    "role_first_seen": 18,
+    "concept_first_seen": 15,
+    "news_mention": 10,
+    "tech_first_seen": 10,
+    "social_post": 8,
     "engagement": 12,
     "competitor_touch": 14,
-    "product_launch": 18,
-    "pricing_change": 14,
-    "news_mention": 10,
-    "gov_contract": 20,
 }
 
 
@@ -51,10 +72,58 @@ class SignalEventDraft:
     source: str
     confidence: float = 1.0
     observed_at: Optional[datetime] = None
+    evidence_url: Optional[str] = None
+    event_date: Optional[datetime] = None
 
     def dedupe_key(self, company_id: str) -> str:
         key = self.payload.get("key", self.title[:80])
         return f"{company_id}:{self.event_type}:{key}"
+
+
+def parse_event_date(value: Any) -> Optional[datetime]:
+    """Best-effort parse of event dates from RSS/ISO/email strings."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if "T" in s and len(s) >= 10:
+            dt = datetime.fromisoformat(s)
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+    try:
+        dt = parsedate_to_datetime(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError, IndexError):
+        pass
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s[:10], fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def draft_from_extra(raw: dict) -> SignalEventDraft:
+    """Build a draft from pipeline extra_events dict."""
+    payload = raw.get("payload") or {}
+    evidence = raw.get("evidence_url") or payload.get("url")
+    event_date = parse_event_date(raw.get("event_date") or payload.get("date") or payload.get("filed_at"))
+    return SignalEventDraft(
+        raw.get("event_type", "social_post"),
+        raw.get("title", ""),
+        payload,
+        raw.get("source", "enrichment"),
+        confidence=float(raw.get("confidence", 0.85)),
+        evidence_url=evidence,
+        event_date=event_date,
+    )
 
 
 def _role_family(title: str) -> str:
@@ -105,25 +174,19 @@ def snapshot_from_result(result: dict) -> dict:
     }
 
 
-def diff_snapshots(prev: Optional[dict], curr: dict) -> list[SignalEventDraft]:
+def diff_snapshots(
+    prev: Optional[dict],
+    curr: dict,
+    *,
+    careers_url: Optional[str] = None,
+    changelog_url: Optional[str] = None,
+) -> list[SignalEventDraft]:
     """Compare two snapshot dicts and return event drafts."""
     if not prev:
         return []
 
     events: list[SignalEventDraft] = []
     now = datetime.now(timezone.utc)
-
-    prev_stage = prev.get("funding_stage")
-    curr_stage = curr.get("funding_stage")
-    if curr_stage and curr_stage != prev_stage:
-        events.append(SignalEventDraft(
-            "funding_round",
-            f"Funding stage moved {prev_stage or 'unknown'} → {curr_stage}"
-            + (f" (total raised {curr['total_raised']})" if curr.get("total_raised") else ""),
-            {"key": curr_stage, "prev": prev_stage, "curr": curr_stage},
-            "jina_news",
-            observed_at=now,
-        ))
 
     pc, cc = prev.get("hiring_count") or 0, curr.get("hiring_count") or 0
     if pc > 0 and cc >= pc * 1.5:
@@ -133,6 +196,8 @@ def diff_snapshots(prev: Optional[dict], curr: dict) -> list[SignalEventDraft]:
             {"key": "hiring_count", "prev": pc, "curr": cc},
             "job_boards",
             observed_at=now,
+            evidence_url=careers_url,
+            event_date=now,
         ))
 
     prev_fams = {_role_family(r) for r in (prev.get("hiring_roles") or [])}
@@ -147,6 +212,8 @@ def diff_snapshots(prev: Optional[dict], curr: dict) -> list[SignalEventDraft]:
             "job_boards",
             confidence=0.9,
             observed_at=now,
+            evidence_url=careers_url,
+            event_date=now,
         ))
 
     prev_tech = set(prev.get("tech_stack") or [])
@@ -158,36 +225,9 @@ def diff_snapshots(prev: Optional[dict], curr: dict) -> list[SignalEventDraft]:
             "tech_detect",
             confidence=0.7,
             observed_at=now,
+            event_date=now,
         ))
 
-    ph, ch = prev.get("headcount") or 0, curr.get("headcount") or 0
-    if ph > 0 and ch >= ph * 1.2:
-        events.append(SignalEventDraft(
-            "headcount_jump",
-            f"Headcount grew ~{ph} → ~{ch} (+{(ch - ph) / ph * 100:.0f}%)",
-            {"key": "headcount", "prev": ph, "curr": ch},
-            "apollo_kg",
-            observed_at=now,
-        ))
-
-    # Pricing page changed (fingerprint diff — both snapshots must have one)
-    prev_fp = prev.get("page_fingerprints") or {}
-    curr_fp = curr.get("page_fingerprints") or {}
-    if prev_fp.get("pricing") and curr_fp.get("pricing") and prev_fp["pricing"] != curr_fp["pricing"]:
-        title = "Pricing page changed"
-        if curr.get("pricing_model") and curr.get("pricing_model") != prev.get("pricing_model"):
-            title += f" (model: {prev.get('pricing_model') or 'unknown'} → {curr['pricing_model']})"
-        events.append(SignalEventDraft(
-            "pricing_change",
-            title,
-            {"key": curr_fp["pricing"], "prev_fp": prev_fp["pricing"], "curr_fp": curr_fp["pricing"],
-             "pricing_model": curr.get("pricing_model")},
-            "website_pages",
-            confidence=0.8,
-            observed_at=now,
-        ))
-
-    # New launches in changelog vs previous snapshot
     prev_launches = {l.strip().lower() for l in (prev.get("recent_launches") or [])}
     for launch in (curr.get("recent_launches") or []):
         if launch.strip().lower() not in prev_launches:
@@ -198,12 +238,19 @@ def diff_snapshots(prev: Optional[dict], curr: dict) -> list[SignalEventDraft]:
                 "website_pages",
                 confidence=0.85,
                 observed_at=now,
+                evidence_url=changelog_url,
+                event_date=now,
             ))
 
     return events
 
 
-def diff_job_posts(session: Session, company_id: str) -> list[SignalEventDraft]:
+def diff_job_posts(
+    session: Session,
+    company_id: str,
+    *,
+    careers_url: Optional[str] = None,
+) -> list[SignalEventDraft]:
     """Emit role/concept spike events from discovery_job_post history."""
     now = datetime.now(timezone.utc)
     events: list[SignalEventDraft] = []
@@ -225,6 +272,8 @@ def diff_job_posts(session: Session, company_id: str) -> list[SignalEventDraft]:
                 "job_posts",
                 confidence=0.85,
                 observed_at=now,
+                evidence_url=careers_url,
+                event_date=now,
             ))
 
     concept_rows = session.execute(text("""
@@ -245,6 +294,8 @@ def diff_job_posts(session: Session, company_id: str) -> list[SignalEventDraft]:
             {"key": f"cspike:{row['concept']}", "count": row["n"]},
             "job_posts",
             observed_at=now,
+            evidence_url=careers_url,
+            event_date=now,
         ))
 
     first_concepts = session.execute(text("""
@@ -271,6 +322,8 @@ def diff_job_posts(session: Session, company_id: str) -> list[SignalEventDraft]:
             "job_posts",
             confidence=0.8,
             observed_at=now,
+            evidence_url=careers_url,
+            event_date=now,
         ))
 
     return events
@@ -341,14 +394,16 @@ def insert_events(
     for ev in events:
         dedupe = ev.dedupe_key(company_id)
         observed = ev.observed_at or datetime.now(timezone.utc)
+        event_date = ev.event_date or observed
         try:
             session.execute(text("""
                 INSERT INTO discovery_signal_event
                     (id, company_id, event_type, title, payload, source,
-                     observed_at, confidence, dedupe_key, created_at)
+                     observed_at, confidence, dedupe_key, evidence_url, event_date, created_at)
                 VALUES
                     (:id, :company_id, :event_type, :title, CAST(:payload AS jsonb),
-                     :source, :observed_at, :confidence, :dedupe_key, NOW())
+                     :source, :observed_at, :confidence, :dedupe_key,
+                     :evidence_url, :event_date, NOW())
                 ON CONFLICT (dedupe_key) DO NOTHING
             """), {
                 "id": str(uuid.uuid4()),
@@ -360,6 +415,8 @@ def insert_events(
                 "observed_at": observed,
                 "confidence": ev.confidence,
                 "dedupe_key": dedupe,
+                "evidence_url": ev.evidence_url,
+                "event_date": event_date,
             })
             inserted_types.append(ev.event_type)
         except Exception as exc:
@@ -379,46 +436,15 @@ def persist_snapshot_and_events(
     """
     snap = snapshot_from_result(result)
     prev = _load_latest_snapshot(session, company_id)
-    if prev is None:
-        baseline = result.get("baseline_fingerprints") or {}
-        if baseline.get("pricing"):
-            prev = {
-                "hiring_count": 0,
-                "hiring_roles": [],
-                "tech_stack": [],
-                "funding_stage": None,
-                "total_raised": None,
-                "headcount": None,
-                "buying_signals": [],
-                "concepts": [],
-                "pricing_model": None,
-                "page_fingerprints": {"pricing": baseline["pricing"], "changelog": ""},
-                "recent_launches": [],
-            }
-    events = diff_snapshots(prev, snap)
+    careers_url = f"https://{domain}/careers" if domain else None
+    changelog_url = f"https://{domain}/changelog" if domain else None
+
+    events = diff_snapshots(prev, snap, careers_url=careers_url, changelog_url=changelog_url)
     write_snapshot(session, company_id, snap)
 
-    events.extend(diff_job_posts(session, company_id))
+    events.extend(diff_job_posts(session, company_id, careers_url=careers_url))
 
     for raw in result.get("extra_events") or []:
-        events.append(SignalEventDraft(
-            raw.get("event_type", "social_post"),
-            raw.get("title", ""),
-            raw.get("payload") or {},
-            raw.get("source", "enrichment"),
-            confidence=float(raw.get("confidence", 0.85)),
-        ))
+        events.append(draft_from_extra(raw))
 
-    inserted = insert_events(session, company_id, events)
-
-    if domain and any(t in INSTANT_ALERT_TYPES for t in inserted):
-        try:
-            import settings as cfg
-            import redis as _redis
-            r = _redis.from_url(cfg.REDIS_URL, socket_connect_timeout=2)
-            alert_key = getattr(cfg, "SIGNALS_ALERT_KEY", "tellora:signals_alert")
-            r.rpush(alert_key, domain)
-        except Exception as exc:
-            logger.warning(f"Could not push instant alert for {domain}: {exc}")
-
-    return inserted
+    return insert_events(session, company_id, events)

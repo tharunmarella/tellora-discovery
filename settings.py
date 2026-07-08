@@ -42,12 +42,14 @@ SIGNALS_READY_KEY: str = "tellora:signals_ready"
 SIGNALS_ALERT_KEY: str = "tellora:signals_alert"
 
 # Staleness refresh caps (ARQ worker crons — daily)
-REFRESH_BATCH_CAP: int = int(os.getenv("REFRESH_BATCH_CAP", "2000"))
+REFRESH_BATCH_CAP: int = int(os.getenv("REFRESH_BATCH_CAP", "4500"))
 REFRESH_STALE_DAYS: int = int(os.getenv("REFRESH_STALE_DAYS", "30"))
 REFRESH_ICP_STALE_DAYS: int = int(os.getenv("REFRESH_ICP_STALE_DAYS", "14"))
 REFRESH_ICP_CAP: int = int(os.getenv("REFRESH_ICP_CAP", "500"))
-WATCHED_STALE_DAYS: int = int(os.getenv("WATCHED_STALE_DAYS", "6"))
-WATCHED_REFRESH_LIMIT: int = int(os.getenv("WATCHED_REFRESH_LIMIT", "300"))
+WATCHED_STALE_HOURS: int = int(os.getenv("WATCHED_STALE_HOURS", "20"))
+WATCHED_ORG_DAILY_BUDGET: int = int(os.getenv("WATCHED_ORG_DAILY_BUDGET", "200"))
+WATCHED_REFRESH_GLOBAL_CAP: int = int(os.getenv("WATCHED_REFRESH_GLOBAL_CAP", "2000"))
+WATCHED_REFRESH_CONCURRENCY: int = int(os.getenv("WATCHED_REFRESH_CONCURRENCY", "5"))
 JOB_POLL_ATS_CAP: int = int(os.getenv("JOB_POLL_ATS_CAP", "500"))
 JOB_POLL_FULL_ENRICH_CAP: int = int(os.getenv("JOB_POLL_FULL_ENRICH_CAP", "100"))
 
@@ -66,6 +68,11 @@ HEADCOUNT_REFRESH_LIMIT: int = int(os.getenv("HEADCOUNT_REFRESH_LIMIT", "500"))
 # Serper.dev — primary web search. Get a key at https://serper.dev
 # Falls back to DDG if not set.
 SERPER_API_KEY: str = os.getenv("SERPER_API_KEY", "")
+
+# Search-grounded profile backfill (funding/HQ only — never alertable events).
+PROFILE_BACKFILL_ENABLED: bool = os.getenv("PROFILE_BACKFILL_ENABLED", "true").lower() in (
+    "1", "true", "yes",
+)
 
 # When true, run site: ATS searches via Serper on job-board miss (1 query per ATS max).
 ATS_SERP_FALLBACK: bool = os.getenv("ATS_SERP_FALLBACK", "false").lower() in ("1", "true", "yes")

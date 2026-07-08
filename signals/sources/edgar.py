@@ -251,13 +251,33 @@ def _insert_funding_event(session: Session, company_id: str, filing: dict) -> No
         title += f" ({_fmt_amount(filing['amount_sold'])} already sold)"
     title += f" (filed {filing.get('filed_at')})"
 
+    evidence_url = None
+    cik = filing.get("cik")
+    acc = filing.get("accession_no")
+    doc = filing.get("doc") or "primary_doc.xml"
+    if cik and acc:
+        evidence_url = _ARCHIVE_URL.format(
+            cik=int(cik),
+            acc_nodash=acc.replace("-", ""),
+            doc=doc,
+        )
+
+    event_date = datetime.now(timezone.utc)
+    filed_at = filing.get("filed_at")
+    if filed_at:
+        try:
+            if isinstance(filed_at, str) and len(filed_at) >= 10:
+                event_date = datetime.strptime(filed_at[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+
     session.execute(text("""
         INSERT INTO discovery_signal_event
             (id, company_id, event_type, title, payload, source,
-             observed_at, confidence, dedupe_key, created_at)
+             observed_at, confidence, dedupe_key, evidence_url, event_date, created_at)
         VALUES
             (:id, :company_id, 'funding_round', :title, CAST(:payload AS jsonb),
-             'sec_edgar', :observed_at, 0.9, :dedupe_key, NOW())
+             'sec_edgar', :observed_at, 0.9, :dedupe_key, :evidence_url, :event_date, NOW())
         ON CONFLICT (dedupe_key) DO NOTHING
     """), {
         "id": str(uuid.uuid4()),
@@ -273,9 +293,12 @@ def _insert_funding_event(session: Session, company_id: str, filing: dict) -> No
             "amount_sold": filing.get("amount_sold"),
             "industry_group": filing.get("industry_group"),
             "executives": execs or None,
+            "url": evidence_url,
         }),
         "observed_at": datetime.now(timezone.utc),
         "dedupe_key": f"{company_id}:funding_round:edgar:{filing['accession_no']}",
+        "evidence_url": evidence_url,
+        "event_date": event_date,
     })
 
 

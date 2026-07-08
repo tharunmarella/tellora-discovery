@@ -292,5 +292,7 @@ class WorkerSettings:
         ),
         # Consolidated daily maintenance (watched → tiered refresh → jobs → headcount → ingest).
         cron(daily_discovery_maintenance_task, hour=4, minute=0),
+        # EDGAR Form D — every 6h for 48h funding SLA headroom (idempotent via dedupe_key).
+        cron(poll_edgar_form_d_task, hour={0, 6, 12, 18}, minute=15),
         cron(reconcile_pending_task, minute={0, 10, 20, 30, 40, 50}),
     ]

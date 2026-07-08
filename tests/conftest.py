@@ -108,13 +108,20 @@ def _patch_engines(engine) -> None:
     enqueue._engine = engine
 
 
-def _ensure_org_research_table(conn) -> None:
+def _ensure_company_watch_table(conn) -> None:
     conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS org_research_company (
+        CREATE TABLE IF NOT EXISTS company (
             id VARCHAR PRIMARY KEY,
-            company_id VARCHAR NOT NULL,
-            org_id VARCHAR,
-            created_at TIMESTAMPTZ DEFAULT NOW()
+            org_id VARCHAR NOT NULL,
+            name VARCHAR NOT NULL,
+            domain VARCHAR,
+            deleted_at TIMESTAMPTZ,
+            discovery_company_id VARCHAR,
+            watch_source VARCHAR,
+            why_fit TEXT,
+            watched_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
         )
     """))
 
@@ -151,7 +158,7 @@ def pg_engine():
             for stmt in database._ENSURE_COLUMNS_SQL.strip().split("\n"):
                 if stmt.strip():
                     conn.execute(text(stmt))
-            _ensure_org_research_table(conn)
+            _ensure_company_watch_table(conn)
 
         yield engine
         engine.dispose()
@@ -163,7 +170,7 @@ _TRUNCATE_ORDER = [
     "discovery_job_post",
     "discovery_edge",
     "discovery_filing",
-    "org_research_company",
+    "company",
     "discovery_progress",
     "discovery_company",
 ]
@@ -236,19 +243,28 @@ def company_factory(db_session):
 
 @pytest.fixture
 def watched_company_factory(db_session, company_factory):
-    """Create discovery_company + org_research_company link."""
+    """Create discovery_company + org company watch link."""
 
     def _create(**kwargs) -> str:
-        company_id = company_factory(**kwargs)
+        discovery_id = company_factory(**kwargs)
         db_session.execute(
             text("""
-                INSERT INTO org_research_company (id, company_id, org_id)
-                VALUES (:id, :company_id, :org_id)
+                INSERT INTO company (
+                    id, org_id, name, domain, discovery_company_id, watch_source, watched_at
+                )
+                VALUES (:id, :org_id, :name, :domain, :discovery_company_id, :watch_source, NOW())
             """),
-            {"id": str(uuid.uuid4()), "company_id": company_id, "org_id": "org-test"},
+            {
+                "id": str(uuid.uuid4()),
+                "org_id": "org-test",
+                "name": kwargs.get("name", "Acme Corp"),
+                "domain": kwargs.get("domain", "acme.com"),
+                "discovery_company_id": discovery_id,
+                "watch_source": "manual",
+            },
         )
         db_session.flush()
         db_session.commit()
-        return company_id
+        return discovery_id
 
     return _create

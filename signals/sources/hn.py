@@ -97,6 +97,8 @@ def hn_extra_events(hn: dict) -> list[dict]:
             },
             "source": "hacker_news",
             "confidence": 0.7,
+            "evidence_url": m.get("url"),
+            "event_date": m.get("created_at"),
         })
     for l in hn.get("launches") or []:
         events.append({
@@ -109,5 +111,7 @@ def hn_extra_events(hn: dict) -> list[dict]:
             },
             "source": "hacker_news",
             "confidence": 0.85,
+            "evidence_url": l.get("url"),
+            "event_date": l.get("created_at"),
         })
     return events

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
@@ -22,18 +23,28 @@ logger = logging.getLogger("discovery.monitoring")
 
 _engine = make_engine(pool_recycle=300, pool_size=3, max_overflow=5)
 
-_SELECT_WATCHED_STALE = text("""
-    SELECT DISTINCT dc.id, dc.name, dc.domain, dc.description, dc.industry,
-           dc.raw_meta, dc.headcount, dc.headquarters
-    FROM discovery_company dc
-    JOIN org_research_company orc ON orc.company_id = dc.id
-    WHERE dc.domain IS NOT NULL
-      AND dc.domain_resolved = true
-      AND (
-          dc.signal_enriched_at IS NULL
-          OR dc.signal_enriched_at < NOW() - make_interval(days => :stale_days)
-      )
-    LIMIT :lim
+_SELECT_WATCHED_STALE_CANDIDATES = text("""
+    WITH candidates AS (
+        SELECT dc.id, dc.name, dc.domain, dc.description, dc.industry,
+               dc.raw_meta, dc.headcount, dc.headquarters, c.org_id,
+               ROW_NUMBER() OVER (
+                   PARTITION BY c.org_id
+                   ORDER BY dc.signal_enriched_at NULLS FIRST
+               ) AS org_rank
+        FROM discovery_company dc
+        JOIN company c ON c.discovery_company_id = dc.id AND c.deleted_at IS NULL
+        WHERE dc.domain IS NOT NULL
+          AND dc.domain_resolved = true
+          AND (
+              dc.signal_enriched_at IS NULL
+              OR dc.signal_enriched_at < NOW() - make_interval(hours => :stale_hours)
+          )
+    )
+    SELECT id, name, domain, description, industry, raw_meta, headcount, headquarters,
+           org_id, org_rank
+    FROM candidates
+    WHERE org_rank <= :org_budget
+    ORDER BY org_id, org_rank
 """)
 
 _SELECT_STALE_INDEX = text("""
@@ -46,7 +57,7 @@ _SELECT_STALE_INDEX = text("""
           OR signal_enriched_at < NOW() - make_interval(days => :stale_days)
       )
       AND NOT EXISTS (
-          SELECT 1 FROM org_research_company orc WHERE orc.company_id = dc.id
+          SELECT 1 FROM company c WHERE c.discovery_company_id = dc.id AND c.deleted_at IS NULL
       )
       AND NOT (
           (source_profiles IS NOT NULL AND cardinality(source_profiles) > 0)
@@ -66,7 +77,7 @@ _SELECT_ICP_HOT_STALE = text("""
           OR signal_enriched_at < NOW() - make_interval(days => :stale_days)
       )
       AND NOT EXISTS (
-          SELECT 1 FROM org_research_company orc WHERE orc.company_id = dc.id
+          SELECT 1 FROM company c WHERE c.discovery_company_id = dc.id AND c.deleted_at IS NULL
       )
       AND (
           (source_profiles IS NOT NULL AND cardinality(source_profiles) > 0)
@@ -89,9 +100,81 @@ _SELECT_ATS_CACHED = text("""
 _SELECT_WATCHED_FOR_JOBS = text("""
     SELECT DISTINCT dc.id, dc.name, dc.domain, dc.ats_board
     FROM discovery_company dc
-    JOIN org_research_company orc ON orc.company_id = dc.id
+    JOIN company c ON c.discovery_company_id = dc.id AND c.deleted_at IS NULL
     WHERE dc.domain IS NOT NULL
 """)
+
+
+def select_watched_refresh_candidates(
+    candidates: list[dict],
+    *,
+    global_cap: int,
+) -> tuple[list[dict], dict[str, int]]:
+    """
+    Round-robin interleave per-org ranked candidates; dedupe shared discovery rows.
+    Returns (rows to refresh, per-org slot consumption counts).
+    """
+    if not candidates or global_cap <= 0:
+        return [], {}
+
+    by_org_rank: dict[tuple[str, int], list[str]] = defaultdict(list)
+    company_fields: dict[str, dict] = {}
+
+    for row in candidates:
+        cid = str(row["id"])
+        org_id = str(row["org_id"])
+        rank = int(row["org_rank"])
+        by_org_rank[(org_id, rank)].append(cid)
+        if cid not in company_fields:
+            company_fields[cid] = {
+                "id": row["id"],
+                "name": row["name"],
+                "domain": row["domain"],
+                "description": row.get("description"),
+                "industry": row.get("industry"),
+                "raw_meta": row.get("raw_meta"),
+                "headcount": row.get("headcount"),
+                "headquarters": row.get("headquarters"),
+            }
+
+    org_ids = sorted({org for org, _ in by_org_rank.keys()})
+    selected_ids: set[str] = set()
+    selected: list[dict] = []
+    org_stats: dict[str, int] = defaultdict(int)
+    rank = 1
+    max_rank = max(r for _, r in by_org_rank.keys()) if by_org_rank else 0
+
+    while len(selected) < global_cap and rank <= max_rank:
+        found_any = False
+        for org_id in org_ids:
+            if len(selected) >= global_cap:
+                break
+            for cid in by_org_rank.get((org_id, rank), []):
+                if cid in selected_ids:
+                    continue
+                selected_ids.add(cid)
+                selected.append(company_fields[cid])
+                org_stats[org_id] += 1
+                found_any = True
+                if len(selected) >= global_cap:
+                    break
+        if not found_any:
+            rank += 1
+            continue
+        rank += 1
+
+    return selected, dict(org_stats)
+
+
+def load_watched_stale_candidates(session: Session) -> list[dict]:
+    rows = session.execute(
+        _SELECT_WATCHED_STALE_CANDIDATES,
+        {
+            "stale_hours": cfg.WATCHED_STALE_HOURS,
+            "org_budget": cfg.WATCHED_ORG_DAILY_BUDGET,
+        },
+    ).mappings().all()
+    return [dict(r) for r in rows]
 
 
 async def _refresh_company(row: dict, sem: asyncio.Semaphore) -> None:
@@ -122,29 +205,33 @@ async def _refresh_company(row: dict, sem: asyncio.Semaphore) -> None:
             )
 
 
-async def _refresh_rows(rows: list[dict], *, label: str) -> dict:
+async def _refresh_rows(
+    rows: list[dict],
+    *,
+    label: str,
+    concurrency: int | None = None,
+) -> dict:
     if not rows:
         return {"refreshed": 0}
-    sem = asyncio.Semaphore(5)
+    sem = asyncio.Semaphore(concurrency or cfg.WATCHED_REFRESH_CONCURRENCY)
     await asyncio.gather(*[_refresh_company(r, sem) for r in rows])
     logger.info("Refreshed %d %s companies", len(rows), label)
     return {"refreshed": len(rows)}
 
 
 async def refresh_watched_companies_task(ctx) -> dict:
-    """Daily: re-enrich watched accounts older than WATCHED_STALE_DAYS."""
+    """Daily: re-enrich watched accounts older than WATCHED_STALE_HOURS."""
     with Session(_engine) as session:
-        rows = [
-            dict(r)
-            for r in session.execute(
-                _SELECT_WATCHED_STALE,
-                {
-                    "stale_days": cfg.WATCHED_STALE_DAYS,
-                    "lim": cfg.WATCHED_REFRESH_LIMIT,
-                },
-            ).mappings().all()
-        ]
-    return await _refresh_rows(rows, label="watched")
+        candidates = load_watched_stale_candidates(session)
+    rows, org_stats = select_watched_refresh_candidates(
+        candidates,
+        global_cap=cfg.WATCHED_REFRESH_GLOBAL_CAP,
+    )
+    result = await _refresh_rows(rows, label="watched")
+    result["org_stats"] = org_stats
+    result["candidates"] = len(candidates)
+    result["selected"] = len(rows)
+    return result
 
 
 async def refresh_icp_hot_task(ctx) -> dict:
@@ -169,7 +256,7 @@ async def refresh_cold_index_task(ctx) -> dict:
     """Daily: refresh cold index companies beyond REFRESH_STALE_DAYS."""
     cold_cap = max(
         0,
-        cfg.REFRESH_BATCH_CAP - cfg.WATCHED_REFRESH_LIMIT - cfg.REFRESH_ICP_CAP,
+        cfg.REFRESH_BATCH_CAP - cfg.WATCHED_REFRESH_GLOBAL_CAP - cfg.REFRESH_ICP_CAP,
     )
     if cold_cap == 0:
         return {"refreshed": 0, "tier": "cold"}

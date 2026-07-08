@@ -99,8 +99,11 @@ def gov_extra_events(awards: list[dict]) -> list[dict]:
                 "agency": agency,
                 "date": a.get("date"),
                 "recipient": a.get("recipient"),
+                "url": f"https://www.usaspending.gov/award/{a['award_id']}" if a.get("award_id") else None,
             },
             "source": "usaspending",
             "confidence": 0.9,
+            "evidence_url": f"https://www.usaspending.gov/award/{a['award_id']}" if a.get("award_id") else None,
+            "event_date": a.get("date"),
         })
     return events

@@ -178,16 +178,21 @@ def github_extra_events(gh: dict) -> list[dict]:
     """Convert new public repos and npm releases into product_launch extra_events."""
     events = []
     for repo in (gh.get("new_repos") or [])[:3]:
+        repo_url = f"https://github.com/{gh.get('org')}/{repo['name']}" if gh.get("org") else None
         events.append({
             "event_type": "product_launch",
             "title": f"New public GitHub repo: {repo['name']}"
                      + (f" ({repo['stars']}★)" if repo.get("stars") else ""),
             "payload": {"key": f"gh:{repo['name']}", "repo": repo["name"],
-                        "stars": repo.get("stars", 0), "created_at": repo.get("created_at")},
+                        "stars": repo.get("stars", 0), "created_at": repo.get("created_at"),
+                        "url": repo_url},
             "source": "github",
             "confidence": 0.7,
+            "evidence_url": repo_url,
+            "event_date": repo.get("created_at"),
         })
     for pkg in (gh.get("new_npm_releases") or [])[:3]:
+        pkg_url = f"https://www.npmjs.com/package/{pkg['name']}"
         events.append({
             "event_type": "product_launch",
             "title": f"npm release: {pkg['name']}@{pkg.get('version', '?')}",
@@ -196,8 +201,11 @@ def github_extra_events(gh: dict) -> list[dict]:
                 "package": pkg["name"],
                 "version": pkg.get("version"),
                 "date": pkg.get("date"),
+                "url": pkg_url,
             },
             "source": "npm",
             "confidence": 0.6,
+            "evidence_url": pkg_url,
+            "event_date": pkg.get("date"),
         })
     return events

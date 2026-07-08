@@ -381,65 +381,6 @@ def page_fingerprint(text_content: str) -> str:
     return hashlib.sha1(normalized.encode()).hexdigest()[:16]
 
 
-async def fetch_wayback_fingerprint(domain: str, path: str = "/pricing") -> str:
-    """
-    Historical page fingerprint via Wayback CDX + Jina (cold-start for pricing diffs).
-    Finds a snapshot 30-90 days old and fingerprints normalized text.
-    """
-    if not domain:
-        return ""
-    url = f"{domain}{path}" if path.startswith("/") else f"{domain}/{path}"
-    if not url.startswith("http"):
-        url = f"https://{url}"
-
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
-                "http://web.archive.org/cdx/search/cdx",
-                params={
-                    "url": url,
-                    "output": "json",
-                    "filter": "statuscode:200",
-                    "limit": "-20",
-                },
-            )
-            if resp.status_code != 200:
-                return ""
-            rows = resp.json()
-            if len(rows) < 2:
-                return ""
-
-            now = datetime.now(timezone.utc)
-            target_ts = None
-            for row in reversed(rows[1:]):
-                if len(row) < 2:
-                    continue
-                ts = row[1]
-                if len(ts) < 8:
-                    continue
-                try:
-                    snap_dt = datetime.strptime(ts[:8], "%Y%m%d").replace(tzinfo=timezone.utc)
-                except ValueError:
-                    continue
-                age_days = (now - snap_dt).days
-                if 30 <= age_days <= 90:
-                    target_ts = ts
-                    break
-
-            if not target_ts and len(rows) > 1:
-                target_ts = rows[1][1]
-
-            if not target_ts:
-                return ""
-
-            archived = f"https://web.archive.org/web/{target_ts}/{url}"
-            text = await _jina_read(archived, max_chars=2000)
-            return page_fingerprint(text)
-    except Exception as exc:
-        logger.warning(f"Wayback fingerprint failed for {domain}{path}: {exc}")
-        return ""
-
-
 async def fetch_company_context(domain: str) -> dict:
     """
     Fetch homepage + /about + /careers + /pricing + /customers + /changelog
@@ -1016,22 +957,6 @@ def build_search_tsv(
 
 # ── Main per-company enrichment entry point ────────────────────────────────
 
-def _company_has_snapshot(company_id: str) -> bool:
-    from sqlalchemy import text as sa_text
-    from sqlalchemy.orm import Session
-    from database import engine
-
-    with Session(engine) as session:
-        row = session.execute(
-            sa_text(
-                "SELECT 1 FROM discovery_company_snapshot "
-                "WHERE company_id = :cid LIMIT 1"
-            ),
-            {"cid": company_id},
-        ).first()
-        return row is not None
-
-
 def _sources_had_data(
     *,
     ctx: dict,
@@ -1099,8 +1024,6 @@ async def _enrich_company_signals_impl(
     from signals.job_posts import fetch_job_board_posts
     from signals.sources.news import classify_news, fetch_company_news
 
-    cold_start = not _company_has_snapshot(company_id)
-
     ctx_task = asyncio.create_task(fetch_company_context(domain))
     news_task = asyncio.create_task(fetch_funding_news(company_name))
     tech_task = asyncio.create_task(detect_tech_stack(domain))
@@ -1110,18 +1033,12 @@ async def _enrich_company_signals_impl(
     rss_task = asyncio.create_task(fetch_company_news(company_name))
     hn_task = asyncio.create_task(fetch_hn_signals(company_name, domain))
     gov_task = asyncio.create_task(fetch_gov_awards(company_name))
-    if cold_start and domain:
-        wayback_task = asyncio.create_task(fetch_wayback_fingerprint(domain, "/pricing"))
-    else:
-        wayback_task = None
 
     need_apollo_hc = not (existing_headcount and existing_headcount > 0)
     gather_tasks = [
         ctx_task, news_task, tech_task, kg_task,
         dns_task, gh_task, rss_task, hn_task, gov_task,
     ]
-    if wayback_task is not None:
-        gather_tasks.append(wayback_task)
     if need_apollo_hc:
         apollo_task = asyncio.create_task(fetch_apollo_headcount(domain))
         gather_tasks.append(apollo_task)
@@ -1138,10 +1055,6 @@ async def _enrich_company_signals_impl(
     hn_data = gathered[7]
     gov_awards = gathered[8]
     idx = 9
-    baseline_pricing_fp = ""
-    if wayback_task is not None:
-        baseline_pricing_fp = gathered[idx]
-        idx += 1
     apollo_hc = gathered[idx] if need_apollo_hc else {}
 
     careers_html = "\n".join(
@@ -1218,6 +1131,8 @@ async def _enrich_company_signals_impl(
             "payload": {"key": h.get("url", h["title"])[:120], "url": h.get("url"), "date": h.get("date")},
             "source": "serper_news",
             "confidence": 0.85,
+            "evidence_url": h.get("url"),
+            "event_date": h.get("date"),
         }
         for h in (exec_news or [])[:2]
     ])
@@ -1254,6 +1169,14 @@ async def _enrich_company_signals_impl(
             "hq_region": hq_region,
             "hq_country": hq_country,
         })
+
+    from signals.profile_backfill import apply_profile_backfill
+    result = await apply_profile_backfill(
+        result,
+        company_name=company_name,
+        serper_kg=serper_kg,
+        existing_headquarters=existing_headquarters,
+    )
 
     sources_had_data = _sources_had_data(
         ctx=ctx,
@@ -1345,9 +1268,6 @@ async def _enrich_company_signals_impl(
             "pricing": page_fingerprint(pricing_text),
             "changelog": page_fingerprint(changelog_text),
         },
-        "baseline_fingerprints": {
-            "pricing": baseline_pricing_fp,
-        } if baseline_pricing_fp else {},
         "github_org": github.get("org"),
         "extra_events": extra_events,
     }
