@@ -40,3 +40,11 @@ def test_gov_extra_events():
     assert len(events) == 1
     assert events[0]["event_type"] == "gov_contract"
     assert "$2.5M" in events[0]["title"]
+
+
+def test_github_empty_results_do_not_share_lists():
+    from signals.sources.github import _empty
+
+    a, b = _empty(), _empty()
+    a["new_npm_releases"].append({"name": "@arcxp/x"})
+    assert b["new_npm_releases"] == []

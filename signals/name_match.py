@@ -107,14 +107,22 @@ def adjust_events_confidence(events: list[dict], company_name: str) -> list[dict
     return adjusted
 
 
+# Sources tied to the company by identity (its own feed, its CIK, its UEI, its
+# GitHub org) rather than a name search — their titles needn't repeat the name.
+IDENTITY_SOURCES = frozenset({
+    "company_feed", "sec_edgar", "sec_8k", "usaspending", "warn_notice", "github", "npm",
+})
+
+
 def filter_events_by_relevance(events: list[dict], company_name: str) -> list[dict]:
-    """Drop name-only events whose title doesn't mention the company."""
-    kept = []
+    """Drop name-searched events whose title doesn't mention the company."""
+    kept, trusted = [], []
     for ev in events:
-        title = ev.get("title") or ""
-        if title_mentions_company(title, company_name):
+        if ev.get("source") in IDENTITY_SOURCES:
+            trusted.append(ev)
+        elif title_mentions_company(ev.get("title") or "", company_name):
             kept.append(ev)
-    return adjust_events_confidence(kept, company_name)
+    return trusted + adjust_events_confidence(kept, company_name)
 
 
 def apply_funding_grounding(

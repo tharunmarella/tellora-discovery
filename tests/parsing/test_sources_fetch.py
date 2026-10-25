@@ -17,28 +17,56 @@ def test_edgar_normalize_name():
 
 
 @pytest.mark.asyncio
-@respx.mock
-async def test_fetch_recent_form_d_parses_hits():
-    respx.get("https://efts.sec.gov/LATEST/search-index").mock(
-        return_value=httpx.Response(200, json={
-            "hits": {
-                "hits": [
-                    {
-                        "_source": {
-                            "ciks": ["0001234567"],
-                            "display_names": ["Acme Inc"],
-                            "file_date": "2026-06-01",
-                            "file_num": "021-123456",
-                        },
-                        "_id": "0001234567:0001234567-26-000001",
-                    }
-                ]
-            }
-        })
-    )
+async def test_fetch_recent_form_d_lists_index(monkeypatch):
+    rows = [{"name": "Acme Inc", "cik": "1234567", "filed_at": "2026-06-01",
+             "accession_no": "0001234567-26-000001", "form": "D", "doc": "primary_doc.xml"}]
+    monkeypatch.setattr("signals.sources.edgar._list_filings_sync", lambda form, days: rows)
     filings = await fetch_recent_form_d(days=2)
-    assert len(filings) >= 1
     assert filings[0]["name"] == "Acme Inc"
+
+
+def test_parse_form_d_maps_edgartools_object():
+    from types import SimpleNamespace as NS
+
+    from signals.sources.edgar import parse_form_d
+
+    form_d = NS(
+        offering_data=NS(
+            industry_group=NS(industry_group_type="Other Technology"),
+            date_of_first_sale="2026-10-15",
+            offering_sales_amounts=NS(total_offering_amount="12000000", total_amount_sold="9500000"),
+            revenue_range="Decline to Disclose",
+            is_new=True,
+            business_combination_transaction=NS(is_business_combination=False),
+        ),
+        primary_issuer=NS(primary_address=NS(state_or_country_description="CALIFORNIA")),
+        related_persons=[NS(first_name="Jane", last_name="Doe", relationships=["Executive Officer", "Director"])],
+    )
+    out = parse_form_d(form_d)
+    assert out["is_tech"] and out["is_new"]
+    assert out["offering_amount"] == 12_000_000 and out["amount_sold"] == 9_500_000
+    assert out["state"] == "CALIFORNIA"
+    assert out["related_persons"] == [{"name": "Jane Doe", "relationship": "Executive Officer, Director"}]
+
+
+def test_parse_form_d_indefinite_amount_and_pooled_fund():
+    from types import SimpleNamespace as NS
+
+    from signals.sources.edgar import parse_form_d
+
+    form_d = NS(
+        offering_data=NS(
+            industry_group=NS(industry_group_type="Pooled Investment Fund"),
+            date_of_first_sale="",
+            offering_sales_amounts=NS(total_offering_amount="Indefinite", total_amount_sold="0"),
+            revenue_range=None, is_new=False, business_combination_transaction=None,
+        ),
+        primary_issuer=None,
+        related_persons=[],
+    )
+    out = parse_form_d(form_d)
+    assert not out["is_tech"] and not out["is_new"]
+    assert out["offering_amount"] is None and out["amount_sold"] is None
 
 
 @pytest.mark.asyncio
@@ -110,6 +138,27 @@ async def test_fetch_gov_awards_parses_results():
     awards = await fetch_gov_awards("Acme Corp")
     assert len(awards) == 1
     assert awards[0]["amount"] == 1_000_000
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_fetch_gov_awards_drops_lookalike_recipients_and_returns_uei():
+    route = respx.post("https://api.usaspending.gov/api/v2/search/spending_by_award/").mock(
+        return_value=httpx.Response(200, json={"results": [
+            {"Award ID": "A1", "Recipient Name": "ORIGINAL FOOTWEAR MANUFACTURING BR INC",
+             "Recipient UEI": "ZZZ", "Award Amount": 50_000, "Awarding Agency": "DLA"},
+            {"Award ID": "A2", "Recipient Name": "TAGUP, INC", "Recipient UEI": "SC7GGDPKXTY4",
+             "Award Amount": 4_137_996, "Awarding Agency": "Department of Defense",
+             "Base Obligation Date": "2026-09-01"},
+        ]})
+    )
+    awards = await fetch_gov_awards("Tagup")
+    assert [a["award_id"] for a in awards] == ["A2"]
+    assert awards[0]["uei"] == "SC7GGDPKXTY4" and awards[0]["date"] == "2026-09-01"
+
+    await fetch_gov_awards("Tagup", uei="SC7GGDPKXTY4")
+    import json as _json
+    assert _json.loads(route.calls[-1].request.content)["filters"]["recipient_search_text"] == ["SC7GGDPKXTY4"]
 
 
 def test_strip_html():

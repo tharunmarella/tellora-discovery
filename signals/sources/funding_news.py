@@ -1,7 +1,9 @@
 """
-Funding news snippets for Gemini synthesis.
+Funding news snippets for Gemini synthesis — Google News RSS (free).
 
-Serper News when SERPER_API_KEY is set; Google News RSS fallback (free).
+Serper News was the paid primary; it searched the same Google News index by
+name, so it cost money without adding coverage. Structured funding comes from
+SEC Form D and the company's own feed; these snippets only ground the summary.
 """
 
 from __future__ import annotations
@@ -12,13 +14,11 @@ from urllib.parse import quote
 
 import httpx
 
-import settings as cfg
 from signals.name_match import title_mentions_company
 
 logger = logging.getLogger("discovery.funding_news")
 
 _MAX_SNIPPETS = 4
-_SERPER_POOL = 8
 _RSS_POOL = 12
 _RSS_DAYS = 30
 
@@ -62,48 +62,6 @@ def _filter_snippets(
     return snippets
 
 
-async def _fetch_serper_funding_news(company_name: str) -> list[str]:
-    if not cfg.SERPER_API_KEY:
-        return []
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                "https://google.serper.dev/news",
-                headers={
-                    "X-API-KEY": cfg.SERPER_API_KEY,
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "q": (
-                        f'"{company_name}" funding OR raised OR "Series" '
-                        f'OR investment OR "seed round"'
-                    ),
-                    "num": _SERPER_POOL,
-                    "tbs": "qdr:m6",
-                },
-            )
-            resp.raise_for_status()
-            hits = [
-                (
-                    (h.get("title") or "").strip(),
-                    (h.get("snippet") or "").strip(),
-                    (h.get("link") or "").strip(),
-                )
-                for h in resp.json().get("news", [])[:_SERPER_POOL]
-            ]
-            snippets = _filter_snippets(hits, company_name)
-            if snippets:
-                logger.info(
-                    "Funding news (Serper) for '%s': %d snippets",
-                    company_name,
-                    len(snippets),
-                )
-            return snippets
-    except Exception as exc:
-        logger.warning("Serper funding news failed for '%s': %s", company_name, exc)
-        return []
-
-
 async def _fetch_rss_funding_news(company_name: str) -> list[str]:
     encoded_name = quote(company_name, safe="")
     url = _RSS_FUNDING_URL.format(name=encoded_name, days=_RSS_DAYS)
@@ -138,15 +96,7 @@ async def _fetch_rss_funding_news(company_name: str) -> list[str]:
 
 
 async def fetch_funding_news(company_name: str) -> list[str]:
-    """
-    Recent funding headlines as text snippets for Gemini synthesis.
-    Tries Serper News first, then Google News RSS (no API key required).
-    """
+    """Recent funding headlines (mentioning the company) as text snippets for synthesis."""
     if not company_name:
         return []
-
-    snippets = await _fetch_serper_funding_news(company_name)
-    if snippets:
-        return snippets
-
     return await _fetch_rss_funding_news(company_name)

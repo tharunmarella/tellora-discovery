@@ -1,58 +1,57 @@
 # tellora-discovery
 
-Standalone Railway service that builds Tellora's pre-populated company database and serves on-demand signal enrichment.
+Standalone service for **on-demand company signal enrichment** (Watch / Enrich in the app). Company Search itself is an ICP-live feed in `tellora-backend` (LLM queries + web search). There is **no weekly Apollo census scrape**.
 
 ## What it does
 
-Queries Apollo's **free** People API Search (`mixed_people/api_search`) across 17 ICP profiles, enriches each company with Serper + Gemini, and stores results in the shared `discovery_company` PostgreSQL table. Zero Apollo credits consumed.
+The ARQ worker (`arq worker.WorkerSettings`, queue `arq:ondemand`) claims `discovery_company` rows and enriches them with Serper, Jina, ATS boards, and Gemini. The backend enqueues `enrich_company_task` when a rep Watches or Enrichs a company.
 
-**17 profiles:** DevTools · Logistics · Healthcare · Financial Services · Sales & Marketing · Cybersecurity · Construction · HR Tech · Real Estate · EdTech · Legal · Manufacturing · Retail · GovTech · Hospitality · Media & Advertising · Nonprofit
+Helpers still in `scrape/` are **not** a census pipeline: domain lookup and Apollo people-count used during enrichment / headcount refresh.
 
-**CEO filter trick:** All profiles search for `person_titles=CEO` — every company has one CEO, so each result is a unique company. Natural dedup, no client-side grouping needed.
+### Signal enrichment (per company)
 
-### Two disjoint enrichment paths
+1. **Pages** — homepage, /about, /careers, /pricing, /customers, /changelog: direct fetch + trafilatura (Jina Reader only for JS-only homepages)
+2. **Tech stack** — Wappalyzer-format fingerprints (HTTP Archive fork, ~4k technologies; GPL-3.0 data downloaded at runtime, not vendored) over headers, cookies, meta, scripts and DNS
+3. **Job boards** — Greenhouse, Lever, Ashby, SmartRecruiters, Workable, iCIMS, JazzHR, Rippling
+4. **First-party feed** — the company's own changelog / blog / newsroom RSS → launches, funding, exec, expansion
+5. **News** — Google News RSS, verified per headline against the company's domain + description (drops same-name companies, places, people)
+6. **Free sources** — GitHub/npm, HN, USAspending (matched by UEI once known), DNS
+7. **Gemini synthesis** → `buying_signals`, `signal_score`, embeddings
+8. **Signal diff** → typed events; adopt/drop tech only between full fingerprint runs; repeat reports of one event merge into it as extra sources
 
-1. **Weekly cron** (`python __main__.py`) — scrapes Apollo, enriches new companies inline, runs headcount backfill cap.
-2. **On-demand worker** (`arq worker.WorkerSettings`, queue `arq:ondemand`) — user-triggered enrichment from the app (single "Enrich" + bulk actions). Backend enqueues `enrich_company_task`.
+### Batch sources (cron)
 
-## Enrichment pipeline (per company)
+| Source | Library | Events |
+|--------|---------|--------|
+| SEC Form D (every 6h) | edgartools (daily form index — every filing, not one search page) | `funding_round`, auto-created startups |
+| SEC 8-K (every 6h) | edgartools; Item 5.02 / 2.01 | `exec_hire`, `exec_departure`, `acquisition` |
+| WARN notices (weekly) | warn-scraper (Big Local News) | `layoffs` |
+| Product Hunt (daily) | RSS | `product_launch` |
 
-### Scrape-time (Apollo ingest)
-
-1. **Serper search** `"{company} CEO: {ceo_first_name}"` → Google SERP results
-2. **Gemini** reads knowledgeGraph + organic results → domain, description, industries, CEO, HQ, funding
-3. **logo_url** from domain via Google Favicon API
-
-### Signal-time (buying signals)
-
-1. **Jina Reader** — homepage, /about, /careers, /pricing, /customers, /changelog
-2. **Job boards** — Greenhouse, Lever, Ashby, SmartRecruiters, Workable
-3. **Funding news** — Serper News (Google News RSS fallback)
-4. **Free sources** — GitHub, EDGAR Form D, Google News RSS, HN, USAspending, DNS, Wayback
-5. **Gemini synthesis** → `buying_signals`, `signal_score`, embeddings
-6. **Signal diff** → typed events (`funding_round`, `hiring_surge`, `product_launch`, …)
+All batch matching goes through `signals/entity.py`: legal-suffix cleaning (cleanco), exact / space-free / descriptor-suffix keys, no edit-distance fuzzing, and single common-word names (wordfreq) only match when the source's state equals the company's HQ state.
 
 Statuses: `pending` · `processing` · `enriched` · `partial` · `failed` · `skipped`
 
 ## Crash recovery
 
-After every committed page the service writes a checkpoint to `discovery_progress`. Signal enrichment uses a reconcile cron (~10 min) to re-queue stuck `processing` rows and retryable `failed`/`partial` companies.
+Signal enrichment uses a reconcile cron (~10 min) to re-queue stuck `processing` rows and retryable `failed`/`partial` companies.
 
 ## Scheduled jobs (freshness)
 
 | Job | Schedule (UTC) | What it refreshes |
 |-----|----------------|-------------------|
-| **Apollo scrape** (Railway) | Sun + Wed 3:00 | New companies + inline enrich + missing headcount (≤1000) |
-| **Watched re-enrich** (worker) | Daily 4:00 | Active research accounts stale >6d (≤300) |
-| **Index re-enrich** (worker) | Daily 5:00 | Full signals for rows stale >30d (≤2000) |
-| **Job posts** (worker) | Daily 6:00 | ATS hiring on watched accounts (≤100) |
-| **Headcount refresh** (worker) | Daily 7:00 | Re-fetch Apollo headcount when stale >30d (≤500) |
-| **EDGAR / Product Hunt** | Daily 10:00 / 11:00 | New funding/launch discovery |
+| **Watched re-enrich** (worker) | Daily 4:00 (via maintenance) | Active research accounts |
+| **Index re-enrich** (worker) | Daily (via maintenance) | Stale index rows |
+| **Job posts / headcount** | Daily (via maintenance) | ATS hiring + Apollo people-count |
+| **EDGAR Form D / 8-K** | Every 6h | Funding, exec changes, acquisitions |
+| **WARN notices** | Mon 3:10 | Layoffs (`WARN_STATES`, `WARN_LOOKBACK_DAYS`) |
+| **Product Hunt** | Periodic | Launch discovery |
 | **Reconcile** | Every 10 min | Stuck/failed enrichment retries |
+| **Jobhive import** | Sun 2:30 | Warm `ats_board` slugs |
 
-Tune via env: `REFRESH_STALE_DAYS`, `REFRESH_BATCH_CAP`, `WATCHED_STALE_DAYS`, `WATCHED_REFRESH_LIMIT`, `HEADCOUNT_REFRESH_*`.
+Tune via env: `REFRESH_STALE_DAYS`, `REFRESH_BATCH_CAP`, `WATCHED_*`, `HEADCOUNT_REFRESH_*`. See [`docs/DISCOVERY_SCHEDULERS.md`](../docs/DISCOVERY_SCHEDULERS.md).
 
-**One-time index backfill** (scrape metadata → signal re-enrich on all ~8.7K enriched rows):
+**One-time index backfill** (scrape metadata → signal re-enrich):
 
 ```bash
 ./scripts/run_index_reenrich.sh             # scrape backfill + full re-enrich
@@ -62,15 +61,14 @@ python scripts/backfill_scrape_fields.py --dry-run  # count eligible rows only
 
 ## Railway setup
 
-1. Add a new service in your Railway project.
+1. Add a service in your Railway project.
 2. **Root directory:** `tellora-discovery/`
-3. **Start command:** `python __main__.py`
-4. **Cron schedule:** `0 3 * * 0,3` (Sunday + Wednesday 3 AM UTC — Apollo scrape twice weekly)
-5. Set environment variables (see `.env.example`)
+3. **Start command:** `arq worker.WorkerSettings`
+4. Set environment variables (see `.env.example`)
 
-**Observability:** set `SENTRY_DSN` and `ENVIRONMENT=production` on **both** Railway services (weekly cron and on-demand worker). Without `SENTRY_DSN`, Sentry is disabled. Events are flushed on shutdown so the short-lived cron job does not drop captured errors.
+Do **not** run a second cron service with `python __main__.py` — that entrypoint is a no-op leftover. Delete the old Railway census cron if it still exists.
 
-For the always-on on-demand worker, deploy a second service with start command `arq worker.WorkerSettings`.
+**Observability:** set `SENTRY_DSN` and `ENVIRONMENT=production` on the worker. Without `SENTRY_DSN`, Sentry is disabled.
 
 ## Local testing
 
@@ -78,8 +76,7 @@ For the always-on on-demand worker, deploy a second service with start command `
 cd tellora-discovery
 pip install -r requirements.txt
 cp .env.example .env
-python __main__.py --dry-run
-python __main__.py
+arq worker.WorkerSettings
 python -m signals.runner --limit 10
 python scripts/test_batch.py
 python scripts/test_search.py
@@ -118,12 +115,10 @@ Blocks `git push` if:
 1. Non-live tests fail or scoped coverage drops below 75%
 2. E2E pipeline quality judge scores below threshold (per-company floor 7, mean >= 8)
 
-Judge model: `E2E_JUDGE_MODEL` (default `gemini-3.5-flash`) runs with **Google Search grounding**
-and is told today's date, so it verifies recent funding/launches/headcount against live search
-instead of its training memory (which would otherwise flag accurate recent facts as
-"hallucinations"). CI does **not** run e2e (no secrets in GitHub Actions).
+Judge model: `E2E_JUDGE_MODEL` (default `gemini-3.5-flash`) runs with **Google Search grounding**.
+CI does **not** run e2e (no secrets in GitHub Actions).
 
-Omitted from the coverage gate (live-only): `scrape/service.py`, `signals/pipeline.py`, `signals/runner.py`, `signals/sources/*`, etc. — see `.coveragerc`.
+Omitted from the coverage gate (live-only): `signals/pipeline.py`, `signals/runner.py`, `signals/sources/*`, etc. — see `.coveragerc`.
 
 Test layout:
 
@@ -131,7 +126,7 @@ Test layout:
 tests/
 ├── unit/           # diff, name_match, pipeline helpers, llm, source mappers
 ├── parsing/        # respx-mocked HTTP fetchers + Gemini synthesis
-├── integration/    # worker tasks, cron jobs, DB persistence (testcontainers)
+├── integration/    # worker tasks, DB persistence (testcontainers)
 ├── live/           # opt-in external API smoke tests
 └── e2e/            # LLM-judged pipeline quality gate (pre-push)
 ```
@@ -140,9 +135,7 @@ tests/
 
 ```
 tellora-discovery/
-├── __main__.py              # Weekly cron entry (scrape + inline enrich)
-├── cron/                    # Weekly cron job orchestration
-│   └── weekly.py
+├── __main__.py              # No-op (old census cron); use arq worker
 ├── tests/                   # pytest suite (unit / parsing / integration / live)
 ├── worker.py                # ARQ on-demand worker (arq:ondemand)
 ├── settings.py              # Env vars
@@ -151,47 +144,29 @@ tellora-discovery/
 ├── llm.py                   # Shared Gemini client
 ├── config_logging.py
 │
-├── scrape/                  # Apollo ingest + scrape-time domain lookup
-│   ├── service.py           # Checkpointed Apollo scrape orchestration
-│   ├── apollo_client.py     # Pagination + rate limiter
-│   ├── profiles.py          # 17 ICP filter configs
-│   ├── domain_lookup.py     # Serper + Gemini at scrape time
-│   └── headcount_backfill.py
+├── scrape/                  # Enrichment helpers (not a census scrape)
+│   ├── apollo_client.py     # Apollo people-count / pagination
+│   ├── domain_lookup.py     # Serper + Gemini domain resolve
+│   └── scrape_fields_backfill.py
 │
 ├── signals/                 # Buying-signal enrichment
 │   ├── pipeline.py          # Per-company orchestration (Jina, Gemini, …)
 │   ├── runner.py            # Batch backfill CLI + persist helper
+│   ├── headcount_backfill.py
 │   ├── diff.py              # Snapshot diff → typed events
 │   ├── edges.py             # discovery_edge graph
 │   ├── job_posts.py         # ATS fetch + concept extraction
 │   ├── monitoring.py        # Cron tasks + reconcile_pending
-│   ├── name_match.py        # Slug variants + relevance guards
-│   ├── constants.py         # Shared API URLs / timeouts
-│   ├── cache.py             # TTL LRU for in-process caches
 │   └── sources/
-│       ├── edgar.py         # SEC Form D poller
-│       ├── github.py
-│       ├── gov.py           # USAspending contracts
-│       ├── hn.py            # Hacker News
-│       └── news.py          # Google News RSS + Product Hunt
 │
 ├── infra/                   # Observability
-│   ├── axiom_arq.py
-│   ├── axiom_logger.py
-│   ├── sentry_init.py
-│   └── sentry_telemetry.py
-│
 └── scripts/                 # One-off POCs and backfills
 ```
 
 ## Rate limits
 
-- **Apollo:** 200 req/min, 600 req/hour — paces at ~1 req/sec
+- **Apollo:** 200 req/min, 600 req/hour — paces at ~1 req/sec (headcount / people lookup)
 - **Serper:** 50 req/sec
 - **Jina (unauth):** ~20 RPM — use `JINA_API_KEY` in production
 - **httpcloak (optional):** set `HTTPCLOAK_FALLBACK=true` + `pip install httpcloak` for JazzHR/iCIMS/tech-stack WAF bypass
-- **Signal worker:** `max_jobs=5`, `job_timeout=600s`, `max_tries=3`
-
-## Expected output
-
-~12,000 unique companies across all 17 profiles per weekly run (first run). Subsequent runs only add new companies Apollo has indexed since the last run.
+- **Signal worker:** `max_jobs` from `SIGNAL_ENRICH_MAX_JOBS`, `job_timeout=600s`, `max_tries=3`

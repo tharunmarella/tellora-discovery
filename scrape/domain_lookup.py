@@ -248,7 +248,7 @@ def _run_lookup(company_name: str, ceo_first_name: str, serper_api_key: str) -> 
     embed_parts = [
         p for p in (enrichment.get("description"), enrichment.get("industry")) if p
     ]
-    if embed_parts and cfg.GEMINI_API_KEY:
+    if embed_parts:
         vec = embed_text(" ".join(embed_parts))
         if vec:
             enrichment["description_embedding"] = vec

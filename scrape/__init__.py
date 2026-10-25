@@ -1,6 +1,5 @@
-"""Apollo scrape and scrape-time domain enrichment."""
+"""Helpers used by signal enrichment (domain lookup, Apollo people-count)."""
 
 from scrape.domain_lookup import lookup_domain
-from scrape.service import run_discovery_scrape
 
-__all__ = ["lookup_domain", "run_discovery_scrape"]
+__all__ = ["lookup_domain"]

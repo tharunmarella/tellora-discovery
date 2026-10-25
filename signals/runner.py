@@ -9,9 +9,8 @@ discovery_company rows. Use this for:
   - Manually retrying a large batch of failed companies
   - Ad-hoc dev/test runs
 
-In production, enrichment runs in two disjoint places:
-  - Weekly discovery cron (cron/weekly.py) → scrapes + enriches inline via run()
-  - Signal worker (worker.py, arq:ondemand) → user-triggered on-demand enrich
+In production, enrichment runs on the signal worker (worker.py, arq:ondemand)
+for user-triggered Watch / Enrich. This CLI is for manual backfill only.
 
 Usage:
   python -m signals.runner                       # backfill all pending
@@ -114,7 +113,7 @@ _UPDATE_SIGNAL = text("""
         hiring_roles             = CAST(:hiring_roles AS jsonb),
         hiring_count             = :hiring_count,
         tech_stack               = CAST(:tech_stack AS jsonb),
-        description_embedding    = CAST(:description_embedding AS vector),
+        description_embedding    = COALESCE(CAST(:description_embedding AS vector), description_embedding),  -- a failed embed keeps the old one
         search_tsv               = to_tsvector('english', :tsv_text),
         hq_city                  = :hq_city,
         hq_region                = :hq_region,
@@ -185,6 +184,12 @@ def persist_result(session: Session, company_id: str, result: dict) -> bool:
             "signal_enriched_at":       result.get("signal_enriched_at") or datetime.now(timezone.utc),
             "signal_enrichment_status": result.get("signal_enrichment_status", "enriched"),
         })
+        if result.get("raw_meta_patch"):
+            session.execute(text("""
+                UPDATE discovery_company
+                SET raw_meta = COALESCE(raw_meta, '{}'::jsonb) || CAST(:patch AS jsonb)
+                WHERE id = :id
+            """), {"id": company_id, "patch": _json.dumps(result["raw_meta_patch"])})
         if has_signal_payload(result):
             from signals.edges import edges_from_enrichment, upsert_edges
             from signals.job_posts import persist_job_posts
@@ -196,7 +201,7 @@ def persist_result(session: Session, company_id: str, result: dict) -> bool:
                     session, company_id, posts, result.get("job_source") or "none",
                 )
                 result["concepts"] = concepts or result.get("concepts") or []
-            persist_snapshot_and_events(session, company_id, domain, result)
+            result["inserted_event_types"] = persist_snapshot_and_events(session, company_id, domain, result)
             upsert_edges(session, edges_from_enrichment(company_id, result))
         return True
     except Exception as exc:
@@ -216,6 +221,15 @@ def _notify_signals_ready(domains: list[str]) -> None:
         logger.info(f"Pushed {len(domains)} domain(s) to {cfg.SIGNALS_READY_KEY}")
     except Exception as exc:
         logger.warning(f"Could not notify Redis after signal enrichment: {exc}")
+
+
+def push_alert_if_tier1(domain: Optional[str], result: dict) -> None:
+    """After commit: queue an instant alert when enrichment inserted a Tier-1 event."""
+    from signals.diff import TIER1_ALERTABLE
+    from signals.sources.edgar import push_instant_alerts
+
+    if domain and TIER1_ALERTABLE.intersection(result.get("inserted_event_types") or []):
+        push_instant_alerts([domain])
 
 
 # ── Batch processing ────────────────────────────────────────────────────────
@@ -391,8 +405,7 @@ async def run(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "One-shot backfill: run signal enrichment on pending discovery_company rows. "
-            "Also used inline by the weekly discovery job (cron/weekly.py)."
+            "One-shot backfill: run signal enrichment on pending discovery_company rows."
         )
     )
     parser.add_argument(

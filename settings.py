@@ -17,6 +17,14 @@ DATABASE_URL: str = _require("DATABASE_URL")
 TELLORA_APOLLO_API_KEY: str = _require("TELLORA_APOLLO_API_KEY")
 GEMINI_API_KEY: str = os.getenv("GOOGLE_API_KEY", os.getenv("GEMINI_API_KEY", ""))
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+
+# Embeddings — must match the backend's EMBEDDING_PROVIDER / OPENAI_EMBEDDING_MODEL:
+# the backend embeds queries, this worker embeds companies, both into description_embedding.
+# Changing either re-embeds every company (reembed_companies_task, queued at startup).
+EMBEDDING_PROVIDER: str = os.getenv("EMBEDDING_PROVIDER", "openai").strip().lower()
+OPENAI_EMBEDDING_MODEL: str = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large").strip()
+EMBEDDING_DIM = 768  # vector(768) columns
 
 # HQ backfill LLM: "gemini" (default) or "groq"
 HQ_NORMALIZE_PROVIDER: str = os.getenv("HQ_NORMALIZE_PROVIDER", "gemini").strip().lower()
@@ -89,8 +97,34 @@ EDGAR_USER_AGENT: str = os.getenv("EDGAR_USER_AGENT", "Tellora Research research
 # Max new discovery_company rows auto-created per daily EDGAR poll.
 EDGAR_AUTO_CREATE_CAP: int = int(os.getenv("EDGAR_AUTO_CREATE_CAP", "25"))
 
+# WARN Act layoff notices (warn-scraper). States scraped by the weekly cron.
+WARN_STATES: list[str] = [
+    s.strip().lower()
+    for s in os.getenv("WARN_STATES", "ca,tx,ny,wa,il,nj,co,ga,va,or,az,pa,oh,mi,md,fl").split(",")
+    if s.strip()
+]
+WARN_LOOKBACK_DAYS: int = int(os.getenv("WARN_LOOKBACK_DAYS", "21"))
+
+# Wappalyzer-format technology fingerprints (GPL-3.0 data, fetched at runtime and
+# cached on disk — not vendored). HTTP Archive maintains the most active fork.
+TECH_FINGERPRINTS_URL: str = os.getenv(
+    "TECH_FINGERPRINTS_URL",
+    "https://raw.githubusercontent.com/HTTPArchive/wappalyzer/main/src",
+)
+TECH_FINGERPRINTS_CACHE: str = os.getenv("TECH_FINGERPRINTS_CACHE", "/tmp/tellora-tech-fingerprints.json")
+TECH_FINGERPRINTS_MAX_AGE_H: int = int(os.getenv("TECH_FINGERPRINTS_MAX_AGE_H", "168"))
+
+# News / first-party feed lookback for events (older items are context, not news).
+NEWS_EVENT_MAX_AGE_DAYS: int = int(os.getenv("NEWS_EVENT_MAX_AGE_DAYS", "45"))
+
 # Max new discovery_company rows auto-created per daily Product Hunt poll.
 PH_AUTO_CREATE_CAP: int = int(os.getenv("PH_AUTO_CREATE_CAP", "10"))
+
+# ICP-targeted index fill (scrape/icp_fill.py): each new company costs one
+# Serper search + one LLM call + an embedding, then signal enrichment.
+ICP_FILL_DAILY_CAP: int = int(os.getenv("ICP_FILL_DAILY_CAP", "1000"))
+ICP_FILL_MAX_PAGES: int = int(os.getenv("ICP_FILL_MAX_PAGES", "15"))
+ICP_FILL_LOOKUP_CONCURRENCY: int = int(os.getenv("ICP_FILL_LOOKUP_CONCURRENCY", "5"))
 
 # Redis — used to notify the backend worker after company signals are enriched
 REDIS_URL: str = os.getenv("REDIS_URL", "redis://redis:6379")
@@ -99,21 +133,6 @@ REDIS_URL: str = os.getenv("REDIS_URL", "redis://redis:6379")
 # Falls back to unauthenticated requests (20 RPM) if not set.
 JINA_API_KEY: str = os.getenv("JINA_API_KEY", "")
 
-# Max pages to scrape per profile per run (100 results/page → 50,000 max).
-# Override in env for testing: MAX_PAGES_PER_PROFILE=5
-MAX_PAGES_PER_PROFILE: int = int(os.getenv("MAX_PAGES_PER_PROFILE", "500"))
-
-# Discovery scrape schedule — hard-coded fallback matches Railway cron (Sun + Wed 3 AM UTC).
-DISCOVERY_SCRAPE_CRON: str = os.getenv("DISCOVERY_SCRAPE_CRON", "0 3 * * 0,3")
-# Set to 1 to skip the in-process schedule guard (local dev / manual runs anytime).
-DISCOVERY_SCRAPE_SCHEDULE_DISABLED: bool = os.getenv("DISCOVERY_SCRAPE_SCHEDULE_DISABLED", "").strip() == "1"
-# Worker ARQ cron mirrors DISCOVERY_SCRAPE_CRON when Railway cron service is absent.
-DISCOVERY_SCRAPE_WORKER_FALLBACK: bool = os.getenv("DISCOVERY_SCRAPE_WORKER_FALLBACK", "1").strip() == "1"
-# Hours to treat an in-progress scrape as active (worker fallback dedup).
-SCRAPE_ACTIVE_HOURS: int = int(os.getenv("SCRAPE_ACTIVE_HOURS", "6"))
-# When false, weekly cron enqueues pending rows instead of inline signals.runner.run().
-DISCOVERY_INLINE_ENRICH: bool = os.getenv("DISCOVERY_INLINE_ENRICH", "true").lower() in ("1", "true", "yes")
-ENQUEUE_SCRAPE_PENDING_LIMIT: int = int(os.getenv("ENQUEUE_SCRAPE_PENDING_LIMIT", "5000"))
 SIGNAL_ENRICH_MAX_JOBS: int = int(os.getenv("SIGNAL_ENRICH_MAX_JOBS", "8"))
 # Jobhive slug import during scheduled maintenance (0 = no limit on scan).
 JOBHIVE_IMPORT_LIMIT: int = int(os.getenv("JOBHIVE_IMPORT_LIMIT", "500"))

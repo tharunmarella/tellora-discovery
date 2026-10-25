@@ -1,4 +1,4 @@
-"""HTTP-mocked tests for funding-news relevance filtering."""
+"""HTTP-mocked tests for funding-news relevance filtering (Google News RSS)."""
 
 import httpx
 import pytest
@@ -7,27 +7,22 @@ import respx
 from signals.sources.funding_news import fetch_funding_news
 
 
+def _rss(*titles: str) -> str:
+    items = "".join(
+        f"<item><title>{t}</title><link>https://news.example/{i}</link><source>TechNews</source></item>"
+        for i, t in enumerate(titles)
+    )
+    return f'<?xml version="1.0"?><rss><channel>{items}</channel></rss>'
+
+
 @pytest.mark.asyncio
 @respx.mock
-async def test_funding_news_drops_same_name_other_company(monkeypatch):
-    import settings as cfg
-
-    monkeypatch.setattr(cfg, "SERPER_API_KEY", "test-key")
-    respx.post("https://google.serper.dev/news").mock(
-        return_value=httpx.Response(200, json={
-            "news": [
-                {
-                    "title": "Guardrails AI raises $7.5M seed round",
-                    "snippet": "Guardrails AI, an LLM validation startup, raised $7.5M.",
-                    "link": "https://techcrunch.com/guardrails-ai-seed",
-                },
-                {
-                    "title": "Guardrail Technologies lands $3M to expand platform",
-                    "snippet": "Guardrail Technologies raised $3M to grow its safety platform.",
-                    "link": "https://example.com/guardrail-technologies",
-                },
-            ],
-        })
+async def test_funding_news_drops_same_name_other_company():
+    respx.get(url__regex=r"https://news\.google\.com/rss/.*").mock(
+        return_value=httpx.Response(200, text=_rss(
+            "Guardrails AI raises $7.5M seed round",
+            "Guardrail Technologies lands $3M to expand platform",
+        ))
     )
 
     out = await fetch_funding_news("Guardrail Technologies")
@@ -39,59 +34,36 @@ async def test_funding_news_drops_same_name_other_company(monkeypatch):
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_funding_news_keeps_relevant_hit(monkeypatch):
+async def test_funding_news_keeps_relevant_hit():
+    respx.get(url__regex=r"https://news\.google\.com/rss/.*").mock(
+        return_value=httpx.Response(200, text=_rss("Acme Robotics closes $25M Series B"))
+    )
+
+    out = await fetch_funding_news("Acme Robotics")
+    assert len(out) == 1
+    assert "Acme Robotics" in out[0]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_funding_news_never_calls_serper(monkeypatch):
     import settings as cfg
 
     monkeypatch.setattr(cfg, "SERPER_API_KEY", "test-key")
-    respx.post("https://google.serper.dev/news").mock(
-        return_value=httpx.Response(200, json={
-            "news": [
-                {
-                    "title": "Acme Robotics closes $25M Series B",
-                    "snippet": "Acme Robotics announced a $25M Series B round.",
-                    "link": "https://news.example/acme-series-b",
-                },
-            ],
-        })
+    serper = respx.post("https://google.serper.dev/news").mock(return_value=httpx.Response(200, json={}))
+    respx.get(url__regex=r"https://news\.google\.com/rss/.*").mock(
+        return_value=httpx.Response(200, text=_rss("Acme Robotics closes $25M Series B"))
     )
 
-    out = await fetch_funding_news("Acme Robotics")
-    assert len(out) == 1
-    assert "Acme Robotics" in out[0]
+    assert len(await fetch_funding_news("Acme Robotics")) == 1
+    assert not serper.called
 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_funding_news_rss_fallback_when_no_serper(monkeypatch):
-    import settings as cfg
-
-    monkeypatch.setattr(cfg, "SERPER_API_KEY", "")
-    rss = """<?xml version="1.0"?>
-    <rss><channel>
-      <item>
-        <title>Acme Robotics closes $25M Series B</title>
-        <link>https://news.example/acme-series-b</link>
-        <source>TechNews</source>
-      </item>
-    </channel></rss>"""
+async def test_funding_news_empty_when_no_hits():
     respx.get(url__regex=r"https://news\.google\.com/rss/.*").mock(
-        return_value=httpx.Response(200, text=rss)
-    )
-
-    out = await fetch_funding_news("Acme Robotics")
-    assert len(out) == 1
-    assert "Acme Robotics" in out[0]
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_funding_news_empty_when_no_hits(monkeypatch):
-    import settings as cfg
-
-    monkeypatch.setattr(cfg, "SERPER_API_KEY", "")
-    rss = """<?xml version="1.0"?><rss><channel></channel></rss>"""
-    respx.get(url__regex=r"https://news\.google\.com/rss/.*").mock(
-        return_value=httpx.Response(200, text=rss)
+        return_value=httpx.Response(200, text=_rss())
     )
 
     assert await fetch_funding_news("Acme Robotics") == []

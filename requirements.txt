@@ -16,3 +16,16 @@ uvicorn[standard]>=0.32.0
 axiom-py
 sentry-sdk>=2.0.0
 dnspython>=2.6.0
+# SEC EDGAR filings (Form D, 8-K) — replaces hand-rolled full-text-search + XML regex
+edgartools>=5.62
+# Main-text extraction from fetched HTML — replaces Jina Reader as the primary page reader
+trafilatura>=2.3
+# First-party RSS/Atom feeds (changelog, blog, newsroom)
+feedparser>=6.0
+# WARN Act layoff notices from state labor departments (Big Local News)
+warn-scraper>=1.2.143
+# Company entity resolution
+rapidfuzz>=3.14
+cleanco>=2.3
+# Common-word check for collision-prone single-word company names
+wordfreq>=3.1

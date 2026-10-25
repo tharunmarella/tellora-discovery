@@ -11,7 +11,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Default command runs the weekly scrape (used by the cron service).
-# The always-on worker service overrides this with a Custom Start Command:
-#   arq worker.WorkerSettings
-CMD ["python", "__main__.py"]
+# On-demand signal worker (Watch / enrich). Railway cron that still calls
+# python __main__.py will no-op.
+CMD ["arq", "worker.WorkerSettings"]

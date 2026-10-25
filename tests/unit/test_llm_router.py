@@ -4,7 +4,15 @@ import asyncio
 
 import pytest
 
-from llm import LLMRouter, model_chain, to_litellm_model
+from llm import (
+    LLMRouter,
+    MODEL_P1,
+    MODEL_P2,
+    default_model_chain,
+    model_chain,
+    signal_model_chain,
+    to_litellm_model,
+)
 
 
 def test_to_litellm_model_adds_gemini_prefix():
@@ -12,7 +20,7 @@ def test_to_litellm_model_adds_gemini_prefix():
 
 
 def test_to_litellm_model_keeps_provider_prefix():
-    assert to_litellm_model("anthropic/claude-haiku-4-5") == "anthropic/claude-haiku-4-5"
+    assert to_litellm_model("groq/openai/gpt-oss-20b") == "groq/openai/gpt-oss-20b"
 
 
 def test_to_litellm_model_requires_name():
@@ -21,68 +29,44 @@ def test_to_litellm_model_requires_name():
 
 
 def test_model_chain_dedupes_and_skips_blanks():
-    chain = model_chain("gemini-3.1-flash-lite", None, "gemini-3.1-flash-lite", "anthropic/x")
-    assert chain == ["gemini/gemini-3.1-flash-lite", "anthropic/x"]
+    chain = model_chain("gemini-3.1-flash-lite", None, "gemini-3.1-flash-lite", "groq/x")
+    assert chain == ["gemini/gemini-3.1-flash-lite", "groq/x"]
 
 
-def test_synthesis_models_excludes_anthropic_without_key(monkeypatch):
-    import settings as cfg
+def test_default_model_chain_starts_with_p1(monkeypatch):
+    import llm as llm_mod
 
-    monkeypatch.setattr(cfg, "SIGNAL_GEMINI_MODEL", "gemini-3.1-flash-lite")
-    monkeypatch.setattr(cfg, "SIGNAL_GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
-    monkeypatch.setattr(cfg, "LLM_CROSS_PROVIDER_MODEL", "anthropic/claude-haiku-4-5")
-    monkeypatch.setattr(cfg, "ANTHROPIC_API_KEY", "")
+    monkeypatch.setattr(llm_mod, "MODEL_P1", "gemini-3.1-flash-lite")
+    monkeypatch.setattr(llm_mod, "MODEL_P2", "gemini-2.5-flash")
+    monkeypatch.setattr(llm_mod, "MODEL_P3", "gemini-2.5-flash-lite")
+    monkeypatch.setattr(llm_mod, "MODEL_P4", "groq/openai/gpt-oss-20b")
+    monkeypatch.setattr(llm_mod.cfg, "GEMINI_API_KEY", "test-key", raising=False)
+    monkeypatch.setattr(llm_mod.cfg, "GROQ_API_KEY", "", raising=False)
 
-    chain = LLMRouter().synthesis_models
-    assert chain == ["gemini/gemini-3.1-flash-lite", "gemini/gemini-2.5-flash"]
-    assert not any("anthropic" in m for m in chain)
-
-
-def test_synthesis_models_includes_anthropic_with_key(monkeypatch):
-    import settings as cfg
-
-    monkeypatch.setattr(cfg, "SIGNAL_GEMINI_MODEL", "gemini-3.1-flash-lite")
-    monkeypatch.setattr(cfg, "SIGNAL_GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
-    monkeypatch.setattr(cfg, "LLM_CROSS_PROVIDER_MODEL", "anthropic/claude-haiku-4-5")
-    monkeypatch.setattr(cfg, "ANTHROPIC_API_KEY", "sk-ant-test")
-
-    chain = LLMRouter().synthesis_models
-    assert chain[-1] == "anthropic/claude-haiku-4-5"
-
-
-def test_enrichment_models_chain(monkeypatch):
-    import settings as cfg
-
-    monkeypatch.setattr(cfg, "ENRICHMENT_GEMINI_MODEL", "gemini-2.5-flash-lite")
-    monkeypatch.setattr(cfg, "ENRICHMENT_GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
-    monkeypatch.setattr(cfg, "ANTHROPIC_API_KEY", "")
-
-    assert LLMRouter().enrichment_models == [
-        "gemini/gemini-2.5-flash-lite",
-        "gemini/gemini-2.5-flash",
-    ]
+    chain = default_model_chain()
+    assert chain[0] == "gemini/gemini-3.1-flash-lite"
+    assert "gemini/gemini-2.5-flash" in chain
 
 
 def test_signal_model_chain_primary_override(monkeypatch):
+    import llm as llm_mod
+
+    monkeypatch.setattr(llm_mod, "MODEL_P1", "gemini-3.1-flash-lite")
+    monkeypatch.setattr(llm_mod, "MODEL_P2", "gemini-2.5-flash")
+    monkeypatch.setattr(llm_mod, "MODEL_P3", "gemini-2.5-flash-lite")
+    monkeypatch.setattr(llm_mod, "MODEL_P4", "groq/openai/gpt-oss-20b")
+    monkeypatch.setattr(llm_mod.cfg, "GEMINI_API_KEY", "test-key", raising=False)
+    monkeypatch.setattr(llm_mod.cfg, "GROQ_API_KEY", "", raising=False)
+
+    assert signal_model_chain(primary="gemini-custom")[0] == "gemini/gemini-custom"
+
+
+def test_complete_text_tries_models_in_order(monkeypatch):
     import settings as cfg
 
-    monkeypatch.setattr(cfg, "SIGNAL_GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
-    monkeypatch.setattr(cfg, "ANTHROPIC_API_KEY", "")
+    monkeypatch.setattr(cfg, "LITELLM_NUM_RETRIES", 1)
 
-    from llm import signal_model_chain
-
-    assert signal_model_chain(primary="gemini-custom") == [
-        "gemini/gemini-custom",
-        "gemini/gemini-2.5-flash",
-    ]
-
-
-def test_complete_text_uses_primary_and_fallbacks(monkeypatch):
-    import settings as cfg
-
-    monkeypatch.setattr(cfg, "LITELLM_NUM_RETRIES", 3)
-
-    captured = {}
+    calls: list[str] = []
 
     class _Msg:
         content = "  hello  "
@@ -97,21 +81,17 @@ def test_complete_text_uses_primary_and_fallbacks(monkeypatch):
     import litellm
 
     def _fake_completion(**kwargs):
-        captured.update(kwargs)
+        calls.append(kwargs["model"])
+        if kwargs["model"] == "gemini/a":
+            raise RuntimeError("fail primary")
         return _Resp()
 
     monkeypatch.setattr(litellm, "completion", _fake_completion)
 
     router = LLMRouter()
-    out = router.complete_text(
-        "prompt",
-        models=["gemini/a", "gemini/b", "anthropic/c"],
-        temperature=0.0,
-    )
+    out = router.complete_text("prompt", models=["gemini/a", "gemini/b"], temperature=0.0)
     assert out == "hello"
-    assert captured["model"] == "gemini/a"
-    assert captured["fallbacks"] == ["gemini/b", "anthropic/c"]
-    assert captured["num_retries"] == 3
+    assert calls == ["gemini/a", "gemini/b"]
 
 
 def test_configure_litellm_sets_drop_params():

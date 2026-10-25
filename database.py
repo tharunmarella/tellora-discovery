@@ -67,6 +67,9 @@ def make_engine(*, pool_pre_ping: bool = True, **kwargs):
     url = cfg.DATABASE_URL
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql://", 1)
+    # SQLAlchemy 2.1 defaults postgresql:// to psycopg (v3); we ship psycopg2-binary.
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
     return create_engine(url, pool_pre_ping=pool_pre_ping, **kwargs)
 
 
@@ -92,6 +95,8 @@ ALTER TABLE discovery_company DROP COLUMN IF EXISTS location;
 ALTER TABLE discovery_signal_event ADD COLUMN IF NOT EXISTS evidence_url VARCHAR;
 ALTER TABLE discovery_signal_event ADD COLUMN IF NOT EXISTS event_date TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS ix_discovery_signal_event_event_date ON discovery_signal_event (event_date);
+ALTER TABLE discovery_edge ADD COLUMN IF NOT EXISTS dst_company_id VARCHAR;
+CREATE INDEX IF NOT EXISTS ix_discovery_edge_type_dst_company ON discovery_edge (edge_type, dst_company_id);
 """
 
 
@@ -99,6 +104,8 @@ def create_tables() -> None:
     """Create discovery_company and discovery_progress tables if they don't exist."""
     from sqlalchemy import text as _text
     import models  # noqa: F401 — registers SQLModel metadata
+    with engine.begin() as conn:
+        conn.execute(_text("CREATE EXTENSION IF NOT EXISTS vector"))
     SQLModel.metadata.create_all(engine, checkfirst=True)
     with engine.begin() as conn:
         for stmt in _ENSURE_COLUMNS_SQL.strip().split("\n"):

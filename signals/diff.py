@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -19,13 +20,41 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger("discovery.signal_diff")
 
+# Fingerprint categories worth an adopt/drop event — tools a vendor sells
+# against or integrates with. Infra noise (CDN, HSTS, JS libraries) stays in
+# tech_stack as context but never becomes an event.
+TECH_EVENT_CATEGORIES = frozenset({
+    "A/B Testing", "Accounting", "Advertising", "Analytics", "Appointment scheduling",
+    "Authentication", "CMS", "CRM", "Customer data platform", "Documentation", "Ecommerce",
+    "Email", "Feature management", "Form builders", "IaaS", "Issue trackers", "LMS",
+    "Live chat", "Loyalty & rewards", "Marketing automation", "PaaS", "Payment processors",
+    "Personalisation", "RUM", "Recruitment & staffing", "Referral marketing", "Retargeting",
+    "Reviews", "Search engines", "Segmentation", "Surveys", "Translation", "User onboarding",
+    "Webmail", "Wikis",
+})
+
+# A full fingerprint run (homepage fetched); DNS-only runs can't prove a removal.
+_FULL_TECH_SOURCE = "wappalyzer"
+
+# Event types where several outlets report one real-world event; a new report
+# within the window merges into the existing event instead of duplicating it.
+CLUSTER_TYPES = frozenset({
+    "funding_round", "exec_hire", "exec_departure", "layoffs", "acquisition",
+    "expansion", "partnership", "product_launch", "news_mention",
+})
+_CLUSTER_WINDOW_DAYS = 30
+_CLUSTER_TITLE_SIMILARITY = 72
+
 # Tier 1 — alertable when grounded with evidence_url
 TIER1_ALERTABLE = frozenset({
     "funding_round",
     "exec_hire",
+    "exec_departure",
     "job_change",
     "product_launch",
     "gov_contract",
+    "layoffs",
+    "acquisition",
 })
 
 # Tier 2 — context only; feeds heat score, never instant alerts
@@ -37,6 +66,9 @@ TIER2_CONTEXT = frozenset({
     "concept_first_seen",
     "news_mention",
     "tech_first_seen",
+    "tech_dropped",
+    "expansion",
+    "partnership",
     "social_post",
     "competitor_touch",
     "engagement",
@@ -58,6 +90,12 @@ EVENT_WEIGHTS = {
     "concept_first_seen": 15,
     "news_mention": 10,
     "tech_first_seen": 10,
+    "tech_dropped": 12,
+    "exec_departure": 16,
+    "layoffs": 16,
+    "acquisition": 20,
+    "expansion": 12,
+    "partnership": 10,
     "social_post": 8,
     "engagement": 12,
     "competitor_touch": 14,
@@ -158,20 +196,80 @@ def _role_family(title: str) -> str:
 
 
 def snapshot_from_result(result: dict) -> dict:
-    """Build a snapshot dict from an enrichment result."""
+    """
+    Build a snapshot dict from an enrichment result.
+
+    The snapshot's tech_stack holds only fingerprint-detected tech (not the LLM's
+    guesses merged into discovery_company.tech_stack), so adopt/drop diffs are
+    grounded. page_fingerprints carries the detection source and display names.
+    """
+    detected = result.get("detected_tech")
+    tech_source = result.get("tech_source")
+    page_fps = dict(result.get("page_fingerprints") or {})
+    if detected is not None and tech_source:
+        tech = sorted({d["slug"] for d in detected})
+        page_fps["tech_source"] = tech_source
+        page_fps["tech_meta"] = {
+            d["slug"]: {"name": d["name"], "categories": d.get("categories") or []} for d in detected
+        }
+    else:
+        tech = result.get("tech_stack") or []
     return {
         "hiring_count": result.get("hiring_count") or 0,
         "hiring_roles": result.get("hiring_roles") or [],
-        "tech_stack": result.get("tech_stack") or [],
+        "tech_stack": tech,
         "funding_stage": result.get("funding_stage"),
         "total_raised": result.get("total_raised"),
         "headcount": result.get("headcount"),
         "buying_signals": result.get("buying_signals") or [],
         "concepts": result.get("concepts") or [],
         "pricing_model": result.get("pricing_model"),
-        "page_fingerprints": result.get("page_fingerprints") or {},
+        "page_fingerprints": page_fps,
         "recent_launches": result.get("recent_launches") or [],
     }
+
+
+def _tech_label(meta: dict, slug: str) -> tuple[str, list[str]]:
+    info = meta.get(slug) or {}
+    return info.get("name") or slug, info.get("categories") or []
+
+
+def diff_tech(prev: dict, curr: dict) -> list[SignalEventDraft]:
+    """Adopt/drop events between two full fingerprint runs, for business-tool categories only."""
+    prev_fps, curr_fps = prev.get("page_fingerprints") or {}, curr.get("page_fingerprints") or {}
+    if curr_fps.get("tech_source") != _FULL_TECH_SOURCE or prev_fps.get("tech_source") != _FULL_TECH_SOURCE:
+        return []
+    now = datetime.now(timezone.utc)
+    prev_tech, curr_tech = set(prev.get("tech_stack") or []), set(curr.get("tech_stack") or [])
+    prev_meta, curr_meta = prev_fps.get("tech_meta") or {}, curr_fps.get("tech_meta") or {}
+    events: list[SignalEventDraft] = []
+    for slug in sorted(curr_tech - prev_tech):
+        name, cats = _tech_label(curr_meta, slug)
+        if not TECH_EVENT_CATEGORIES.intersection(cats):
+            continue
+        events.append(SignalEventDraft(
+            "tech_first_seen",
+            f"Started using {name} ({', '.join(cats[:2])})",
+            {"key": f"tech:{slug}:{now.date().isoformat()[:7]}", "tech": slug, "name": name, "categories": cats},
+            "tech_detect",
+            confidence=0.85,
+            observed_at=now,
+            event_date=now,
+        ))
+    for slug in sorted(prev_tech - curr_tech):
+        name, cats = _tech_label(prev_meta, slug)
+        if not TECH_EVENT_CATEGORIES.intersection(cats):
+            continue
+        events.append(SignalEventDraft(
+            "tech_dropped",
+            f"Stopped using {name} ({', '.join(cats[:2])})",
+            {"key": f"tech_drop:{slug}:{now.date().isoformat()[:7]}", "tech": slug, "name": name, "categories": cats},
+            "tech_detect",
+            confidence=0.7,
+            observed_at=now,
+            event_date=now,
+        ))
+    return events
 
 
 def diff_snapshots(
@@ -216,31 +314,10 @@ def diff_snapshots(
             event_date=now,
         ))
 
-    prev_tech = set(prev.get("tech_stack") or [])
-    for tech in sorted(set(curr.get("tech_stack") or []) - prev_tech):
-        events.append(SignalEventDraft(
-            "tech_first_seen",
-            f"Started using {tech}",
-            {"key": tech},
-            "tech_detect",
-            confidence=0.7,
-            observed_at=now,
-            event_date=now,
-        ))
-
-    prev_launches = {l.strip().lower() for l in (prev.get("recent_launches") or [])}
-    for launch in (curr.get("recent_launches") or []):
-        if launch.strip().lower() not in prev_launches:
-            events.append(SignalEventDraft(
-                "product_launch",
-                f"Product launch: {launch}",
-                {"key": launch.strip().lower()[:80]},
-                "website_pages",
-                confidence=0.85,
-                observed_at=now,
-                evidence_url=changelog_url,
-                event_date=now,
-            ))
+    # Tech adopt/drop only from fingerprint runs. Launches come from the company's
+    # own feed, Product Hunt and Show HN — not from the LLM's recent_launches list,
+    # which turned blog pages ("Investor Overview") into launches.
+    events.extend(diff_tech(prev, curr))
 
     return events
 
@@ -384,15 +461,70 @@ def write_snapshot(session: Session, company_id: str, snap: dict) -> None:
     })
 
 
+def _same_real_event(ev: SignalEventDraft, title: str, payload: dict) -> bool:
+    """Is this new report about an event we already stored (another outlet, same story)?"""
+    from rapidfuzz import fuzz
+
+    a_story, b_story = ev.payload.get("story"), payload.get("story")
+    if a_story and b_story and a_story == b_story:
+        return True
+    a_person, b_person = (ev.payload.get("person") or "").lower(), (payload.get("person") or "").lower()
+    if a_person and b_person:
+        return a_person == b_person
+    a_amt, b_amt = ev.payload.get("amount"), payload.get("amount")
+    if ev.event_type == "funding_round" and a_amt and b_amt:
+        return re.sub(r"[^0-9.]", "", str(a_amt)) == re.sub(r"[^0-9.]", "", str(b_amt))
+    threshold = 85 if ev.event_type in ("news_mention", "exec_hire", "exec_departure") else _CLUSTER_TITLE_SIMILARITY
+    strip = lambda t: re.sub(r"\s+-\s+[^-]+$", "", t or "")  # drop " - Outlet Name" suffix
+    return fuzz.token_set_ratio(strip(ev.title).lower(), strip(title).lower()) >= threshold
+
+
+def _merge_into_existing(session: Session, company_id: str, ev: SignalEventDraft) -> bool:
+    """Attach ev as another source of a matching recent event. True when merged."""
+    rows = session.execute(text("""
+        SELECT id, title, payload FROM discovery_signal_event
+        WHERE company_id = :cid AND event_type = :et
+          AND observed_at > NOW() - make_interval(days => :days)
+        ORDER BY observed_at DESC LIMIT 25
+    """), {"cid": company_id, "et": ev.event_type, "days": _CLUSTER_WINDOW_DAYS}).mappings().all()
+    for row in rows:
+        payload = row["payload"] or {}
+        if not _same_real_event(ev, row["title"], payload):
+            continue
+        sources = list(payload.get("sources") or [])
+        url = ev.evidence_url or ev.payload.get("url")
+        if url and any(src.get("url") == url for src in sources):
+            return True
+        sources.append({"url": url, "title": ev.title[:200], "source": ev.source})
+        session.execute(text("""
+            UPDATE discovery_signal_event
+            SET payload = jsonb_set(COALESCE(payload, '{}'::jsonb), '{sources}', CAST(:sources AS jsonb)),
+                confidence = LEAST(0.98, confidence + 0.05)
+            WHERE id = :id
+        """), {"id": row["id"], "sources": json.dumps(sources[-10:])})
+        return True
+    return False
+
+
 def insert_events(
     session: Session,
     company_id: str,
     events: list[SignalEventDraft],
 ) -> list[str]:
-    """Insert events, skip duplicates. Returns event_types inserted."""
+    """
+    Insert events, skip duplicates. Reports of an already-stored real-world event
+    (same funding round from another outlet) merge into it as extra sources.
+    Returns event_types inserted.
+    """
     inserted_types: list[str] = []
     for ev in events:
         dedupe = ev.dedupe_key(company_id)
+        if ev.event_type in CLUSTER_TYPES:
+            exists = session.execute(
+                text("SELECT 1 FROM discovery_signal_event WHERE dedupe_key = :k"), {"k": dedupe},
+            ).first()
+            if exists or _merge_into_existing(session, company_id, ev):
+                continue
         observed = ev.observed_at or datetime.now(timezone.utc)
         event_date = ev.event_date or observed
         try:

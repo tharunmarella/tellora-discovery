@@ -5,7 +5,7 @@ Entity types:
   company  : discovery_company.id
   person   : normalized name slug (display name kept in payload)
   vendor   : tech key e.g. 'stripe', 'google_workspace'
-  customer : normalized company name (matched discovery_company id in payload)
+  customer : normalized company name (resolved discovery_company id in dst_company_id)
 
 Edge types:
   uses_vendor  : company → vendor   (from tech_stack)
@@ -13,6 +13,10 @@ Edge types:
   employs_exec : company → person   (from Form D related_persons)
   works_at     : person  → company  (from LinkedIn extension job changes)
   left_company : person  → company  (previous employer on a job change)
+
+has_customer rows are shared with the backend's customer crawler (same dst_id
+slug); resolve_customer_edges() fills dst_company_id daily so vendor → customer
+→ customer's customers chains can be walked.
 """
 
 from __future__ import annotations
@@ -46,6 +50,7 @@ class EdgeDraft:
     dst_id: str
     source: str
     payload: dict = field(default_factory=dict)
+    dst_company_id: Optional[str] = None
 
 
 def upsert_edges(session: Session, edges: list[EdgeDraft]) -> int:
@@ -57,13 +62,14 @@ def upsert_edges(session: Session, edges: list[EdgeDraft]) -> int:
         try:
             session.execute(text("""
                 INSERT INTO discovery_edge
-                    (id, src_type, src_id, edge_type, dst_type, dst_id,
+                    (id, src_type, src_id, edge_type, dst_type, dst_id, dst_company_id,
                      payload, source, observed_at, last_seen_at, created_at)
                 VALUES
-                    (:id, :src_type, :src_id, :edge_type, :dst_type, :dst_id,
+                    (:id, :src_type, :src_id, :edge_type, :dst_type, :dst_id, :dst_company_id,
                      CAST(:payload AS jsonb), :source, NOW(), NOW(), NOW())
                 ON CONFLICT (src_type, src_id, edge_type, dst_type, dst_id)
-                DO UPDATE SET last_seen_at = NOW()
+                DO UPDATE SET last_seen_at = NOW(),
+                    dst_company_id = COALESCE(EXCLUDED.dst_company_id, discovery_edge.dst_company_id)
             """), {
                 "id": str(uuid.uuid4()),
                 "src_type": e.src_type,
@@ -71,6 +77,7 @@ def upsert_edges(session: Session, edges: list[EdgeDraft]) -> int:
                 "edge_type": e.edge_type,
                 "dst_type": e.dst_type,
                 "dst_id": e.dst_id,
+                "dst_company_id": e.dst_company_id,
                 "payload": json.dumps(e.payload or {}),
                 "source": e.source,
             })
@@ -78,6 +85,53 @@ def upsert_edges(session: Session, edges: list[EdgeDraft]) -> int:
         except Exception as exc:
             logger.warning(f"Edge upsert failed {e.edge_type} {e.src_id}→{e.dst_id}: {exc}")
     return written
+
+
+def resolve_customer_edges(session: Session, index=None) -> dict:
+    """
+    Point unresolved has_customer edges at tracked companies: the edge's
+    customer domain first, then the customer name via CompanyIndex (strict —
+    ambiguous or weak names stay unresolved). Caller commits.
+    """
+    rows = session.execute(text("""
+        SELECT id, src_id, payload FROM discovery_edge
+        WHERE edge_type = 'has_customer' AND dst_company_id IS NULL
+          AND (payload->>'ignored_reason') IS NULL
+    """)).mappings().all()
+    stats = {"unresolved": len(rows), "by_domain": 0, "by_name": 0}
+    if not rows:
+        return stats
+
+    domains = sorted({
+        d for d in ((r["payload"] or {}).get("domain") for r in rows) if d
+    })
+    by_domain = {
+        d.lower(): str(i) for i, d in session.execute(
+            text("SELECT id, domain FROM discovery_company WHERE lower(domain) = ANY(:d)"),
+            {"d": [d.lower() for d in domains]},
+        ).all()
+    } if domains else {}
+
+    if index is None:
+        from signals.entity import CompanyIndex
+        index = CompanyIndex.load(session)
+
+    updates = []
+    for r in rows:
+        payload = r["payload"] or {}
+        company_id = by_domain.get((payload.get("domain") or "").lower())
+        how = "by_domain"
+        if not company_id and payload.get("display"):
+            hit = index.match(payload["display"])
+            company_id, how = (hit.company.id if hit else None), "by_name"
+        if company_id and company_id != r["src_id"]:
+            updates.append({"id": r["id"], "cid": company_id})
+            stats[how] += 1
+    if updates:
+        session.execute(
+            text("UPDATE discovery_edge SET dst_company_id = :cid WHERE id = :id"), updates,
+        )
+    return stats
 
 
 # ── Builders ────────────────────────────────────────────────────────────────

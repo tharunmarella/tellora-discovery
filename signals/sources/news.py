@@ -2,7 +2,7 @@
 Google News RSS + Product Hunt feed ingesters (free, no API key).
 
   fetch_company_news(name)  → headlines from the last 7 days
-  classify_news(name, items) → Gemini batch relevance filter → extra_events
+  classify_news(name, items, domain=…, description=…) → entity-verified, typed extra_events
   fetch_product_hunt_launches() → daily PH launches for cron matching
 """
 
@@ -13,7 +13,8 @@ import logging
 import re
 import uuid
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -32,8 +33,18 @@ _RSS_URL = (
     'q="{name}"+when:{days}d+-stock+-shares&hl=en-US&gl=US&ceid=US:en'
 )
 
-# classifier category → event type (anything else stays news_mention)
-_CATEGORY_UPGRADES = {"funding": "funding_round", "exec_hire": "exec_hire"}
+# classifier category → event type (anything else is dropped)
+_CATEGORY_EVENTS = {
+    "funding": "funding_round",
+    "exec_hire": "exec_hire",
+    "exec_departure": "exec_departure",
+    "layoffs": "layoffs",
+    "acquisition": "acquisition",
+    "expansion": "expansion",
+    "partnership": "partnership",
+    "product": "product_launch",
+    "business_news": "news_mention",
+}
 
 
 async def fetch_company_news(company_name: str, days: int = 7) -> list[dict]:
@@ -62,25 +73,76 @@ async def fetch_company_news(company_name: str, days: int = 7) -> list[dict]:
     return [it for it in items if it["title"]][:12]
 
 
-def classify_news(company_name: str, items: list[dict]) -> list[dict]:
+def _company_card(company_name: str, domain: Optional[str], description: Optional[str], industry: Optional[str]) -> str:
+    parts = [f"Name: {company_name}"]
+    if domain:
+        parts.append(f"Website: {domain}")
+    if industry:
+        parts.append(f"Industry: {industry}")
+    if description:
+        parts.append(f"What they do: {description.strip()[:400]}")
+    return "\n".join(parts)
+
+
+def classify_news(
+    company_name: str,
+    items: list[dict],
+    *,
+    domain: Optional[str] = None,
+    description: Optional[str] = None,
+    industry: Optional[str] = None,
+) -> list[dict]:
     """
-    Gemini batch classification of headlines. Synchronous — run in executor.
-    Returns extra_events drafts for relevant headlines only.
+    Verify + type headlines found by a name search. Synchronous — run in executor.
+
+    Name searches return same-named companies, places and people ("Origin" →
+    Blue Origin, "Redmond" → the city), so the model gets the company's website,
+    industry and description and must confirm each headline is about *this*
+    company. Funding only counts when the company itself receives investment —
+    grants, donations, fundraisers and prizes are dropped.
     """
-    if not items or not cfg.GEMINI_API_KEY:
+    if not items:
         return []
 
-    sample = [{"i": i, "title": it["title"], "source": it["source"]}
-              for i, it in enumerate(items)]
-    prompt = f"""Classify each news headline about the company "{company_name}".
-category = funding | exec_hire | partnership | product | expansion | layoffs | irrelevant
-Mark relevant=false for stock chatter, lawsuits, listicles, or headlines not
-actually about {company_name} as a business.
+    cutoff = datetime.now(timezone.utc) - timedelta(days=cfg.NEWS_EVENT_MAX_AGE_DAYS)
+    fresh = []
+    for it in items:
+        date = parse_event_date(it.get("date"))
+        if date is None or date >= cutoff:
+            fresh.append(it)
+    if not fresh:
+        return []
+
+    sample = [{"i": i, "title": it["title"], "source": it["source"]} for i, it in enumerate(fresh)]
+    prompt = f"""You verify news headlines for one specific company.
+
+COMPANY
+{_company_card(company_name, domain, description, industry)}
+
+For each headline decide:
+about_company: true ONLY if the headline is about this exact company (the one
+  at the website above). false for a different company/product/place/person that
+  shares the name, for listicles, stock-price chatter, and sponsored posts.
+category:
+  funding        — this company RECEIVED venture/equity/debt investment (not grants,
+                   donations, charity fundraisers, prizes, or investing in others)
+  exec_hire      — this company hired/promoted a named executive (VP and above)
+  exec_departure — a named executive left this company
+  layoffs        — this company cut jobs or closed a site
+  acquisition    — this company acquired, or was acquired by, a named company
+  expansion      — new office, new market/country, major new facility
+  partnership    — a named strategic partnership or major customer win
+  product        — this company launched a product or major feature
+  business_news  — other substantive news about this company's business
+  irrelevant     — anything else
+amount: the funding amount as written (e.g. "$40M"), else null
+story: 2-5 lowercase words naming the real-world event; headlines about the
+  same event get the same story (e.g. "krea 3 launch", "series b 40m")
 
 HEADLINES:
 {json.dumps(sample)}
 
-Respond with ONLY valid JSON: {{"results": [{{"i": 0, "category": "...", "relevant": true}}]}}"""
+Respond with ONLY valid JSON: {{"results": [{{"i": 0, "about_company": true, "category": "funding", "amount": "$40M", "story": "series b 40m"}}]}}"""
 
     def _do():
         raw = get_router().complete_text(
@@ -97,17 +159,33 @@ Respond with ONLY valid JSON: {{"results": [{{"i": 0, "category": "...", "releva
         logger.warning(f"News classification failed for '{company_name}': {exc}")
         return []
 
-    events = []
+    events: list[dict] = []
+    by_story: dict[tuple[str, str], dict] = {}
     for v in verdicts.get("results", []):
         try:
-            it = items[int(v["i"])]
-        except (KeyError, ValueError, IndexError):
+            it = fresh[int(v["i"])]
+        except (KeyError, ValueError, IndexError, TypeError):
+            continue
+        if v.get("about_company") is not True:
             continue
         category = (v.get("category") or "irrelevant").strip().lower()
-        if not v.get("relevant") or category == "irrelevant":
+        event_type = _CATEGORY_EVENTS.get(category)
+        if not event_type:
             continue
-        event_type = _CATEGORY_UPGRADES.get(category, "news_mention")
-        events.append({
+        amount = (v.get("amount") or "").strip() or None
+        if event_type == "funding_round" and not amount and not re.search(
+            r"\b(series [a-h]|seed|pre-seed|round)\b", it["title"], re.IGNORECASE
+        ):
+            event_type = "news_mention"  # "secures investment" with no amount or round is not a round
+        story = re.sub(r"\s+", " ", (v.get("story") or "").strip().lower())[:60]
+        source_ref = {"url": it.get("url"), "title": it["title"][:200], "source": it.get("source")}
+        if story and (event_type, story) in by_story:
+            # Same real-world event from another outlet: one event, more sources
+            ev = by_story[(event_type, story)]
+            ev["payload"]["sources"].append(source_ref)
+            ev["confidence"] = min(0.95, ev["confidence"] + 0.05)
+            continue
+        ev = {
             "event_type": event_type,
             "title": it["title"][:500],
             "payload": {
@@ -116,13 +194,19 @@ Respond with ONLY valid JSON: {{"results": [{{"i": 0, "category": "...", "releva
                 "date": it.get("date"),
                 "news_source": it.get("source"),
                 "category": category,
+                "amount": amount,
+                "story": story or None,
+                "sources": [source_ref],
             },
             "source": "google_news",
-            "confidence": 0.75,
+            "confidence": 0.8,
             "evidence_url": it.get("url"),
             "event_date": it.get("date"),
-        })
-    return events[:5]
+        }
+        if story:
+            by_story[(event_type, story)] = ev
+        events.append(ev)
+    return events[:6]
 
 
 # ── Product Hunt daily poll ──────────────────────────────────────────────────
@@ -193,36 +277,21 @@ def _insert_ph_launch_event(session: Session, company_id: str, launch: dict) -> 
 
 
 def match_ph_launches(session: Session, launches: list[dict]) -> list[str]:
-    """Match PH launch names to discovery_company; insert product_launch events."""
+    """Match PH launch names to tracked companies (signals.entity); insert product_launch events."""
     if not launches:
         return []
+    from signals.entity import CompanyIndex
 
-    by_norm: dict[str, dict] = {}
-    for launch in launches:
-        norm = normalize_name(launch["title"])
-        if len(norm) >= 3:
-            by_norm.setdefault(norm, launch)
-
-    if not by_norm:
-        return []
-
-    rows = session.execute(text("""
-        SELECT id, name, domain
-        FROM discovery_company
-        WHERE LOWER(regexp_replace(name, '[^a-zA-Z0-9]+', ' ', 'g')) = ANY(:norms)
-           OR LOWER(name) = ANY(:norms)
-    """), {"norms": list(by_norm.keys())}).mappings().all()
-
+    index = CompanyIndex.load(session)
     matched_domains: list[str] = []
-    for row in rows:
-        norm = normalize_name(row["name"])
-        launch = by_norm.get(norm)
-        if not launch:
+    for launch in launches:
+        hit = index.match(launch["title"])
+        if not hit:
             continue
         launch["_matched"] = True
-        _insert_ph_launch_event(session, row["id"], launch)
-        if row["domain"]:
-            matched_domains.append(row["domain"])
+        _insert_ph_launch_event(session, hit.company.id, launch)
+        if hit.company.domain:
+            matched_domains.append(hit.company.domain)
     return matched_domains
 
 

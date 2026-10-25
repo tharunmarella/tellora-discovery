@@ -8,19 +8,16 @@ enrich). The backend enqueues enrich_company_task onto arq:ondemand.
 
   arq:ondemand  ← user-triggered enrichment (single + bulk on-demand)
 
-This is intentionally disjoint from the weekly discovery job: the discovery
-service (python __main__.py) scrapes AND enriches its own companies inline, so
-nothing here ever blocks behind the weekly batch (and vice versa).
+This is intentionally disjoint from CRM jobs on arq:default.
 
 Running:
   arq worker.WorkerSettings
 """
 
 import logging
-import time
 
 import redis.asyncio as aioredis
-from arq import cron
+from arq import cron, func
 from arq.connections import RedisSettings
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -28,23 +25,18 @@ from sqlalchemy.orm import Session
 import settings as cfg
 from database import make_engine
 from infra.axiom_arq import after_job_end, on_job_failure
-from infra.axiom_logger import axiom_logger
 from infra.lifespan import SERVICE_WORKER, bootstrap, shutdown as lifespan_shutdown, startup as lifespan_startup
-from cron.scrape_schedule import (
-    DEFAULT_DISCOVERY_SCRAPE_CRON,
-    discovery_scrape_recently_active,
-    parse_scrape_cron,
-    should_run_discovery_scrape,
-)
-from cron.weekly import WeeklyCronArgs, execute as run_weekly_cron, validate_args as validate_weekly_args
-from signals.enqueue import enqueue_scrape_pending_task
 from signals.monitoring import (
     daily_discovery_maintenance_task,
+    fill_index_for_icp_task,
     import_jobhive_slugs_task,
+    poll_edgar_8k_task,
     poll_edgar_form_d_task,
     poll_job_posts_task,
     poll_product_hunt_task,
+    poll_warn_notices_task,
     reconcile_pending_task,
+    reembed_companies_task,
     refresh_headcounts_task,
     refresh_stale_index_task,
     refresh_watched_companies_task,
@@ -152,6 +144,9 @@ async def enrich_company_task(ctx, company_id: str) -> dict:
         persist_result(session, company_id, result)
         session.commit()
 
+    from signals.runner import push_alert_if_tier1
+    push_alert_if_tier1(domain, result)
+
     status = result.get("signal_enrichment_status")
     if domain and status in ("enriched", "partial"):
         try:
@@ -174,53 +169,6 @@ async def enrich_company_task(ctx, company_id: str) -> dict:
     }
 
 
-async def run_discovery_scrape_task(ctx) -> dict:
-    """
-    Fallback scrape cron on the worker when the Railway cron service is absent
-    or misconfigured. Skips if a scrape already ran recently (Railway path).
-    """
-    start = time.perf_counter()
-
-    async def _skip(reason: str) -> dict:
-        logger.info("[run_discovery_scrape_task] Skipping — %s", reason)
-        await axiom_logger.log_task_run(
-            task_name="discovery_scrape_fallback",
-            success=True,
-            duration_ms=(time.perf_counter() - start) * 1000,
-            service=SERVICE_WORKER,
-            stats={"skipped": True, "skipped_reason": reason},
-        )
-        return {"ok": True, "skipped": True, "reason": reason}
-
-    if not cfg.DISCOVERY_SCRAPE_WORKER_FALLBACK:
-        return await _skip("worker_fallback_disabled")
-
-    if discovery_scrape_recently_active():
-        return await _skip("recent_run")
-
-    if not should_run_discovery_scrape(
-        cron_expr=cfg.DISCOVERY_SCRAPE_CRON,
-        schedule_disabled=cfg.DISCOVERY_SCRAPE_SCHEDULE_DISABLED,
-    ):
-        return await _skip("off_schedule")
-
-    args = WeeklyCronArgs()
-    validate_weekly_args(args)
-    logger.info(
-        "[run_discovery_scrape_task] Starting worker fallback scrape (%s)",
-        cfg.DISCOVERY_SCRAPE_CRON,
-    )
-    await run_weekly_cron(args)
-    await axiom_logger.log_task_run(
-        task_name="discovery_scrape_fallback",
-        success=True,
-        duration_ms=(time.perf_counter() - start) * 1000,
-        service=SERVICE_WORKER,
-        stats={"skipped": False},
-    )
-    return {"ok": True, "skipped": False}
-
-
 # ── ARQ lifecycle hooks ─────────────────────────────────────────────────────
 
 async def startup(ctx):
@@ -228,6 +176,12 @@ async def startup(ctx):
         server_name=SERVICE_WORKER,
         create_tables=True,
         axiom_background_flush=True,
+    )
+    # one job per embedding model; a no-op once that model's re-embed has finished
+    from llm import embedding_model
+
+    await ctx["redis"].enqueue_job(
+        "reembed_companies_task", _job_id=f"reembed:{embedding_model()}", _queue_name="arq:ondemand",
     )
 
 
@@ -243,26 +197,23 @@ _redis_settings = RedisSettings.from_dsn(cfg.REDIS_URL)
 # ── Worker settings ─────────────────────────────────────────────────────────
 
 class WorkerSettings:
-    """
-    On-demand enrichment worker: listens on arq:ondemand for user-triggered
-    enrichment (single "Enrich" clicks + bulk on-demand actions) enqueued by
-    the backend. Stays disjoint from the weekly discovery job, which scrapes
-    and enriches its own companies inline.
-    """
+    """On-demand company signal enrichment on arq:ondemand."""
     functions = [
         enrich_company_task,
-        run_discovery_scrape_task,
         refresh_watched_companies_task,
         refresh_stale_index_task,
         refresh_headcounts_task,
         poll_job_posts_task,
         poll_edgar_form_d_task,
+        poll_edgar_8k_task,
+        poll_warn_notices_task,
         poll_product_hunt_task,
         reconcile_pending_task,
         log_scheduler_health_task,
-        enqueue_scrape_pending_task,
         import_jobhive_slugs_task,
         daily_discovery_maintenance_task,
+        func(fill_index_for_icp_task, timeout=3600, max_tries=1),
+        func(reembed_companies_task, timeout=3600, max_tries=3),
     ]
     queue_name = "arq:ondemand"
     redis_settings = _redis_settings
@@ -273,26 +224,12 @@ class WorkerSettings:
     max_jobs = cfg.SIGNAL_ENRICH_MAX_JOBS
     max_tries = _ENRICH_MAX_TRIES
     job_timeout = 600
-    _scrape_schedule = parse_scrape_cron(
-        cfg.DISCOVERY_SCRAPE_CRON or DEFAULT_DISCOVERY_SCRAPE_CRON
-    )
     cron_jobs = [
-        # Jobhive slug warm-up — Sunday 2:30 UTC (before Sun 3 AM scrape).
         cron(import_jobhive_slugs_task, weekday={6}, hour=2, minute=30),
-        # Safety net: enqueue pending rows from last 24h.
-        cron(enqueue_scrape_pending_task, hour=3, minute=30),
-        # Scheduler health snapshot before daily maintenance block.
         cron(log_scheduler_health_task, hour=3, minute=55),
-        # Fallback discovery scrape — mirrors DISCOVERY_SCRAPE_CRON (default Sun+Wed 3 AM UTC).
-        cron(
-            run_discovery_scrape_task,
-            weekday=set(_scrape_schedule.python_weekdays),
-            hour=_scrape_schedule.hour,
-            minute=_scrape_schedule.minute,
-        ),
-        # Consolidated daily maintenance (watched → tiered refresh → jobs → headcount → ingest).
         cron(daily_discovery_maintenance_task, hour=4, minute=0),
-        # EDGAR Form D — every 6h for 48h funding SLA headroom (idempotent via dedupe_key).
         cron(poll_edgar_form_d_task, hour={0, 6, 12, 18}, minute=15),
+        cron(poll_edgar_8k_task, hour={1, 7, 13, 19}, minute=20),
+        cron(poll_warn_notices_task, weekday={0}, hour=3, minute=10, timeout=3600),
         cron(reconcile_pending_task, minute={0, 10, 20, 30, 40, 50}),
     ]

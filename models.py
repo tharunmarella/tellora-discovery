@@ -74,7 +74,7 @@ class DiscoveryCompany(SQLModel, table=True):
         default=None, sa_column=Column(ARRAY(Text), nullable=True)
     )
 
-    # Origin of this row: apollo (weekly scrape) | ora_research | manual | people_upload | sec_edgar
+    # Origin of this row: apollo | ora_research | manual | people_upload | sec_edgar
     source: str = Field(
         default="apollo", sa_column=Column(String, nullable=False, server_default="apollo", index=True)
     )
@@ -228,6 +228,8 @@ class DiscoveryEdge(SQLModel, table=True):
     Entity types: company (discovery_company.id), person (normalized name slug),
     vendor (tech key e.g. 'stripe'), customer (normalized company name).
     Edge types: employs_exec | uses_vendor | has_customer | works_at | left_company
+    dst_company_id: for has_customer, the tracked company the customer resolved to
+    (walk company → customer → company chains on it).
     """
     __tablename__ = "discovery_edge"
 
@@ -236,6 +238,7 @@ class DiscoveryEdge(SQLModel, table=True):
               "dst_type", "dst_id", unique=True),
         Index("ix_discovery_edge_src", "src_type", "src_id"),
         Index("ix_discovery_edge_dst", "dst_type", "dst_id"),
+        Index("ix_discovery_edge_type_dst_company", "edge_type", "dst_company_id"),
     )
 
     id: str = Field(default_factory=_uuid, sa_column=Column(String, primary_key=True))
@@ -244,6 +247,7 @@ class DiscoveryEdge(SQLModel, table=True):
     edge_type: str = Field(sa_column=Column(String, nullable=False, index=True))
     dst_type: str = Field(sa_column=Column(String, nullable=False))
     dst_id: str = Field(sa_column=Column(String, nullable=False))
+    dst_company_id: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
     payload: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
     source: str = Field(sa_column=Column(String, nullable=False))
     observed_at: datetime = Field(

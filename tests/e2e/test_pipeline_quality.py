@@ -138,7 +138,7 @@ def judge_pipeline_output(company_name: str, domain: str, result: dict) -> dict:
 
     def _do() -> dict:
         resp = client.models.generate_content(
-            model=cfg.E2E_JUDGE_MODEL,
+            model=os.getenv("MODEL_P2", "gemini-3.5-flash"),
             contents=prompt,
             config=config,
         )

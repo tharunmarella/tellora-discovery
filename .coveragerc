@@ -7,7 +7,6 @@ source = .
 omit =
     tests/*
     __main__.py
-    scrape/service.py
     scrape/domain_lookup.py
     signals/runner.py
     signals/pipeline.py

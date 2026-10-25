@@ -1,11 +1,11 @@
-"""Integration tests for scrape/headcount_backfill.py."""
+"""Integration tests for signals/headcount_backfill.py."""
 
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import text
 
-from scrape.headcount_backfill import backfill_apollo_headcounts
+from signals.headcount_backfill import backfill_apollo_headcounts
 
 
 pytestmark = pytest.mark.integration
@@ -18,10 +18,10 @@ async def test_backfill_fills_missing_headcount(db_session, company_factory):
 
     with (
         patch(
-            "scrape.headcount_backfill.fetch_apollo_headcount",
+            "signals.headcount_backfill.fetch_apollo_headcount",
             new_callable=AsyncMock,
         ) as mock_fetch,
-        patch("scrape.headcount_backfill.asyncio.sleep", new_callable=AsyncMock),
+        patch("signals.headcount_backfill.asyncio.sleep", new_callable=AsyncMock),
     ):
         mock_fetch.return_value = {"headcount_estimate": 250}
         stats = await backfill_apollo_headcounts(limit=10)
@@ -41,10 +41,10 @@ async def test_backfill_skips_when_apollo_returns_empty(db_session, company_fact
 
     with (
         patch(
-            "scrape.headcount_backfill.fetch_apollo_headcount",
+            "signals.headcount_backfill.fetch_apollo_headcount",
             new_callable=AsyncMock,
         ) as mock_fetch,
-        patch("scrape.headcount_backfill.asyncio.sleep", new_callable=AsyncMock),
+        patch("signals.headcount_backfill.asyncio.sleep", new_callable=AsyncMock),
     ):
         mock_fetch.return_value = {}
         stats = await backfill_apollo_headcounts(limit=10)
@@ -60,7 +60,7 @@ async def test_backfill_skips_when_apollo_returns_empty(db_session, company_fact
 
 @pytest.mark.asyncio
 async def test_backfill_no_eligible_rows(db_session):
-    with patch("scrape.headcount_backfill.asyncio.sleep", new_callable=AsyncMock):
+    with patch("signals.headcount_backfill.asyncio.sleep", new_callable=AsyncMock):
         stats = await backfill_apollo_headcounts(limit=10)
 
     assert stats == {"filled": 0, "skipped": 0, "processed": 0, "batches": 1}
@@ -70,7 +70,7 @@ async def test_backfill_no_eligible_rows(db_session):
 async def test_refresh_stale_headcount_updates_row(db_session, company_factory):
     from datetime import datetime, timedelta, timezone
 
-    from scrape.headcount_backfill import refresh_stale_apollo_headcounts
+    from signals.headcount_backfill import refresh_stale_apollo_headcounts
 
     stale = datetime.now(timezone.utc) - timedelta(days=40)
     company_factory(
@@ -83,10 +83,10 @@ async def test_refresh_stale_headcount_updates_row(db_session, company_factory):
 
     with (
         patch(
-            "scrape.headcount_backfill.fetch_apollo_headcount",
+            "signals.headcount_backfill.fetch_apollo_headcount",
             new_callable=AsyncMock,
         ) as mock_fetch,
-        patch("scrape.headcount_backfill.asyncio.sleep", new_callable=AsyncMock),
+        patch("signals.headcount_backfill.asyncio.sleep", new_callable=AsyncMock),
     ):
         mock_fetch.return_value = {"headcount_estimate": 250}
         stats = await refresh_stale_apollo_headcounts(limit=10, stale_days=30)

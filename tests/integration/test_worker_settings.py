@@ -39,32 +39,24 @@ def test_retry_and_concurrency_bounds():
 def test_monitoring_crons_registered():
     cron_funcs = {c.coroutine.__name__ for c in WorkerSettings.cron_jobs}
     assert "reconcile_pending_task" in cron_funcs
-    assert "run_discovery_scrape_task" in cron_funcs
     assert "daily_discovery_maintenance_task" in cron_funcs
     assert "log_scheduler_health_task" in cron_funcs
-    assert "enqueue_scrape_pending_task" in cron_funcs
     assert "import_jobhive_slugs_task" in cron_funcs
+    assert "run_discovery_scrape_task" not in cron_funcs
+    assert "enqueue_scrape_pending_task" not in cron_funcs
+
+
+def test_maintenance_does_not_repeat_jobs_that_have_their_own_cron():
+    import inspect
+
+    from signals.monitoring import daily_discovery_maintenance_task
+
+    src = inspect.getsource(daily_discovery_maintenance_task)
+    cron_funcs = {c.coroutine.__name__ for c in WorkerSettings.cron_jobs}
+    assert "poll_edgar_form_d_task" in cron_funcs and "poll_edgar_form_d_task(" not in src
+    assert "log_scheduler_health_task" in cron_funcs and "log_scheduler_health(" not in src
 
 
 def test_max_jobs_uses_setting():
     import settings as cfg
     assert WorkerSettings.max_jobs == cfg.SIGNAL_ENRICH_MAX_JOBS
-
-
-def test_scrape_fallback_cron_calculates_next_run():
-    """arq cron weekday must be set/list/tuple — frozenset crashes at runtime."""
-    from datetime import datetime, timezone
-
-    from arq.cron import next_cron
-
-    scrape_cron = next(
-        c for c in WorkerSettings.cron_jobs if c.coroutine.__name__ == "run_discovery_scrape_task"
-    )
-    now = datetime(2026, 6, 22, 2, 0, tzinfo=timezone.utc)  # Monday
-    next_run = next_cron(
-        now,
-        weekday=scrape_cron.weekday,
-        hour=scrape_cron.hour,
-        minute=scrape_cron.minute,
-    )
-    assert next_run.weekday() in scrape_cron.weekday

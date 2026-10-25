@@ -44,12 +44,6 @@ class SignalReenrichRequest(BaseModel):
     reset_failed: bool = False
 
 
-class WeeklyScrapeRequest(BaseModel):
-    dry_run: bool = False
-    headcount_only: bool = False
-    force: bool = True
-
-
 class HeadcountBackfillRequest(BaseModel):
     run_all: bool = False
     limit: Optional[int] = Field(default=None, ge=1, le=10_000)
@@ -160,36 +154,12 @@ async def start_signal_reenrich(body: SignalReenrichRequest) -> dict[str, Any]:
 
 
 @app.post(
-    "/admin/jobs/weekly-scrape",
-    status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(_require_admin_secret)],
-)
-async def start_weekly_scrape(body: WeeklyScrapeRequest) -> dict[str, Any]:
-    from cron.weekly import WeeklyCronArgs, apply_dry_run_settings, execute, validate_args
-
-    async def _run() -> dict[str, Any]:
-        args = WeeklyCronArgs(
-            dry_run=body.dry_run,
-            headcount_only=body.headcount_only,
-            force=body.force,
-        )
-        validate_args(args)
-        apply_dry_run_settings(args)
-        await execute(args)
-        return {"ok": True}
-
-    job = await submit_job("weekly_scrape", body.model_dump(), _run)
-    logger.info("Queued weekly_scrape job %s", job.id)
-    return {"job": job.to_dict()}
-
-
-@app.post(
     "/admin/jobs/headcount-backfill",
     status_code=status.HTTP_202_ACCEPTED,
     dependencies=[Depends(_require_admin_secret)],
 )
 async def start_headcount_backfill(body: HeadcountBackfillRequest) -> dict[str, Any]:
-    from scrape.headcount_backfill import backfill_apollo_headcounts
+    from signals.headcount_backfill import backfill_apollo_headcounts
 
     async def _run() -> dict[str, Any]:
         return await backfill_apollo_headcounts(limit=body.limit, run_all=body.run_all)

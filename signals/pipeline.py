@@ -177,14 +177,18 @@ async def fetch_apollo_headcount(domain: str) -> dict:
     """
     if not domain or not getattr(cfg, "TELLORA_APOLLO_API_KEY", None):
         return {}
+    from scrape.apollo_client import ApolloBudgetExhausted, search_page
+
     try:
-        from scrape.apollo_client import search_page
         data = await search_page(
             cfg.TELLORA_APOLLO_API_KEY,
             {"q_organization_domains_list": [domain]},
             page=1,
             per_page=1,
         )
+    except ApolloBudgetExhausted as exc:
+        logger.info(f"Apollo headcount lookup skipped for '{domain}': {exc}")
+        return {}
     except Exception as exc:
         logger.warning(f"Apollo headcount lookup failed for '{domain}': {exc}")
         return {}
@@ -233,41 +237,66 @@ _TECH_PATTERNS: dict[str, list[str]] = {
 
 # ── Tech stack detection ───────────────────────────────────────────────────
 
-async def detect_tech_stack(domain: str) -> list[str]:
-    """
-    Fetch homepage HTML + headers, regex-match known tech.
-    Returns list of detected technology keys e.g. ["hubspot", "stripe"].
-    Zero cost — pure HTTP + regex; optional httpcloak fallback on WAF block.
-    """
-    if not domain:
-        return []
-    url = f"https://{domain}" if not domain.startswith("http") else domain
-    try:
-        async with httpx.AsyncClient(
-            timeout=8.0,
-            follow_redirects=True,
-        ) as client:
-            result = await fetch_html(client, url, timeout=8.0)
-            if result.status_code != 200 or not result.text:
-                logger.warning(
-                    "Tech stack fetch failed for %s (status=%s via=%s)",
-                    domain, result.status_code, result.via,
-                )
-                return []
-            search_text = result.text + " " + " ".join(
-                f"{k}: {v}" for k, v in result.headers.items()
-            )
-    except Exception as exc:
-        logger.warning(f"Tech stack fetch failed for {domain}: {exc}")
-        return []
+def _cookies_from_headers(headers: dict[str, str]) -> dict[str, str]:
+    raw = headers.get("set-cookie") or ""
+    out = {}
+    for part in re.split(r",(?=\s*[A-Za-z0-9_.-]+=)", raw):
+        name, _, value = part.strip().partition("=")
+        if name:
+            out[name.strip()] = value.split(";")[0]
+    return out
 
-    detected = []
-    for tech, patterns in _TECH_PATTERNS.items():
-        for pat in patterns:
-            if re.search(pat, search_text, re.IGNORECASE):
-                detected.append(tech)
-                break
-    return detected
+
+async def detect_technologies(domain: str) -> dict:
+    """
+    Fingerprint the homepage + DNS with Wappalyzer-format rules (signals.techdetect).
+    Returns {"slugs": [...], "details": [{slug, name, categories, evidence}], "source": "wappalyzer"|"regex"|"none"}.
+    "source" lets the snapshot diff ignore runs where detection didn't happen.
+    """
+    from signals.techdetect import load_fingerprints, resolve_dns_records
+
+    empty = {"slugs": [], "details": [], "source": "none"}
+    if not domain:
+        return empty
+    url = f"https://{domain}" if not domain.startswith("http") else domain
+    page, dns_records, fingerprints = await asyncio.gather(
+        _fetch_page(url),
+        asyncio.to_thread(resolve_dns_records, domain),
+        asyncio.to_thread(load_fingerprints),
+    )
+    ok = page.status_code == 200 and bool(page.text)
+    if not ok:
+        logger.warning("Tech stack fetch failed for %s (status=%s via=%s)", domain, page.status_code, page.via)
+    if fingerprints is None:
+        if not ok:
+            return empty
+        search_text = page.text + " " + " ".join(f"{k}: {v}" for k, v in page.headers.items())
+        slugs = [
+            tech for tech, patterns in _TECH_PATTERNS.items()
+            if any(re.search(pat, search_text, re.IGNORECASE) for pat in patterns)
+        ]
+        return {"slugs": slugs, "details": [{"slug": t, "name": t, "categories": [], "evidence": "regex"} for t in slugs], "source": "regex"}
+
+    detections = await asyncio.to_thread(
+        fingerprints.detect,
+        html=page.text if ok else "",
+        headers=page.headers if ok else {},
+        cookies=_cookies_from_headers(page.headers) if ok else {},
+        url=url,
+        dns=dns_records,
+    )
+    if not ok and not dns_records:
+        return empty
+    details = [
+        {"slug": d.slug, "name": d.name, "categories": list(d.categories), "evidence": d.evidence}
+        for d in detections
+    ]
+    return {"slugs": [d["slug"] for d in details], "details": details, "source": "wappalyzer" if ok else "wappalyzer_dns"}
+
+
+async def detect_tech_stack(domain: str) -> list[str]:
+    """Technology slugs seen on the homepage / DNS, e.g. ["hubspot", "stripe"]."""
+    return (await detect_technologies(domain))["slugs"]
 
 
 # ── DNS TXT/MX tech detection ──────────────────────────────────────────────
@@ -349,12 +378,51 @@ async def detect_dns_tech(domain: str) -> list[str]:
 
 # ── Jina helpers ───────────────────────────────────────────────────────────
 
-async def _jina_read(url: str, max_chars: int = 3000) -> str:
-    """Fetch clean text from a URL via Jina Reader. Returns '' on failure."""
-    if not url:
+# Short-lived: only needs to span one company's enrichment (pages can be ~1MB).
+_PAGE_CACHE: TTLLRUCache = TTLLRUCache(maxsize=200, ttl=300.0)
+_PAGE_INFLIGHT: dict[str, asyncio.Future] = {}
+
+
+async def _fetch_page(url: str):
+    """One HTTP fetch per URL per enrichment, shared by text extraction, tech detection and feed discovery."""
+    from signals.http_fetch import FetchResult
+
+    cached = _PAGE_CACHE.get(url)
+    if cached is not None:
+        return cached
+    inflight = _PAGE_INFLIGHT.get(url)
+    if inflight is not None:
+        return await asyncio.shield(inflight)
+    fut: asyncio.Future = asyncio.get_event_loop().create_future()
+    _PAGE_INFLIGHT[url] = fut
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+            result = await fetch_html(client, url, timeout=15.0)
+    except Exception as exc:
+        logger.debug(f"Page fetch failed for {url}: {exc}")
+        result = FetchResult(status_code=0, text="", via="httpx")
+    finally:
+        _PAGE_INFLIGHT.pop(url, None)
+    _PAGE_CACHE.set(url, result)
+    if not fut.done():
+        fut.set_result(result)
+    return result
+
+
+def _extract_main_text(html: str, url: str) -> str:
+    import trafilatura
+
+    try:
+        return trafilatura.extract(
+            html, url=url, include_comments=False, include_tables=True, favor_recall=True,
+        ) or ""
+    except Exception as exc:
+        logger.debug(f"trafilatura failed for {url}: {exc}")
         return ""
-    if not url.startswith("http"):
-        url = f"https://{url}"
+
+
+async def _jina_read(url: str, max_chars: int = 3000) -> str:
+    """Jina Reader fallback for JS-rendered pages. Returns '' on failure."""
     headers: dict[str, str] = {"Accept": "text/plain", "X-No-Cache": "true"}
     if cfg.JINA_API_KEY:
         headers["Authorization"] = f"Bearer {cfg.JINA_API_KEY}"
@@ -373,6 +441,26 @@ async def _jina_read(url: str, max_chars: int = 3000) -> str:
         return ""
 
 
+async def _read_page(url: str, max_chars: int = 3000, *, jina_fallback: bool = False) -> str:
+    """
+    Clean main text of a page: direct fetch + trafilatura (local, free). Jina is
+    used only when jina_fallback is set and the page yields no text without JS.
+    """
+    if not url:
+        return ""
+    if not url.startswith("http"):
+        url = f"https://{url}"
+    page = await _fetch_page(url)
+    text_out = ""
+    if page.status_code == 200 and page.text:
+        text_out = await asyncio.to_thread(_extract_main_text, page.text, url)
+    if len(text_out) < 200 and jina_fallback:
+        jina = await _jina_read(url, max_chars=max_chars)
+        if len(jina) > len(text_out):
+            text_out = jina
+    return text_out[:max_chars]
+
+
 def page_fingerprint(text_content: str) -> str:
     """Stable SHA1 fingerprint of normalized page text. '' for empty pages."""
     if not text_content or len(text_content.strip()) < 100:
@@ -384,7 +472,8 @@ def page_fingerprint(text_content: str) -> str:
 async def fetch_company_context(domain: str) -> dict:
     """
     Fetch homepage + /about + /careers + /pricing + /customers + /changelog
-    via Jina Reader. Cached per domain for 1 hour.
+    (direct fetch + trafilatura; Jina only for a JS-only homepage). Cached per
+    domain for 1 hour.
     Returns {homepage, about, careers, pricing, customers, changelog}.
     """
     empty = {"homepage": "", "about": "", "careers": "",
@@ -400,12 +489,12 @@ async def fetch_company_context(domain: str) -> dict:
 
     homepage_text, about_text, careers_text, pricing_text, customers_text, changelog_text = (
         await asyncio.gather(
-            _jina_read(base, max_chars=8000),
-            _jina_read(f"{base}/about", max_chars=2000),
-            _jina_read(f"{base}/careers", max_chars=2000),
-            _jina_read(f"{base}/pricing", max_chars=2000),
-            _jina_read(f"{base}/customers", max_chars=2000),
-            _jina_read(f"{base}/changelog", max_chars=2000),
+            _read_page(base, max_chars=8000, jina_fallback=True),
+            _read_page(f"{base}/about", max_chars=2000),
+            _read_page(f"{base}/careers", max_chars=2000),
+            _read_page(f"{base}/pricing", max_chars=2000),
+            _read_page(f"{base}/customers", max_chars=2000),
+            _read_page(f"{base}/changelog", max_chars=2000),
         )
     )
 
@@ -416,7 +505,7 @@ async def fetch_company_context(domain: str) -> dict:
         if len(current) >= min_len or fallback_reads >= CONTEXT_FALLBACK_MAX:
             return current
         fallback_reads += 1
-        alt = await _jina_read(f"{base}{path}", max_chars=2000)
+        alt = await _read_page(f"{base}{path}", max_chars=2000)
         return alt if len(alt) > len(current) else current
 
     if len(about_text) < 200:
@@ -452,35 +541,6 @@ async def fetch_company_context(domain: str) -> dict:
         f"pricing={len(pricing_text)}c, customers={len(customers_text)}c, changelog={len(changelog_text)}c"
     )
     return ctx
-
-
-async def fetch_exec_hire_news(company_name: str) -> list[dict]:
-    """Serper news for executive hires at a company."""
-    if not company_name or not cfg.SERPER_API_KEY:
-        return []
-    try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            resp = await client.post(
-                "https://google.serper.dev/news",
-                headers={
-                    "X-API-KEY": cfg.SERPER_API_KEY,
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "q": f'"{company_name}" hires OR appoints OR "joins as" VP OR Chief OR Head',
-                    "num": 4,
-                    "tbs": "qdr:m3",
-                },
-            )
-            resp.raise_for_status()
-            return [
-                {"title": h.get("title", ""), "url": h.get("link", ""), "date": h.get("date", "")}
-                for h in resp.json().get("news", [])[:4]
-                if h.get("title")
-            ]
-    except Exception as exc:
-        logger.warning(f"Exec hire news failed for '{company_name}': {exc}")
-        return []
 
 
 # ── Gemini synthesis ───────────────────────────────────────────────────────
@@ -875,21 +935,14 @@ Respond with ONLY valid JSON matching this exact schema. No markdown, no explana
 
 # ── Embedding ──────────────────────────────────────────────────────────────
 
-def embed_company(
+def company_embed_text(
     company_summary: Optional[str],
     description: Optional[str],
     industry: Optional[str],
     tech_stack: list[str],
     recent_launches: Optional[list[str]] = None,
-) -> Optional[list[float]]:
-    """
-    Embed company text for semantic search using gemini-embedding-001.
-    Uses company_summary if available (richer), falls back to description.
-    Synchronous — run in executor.
-    """
-    if not cfg.GEMINI_API_KEY:
-        return None
-
+) -> str:
+    """The text a company's description_embedding is built from."""
     parts = []
     if company_summary:
         parts.append(company_summary)
@@ -901,12 +954,23 @@ def embed_company(
         parts.append(", ".join(tech_stack))
     if recent_launches:
         parts.append("Recent launches: " + "; ".join(recent_launches[:5]))
+    return " ".join(filter(None, parts)).strip()
 
-    text = " ".join(filter(None, parts)).strip()
-    if not text:
-        return None
 
-    return embed_text(text)
+def embed_company(
+    company_summary: Optional[str],
+    description: Optional[str],
+    industry: Optional[str],
+    tech_stack: list[str],
+    recent_launches: Optional[list[str]] = None,
+) -> Optional[list[float]]:
+    """
+    Embed company text for semantic search (llm.embed_text — see EMBEDDING_PROVIDER).
+    Uses company_summary if available (richer), falls back to description.
+    Synchronous — run in executor.
+    """
+    text = company_embed_text(company_summary, description, industry, tech_stack, recent_launches)
+    return embed_text(text) if text else None
 
 
 def build_search_tsv(
@@ -1001,6 +1065,22 @@ def _determine_enrichment_status(
     return "failed"
 
 
+async def _company_feed_events(domain: str, company_name: str, raw_meta: Optional[dict]) -> dict:
+    """First-party feed → {"feed_url", "events"}. Feed URL is discovered once and cached in raw_meta."""
+    from signals.sources.feeds import classify_feed_entries, discover_feed_url, fetch_feed_entries
+
+    if not domain:
+        return {"feed_url": None, "events": []}
+    meta = raw_meta or {}
+    feed_url = meta.get("feed_url")
+    if feed_url is None and not meta.get("feed_checked_at"):
+        home = await _fetch_page(f"https://{domain}")
+        feed_url = await discover_feed_url(domain, home.text if home.status_code == 200 else "")
+    entries = await fetch_feed_entries(feed_url) if feed_url else []
+    events = await asyncio.to_thread(classify_feed_entries, company_name, entries) if entries else []
+    return {"feed_url": feed_url, "events": events}
+
+
 async def _enrich_company_signals_impl(
     company_id: str,
     company_name: str,
@@ -1026,18 +1106,21 @@ async def _enrich_company_signals_impl(
 
     ctx_task = asyncio.create_task(fetch_company_context(domain))
     news_task = asyncio.create_task(fetch_funding_news(company_name))
-    tech_task = asyncio.create_task(detect_tech_stack(domain))
+    tech_task = asyncio.create_task(detect_technologies(domain))
     kg_task = asyncio.create_task(fetch_serper_kg(company_name))
     dns_task = asyncio.create_task(detect_dns_tech(domain))
     gh_task = asyncio.create_task(fetch_github_signals(domain))
     rss_task = asyncio.create_task(fetch_company_news(company_name))
     hn_task = asyncio.create_task(fetch_hn_signals(company_name, domain))
-    gov_task = asyncio.create_task(fetch_gov_awards(company_name))
+    gov_task = asyncio.create_task(
+        fetch_gov_awards(company_name, uei=(raw_meta or {}).get("usaspending_uei"))
+    )
+    feed_task = asyncio.create_task(_company_feed_events(domain, company_name, raw_meta))
 
     need_apollo_hc = not (existing_headcount and existing_headcount > 0)
     gather_tasks = [
         ctx_task, news_task, tech_task, kg_task,
-        dns_task, gh_task, rss_task, hn_task, gov_task,
+        dns_task, gh_task, rss_task, hn_task, gov_task, feed_task,
     ]
     if need_apollo_hc:
         apollo_task = asyncio.create_task(fetch_apollo_headcount(domain))
@@ -1047,14 +1130,16 @@ async def _enrich_company_signals_impl(
 
     ctx = gathered[0]
     funding_news = gathered[1]
-    tech_stack = gathered[2]
+    tech_info = gathered[2]
+    tech_stack = tech_info["slugs"]
     serper_kg = gathered[3]
     dns_tech = gathered[4]
     github = gathered[5]
     rss_news = gathered[6]
     hn_data = gathered[7]
     gov_awards = gathered[8]
-    idx = 9
+    feed = gathered[9]
+    idx = 10
     apollo_hc = gathered[idx] if need_apollo_hc else {}
 
     careers_html = "\n".join(
@@ -1104,10 +1189,10 @@ async def _enrich_company_signals_impl(
 
     news_events: list[dict] = []
     if rss_news:
-        news_events = await loop.run_in_executor(None, classify_news, company_name, rss_news)
-        exec_news = []
-    else:
-        exec_news = await fetch_exec_hire_news(company_name)
+        news_events = await asyncio.to_thread(
+            classify_news, company_name, rss_news,
+            domain=domain, description=description, industry=industry,
+        )
 
     if job_posts:
         from signals.job_posts import extract_posts_with_gemini
@@ -1124,18 +1209,7 @@ async def _enrich_company_signals_impl(
     extra_events.extend(github_extra_events(github))
     extra_events.extend(hn_extra_events(hn_data))
     extra_events.extend(gov_extra_events(gov_awards))
-    extra_events.extend([
-        {
-            "event_type": "exec_hire",
-            "title": h["title"][:500],
-            "payload": {"key": h.get("url", h["title"])[:120], "url": h.get("url"), "date": h.get("date")},
-            "source": "serper_news",
-            "confidence": 0.85,
-            "evidence_url": h.get("url"),
-            "event_date": h.get("date"),
-        }
-        for h in (exec_news or [])[:2]
-    ])
+    extra_events.extend(feed["events"])
     extra_events = filter_events_by_relevance(extra_events, company_name)
 
     buying_signals, signal_score, funding_stage, total_raised = apply_funding_grounding(
@@ -1270,7 +1344,24 @@ async def _enrich_company_signals_impl(
         },
         "github_org": github.get("org"),
         "extra_events": extra_events,
+        "detected_tech": tech_info["details"],
+        "tech_source": tech_info["source"],
+        "raw_meta_patch": _raw_meta_patch(raw_meta, feed=feed, gov_awards=gov_awards),
     }
+
+
+def _raw_meta_patch(raw_meta: Optional[dict], *, feed: dict, gov_awards: list[dict]) -> dict:
+    """Identity hints learned this run, merged into discovery_company.raw_meta."""
+    meta = raw_meta or {}
+    patch: dict = {}
+    if feed.get("feed_url") and feed["feed_url"] != meta.get("feed_url"):
+        patch["feed_url"] = feed["feed_url"]
+    if not meta.get("feed_url") and not meta.get("feed_checked_at"):
+        patch["feed_checked_at"] = datetime.now(timezone.utc).isoformat()
+    uei = next((a.get("uei") for a in gov_awards if a.get("uei")), None)
+    if uei and uei != meta.get("usaspending_uei"):
+        patch["usaspending_uei"] = uei
+    return patch
 
 
 async def enrich_company_signals(

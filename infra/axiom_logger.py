@@ -1,4 +1,4 @@
-"""Buffered Axiom client for the discovery service (worker + weekly cron)."""
+"""Buffered Axiom client for the discovery signal worker."""
 
 from __future__ import annotations
 

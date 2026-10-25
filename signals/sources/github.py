@@ -29,7 +29,9 @@ _API = "https://api.github.com"
 # domain → result dict. Negative resolutions cached too (org=None).
 _GH_CACHE: TTLLRUCache[dict] = TTLLRUCache(maxsize=cfg.DOMAIN_CACHE_MAXSIZE, ttl=86400.0)
 
-_EMPTY = {"org": None, "languages": [], "new_repos": [], "repo_count": 0, "new_npm_releases": [], "npm_package_count": 0}
+def _empty() -> dict:
+    """Fresh result — a shared _empty() let one company's npm releases leak into every later company."""
+    return {"org": None, "languages": [], "new_repos": [], "repo_count": 0, "new_npm_releases": [], "npm_package_count": 0}
 
 
 def _headers() -> dict:
@@ -77,13 +79,13 @@ async def fetch_github_signals(domain: str) -> dict:
     Cached per domain for 24h (including negative resolutions).
     """
     if not domain:
-        return dict(_EMPTY)
+        return _empty()
 
     cached = _GH_CACHE.get(domain)
     if cached is not None:
         return cached
 
-    result = dict(_EMPTY)
+    result = _empty()
     try:
         async with httpx.AsyncClient(timeout=15, headers=_headers()) as client:
             org = await _resolve_org(client, domain)
@@ -163,7 +165,7 @@ async def fetch_github_signals(domain: str) -> dict:
                     logger.debug(f"npm search failed for {org_login}: {exc}")
     except Exception as exc:
         logger.warning(f"GitHub signals failed for {domain}: {exc}")
-        return dict(_EMPTY)  # don't cache transient failures
+        return _empty()  # don't cache transient failures
 
     _GH_CACHE.set(domain, result)
     if result["org"]:

@@ -1,17 +1,26 @@
 """
-Apollo People API Search client with rate limiting and retry logic.
+Apollo People API Search client with a shared rate budget.
 
 Endpoint: POST https://api.apollo.io/api/v1/mixed_people/api_search
 Credits:  FREE — this endpoint does not consume Apollo credits.
-Rate limits: 200 req/min, 600 req/hour, 6000 req/day (plan-dependent).
+Rate limits (this key, from /usage_stats/api_usage_stats, Oct 2026):
+          200/minute, 6,000/hour, 50,000/day — fixed windows, no Retry-After.
+          Every response carries x-rate-limit-{minute,hourly,24-hour} and
+          x-{minute,hourly,24-hour}-usage; those headers are the source of truth.
 
-Strategy: pace at 1 request/sec, track hourly count, exponential backoff on 429.
+Every caller (ICP fill, the per-company headcount proxy, headcount backfills)
+goes through search_page → ApolloBudget, a Redis counter per window shared by
+all worker processes using the key, kept 10% under Apollo's limits:
+  - minute window full → wait for the next minute
+  - hour / day window full → ApolloBudgetExhausted (callers stop for now)
+  - 429 anyway (another client on the key) → wait out the minute, retry twice
 """
 
 import asyncio
+import hashlib
 import logging
 import time
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 
@@ -32,6 +41,7 @@ _ARRAY_KEYS = [
     "q_organization_job_titles",
     "organization_job_locations",
     "q_organization_domains_list",
+    "q_organization_keyword_tags",
 ]
 
 _RANGE_KEYS = [
@@ -44,6 +54,128 @@ _RANGE_KEYS = [
 
 class ApolloRateLimitError(Exception):
     pass
+
+
+class ApolloBudgetExhausted(ApolloRateLimitError):
+    """The hourly or daily window is used up — retrying now won't help."""
+
+
+_DEFAULT_LIMITS = {"minute": 200, "hour": 6000, "day": 50000}
+_WINDOW_SECONDS = {"minute": 60, "hour": 3600, "day": 86400}
+_LIMIT_HEADERS = {"minute": "x-rate-limit-minute", "hour": "x-rate-limit-hourly", "day": "x-rate-limit-24-hour"}
+_USAGE_HEADERS = {"minute": "x-minute-usage", "hour": "x-hourly-usage", "day": "x-24-hour-usage"}
+HEADROOM = 0.9
+
+
+class ApolloBudget:
+    """
+    Fixed-window request counters shared through Redis (per API key), so
+    concurrent enrichments, fills and backfills can't jointly exceed Apollo's
+    limits. Falls back to in-process counters when Redis is unavailable.
+    """
+
+    def __init__(self, api_key: str, redis_url: Optional[str] = None):
+        self._prefix = "apollo:rl:" + hashlib.sha256(api_key.encode()).hexdigest()[:12]
+        self._redis_url = redis_url
+        self._local: dict[str, int] = {}
+        self._limits = dict(_DEFAULT_LIMITS)
+
+    def _key(self, window: str, now: float) -> str:
+        return f"{self._prefix}:{window}:{int(now // _WINDOW_SECONDS[window])}"
+
+    async def _client(self):
+        if not self._redis_url:
+            return None
+        try:
+            import redis.asyncio as aioredis
+
+            return aioredis.from_url(self._redis_url, socket_connect_timeout=2)
+        except Exception:
+            return None
+
+    async def _incr(self, keys: dict[str, str], by: int) -> dict[str, int]:
+        r = await self._client()
+        if r is not None:
+            try:
+                pipe = r.pipeline()
+                for window, key in keys.items():
+                    pipe.incrby(key, by)
+                    pipe.expire(key, _WINDOW_SECONDS[window] * 2)
+                res = await pipe.execute()
+                stored = await r.get(f"{self._prefix}:limits")
+                await r.aclose()
+                if stored:
+                    import json
+
+                    self._limits.update(json.loads(stored))
+                return {w: int(res[i * 2]) for i, w in enumerate(keys)}
+            except Exception as exc:
+                logger.debug(f"Apollo budget: Redis unavailable, using local counters ({exc})")
+        out = {}
+        for window, key in keys.items():
+            self._local[key] = self._local.get(key, 0) + by
+            out[window] = self._local[key]
+        return out
+
+    async def acquire(self) -> None:
+        while True:
+            now = time.time()
+            keys = {w: self._key(w, now) for w in _WINDOW_SECONDS}
+            used = await self._incr(keys, 1)
+            over = [w for w in ("day", "hour", "minute") if used[w] > int(self._limits[w] * HEADROOM)]
+            if not over:
+                return
+            await self._incr(keys, -1)
+            if "day" in over or "hour" in over:
+                raise ApolloBudgetExhausted(f"Apollo {over[0]} budget used ({used[over[0]]}/{self._limits[over[0]]})")
+            await asyncio.sleep(60 - (now % 60) + 0.5)
+
+    async def sync(self, headers: httpx.Headers) -> None:
+        """Adopt Apollo's own limits and usage (other clients may share the key)."""
+        try:
+            limits = {w: int(headers[h]) for w, h in _LIMIT_HEADERS.items() if headers.get(h)}
+            usage = {w: int(headers[h]) for w, h in _USAGE_HEADERS.items() if headers.get(h)}
+        except ValueError:
+            return
+        if not limits and not usage:
+            return
+        self._limits.update(limits)
+        r = await self._client()
+        if r is None:
+            return
+        try:
+            import json
+
+            now = time.time()
+            if limits:
+                await r.set(f"{self._prefix}:limits", json.dumps(self._limits), ex=86400)
+            for window, n in usage.items():
+                key = self._key(window, now)
+                current = int(await r.get(key) or 0)
+                if n > current:
+                    await r.incrby(key, n - current)
+                    await r.expire(key, _WINDOW_SECONDS[window] * 2)
+            await r.aclose()
+        except Exception:
+            pass
+
+    async def wait_for_next_minute(self) -> None:
+        await asyncio.sleep(60 - (time.time() % 60) + 1)
+
+
+_budgets: dict[str, ApolloBudget] = {}
+
+
+def budget_for(api_key: str) -> ApolloBudget:
+    if api_key not in _budgets:
+        try:
+            import settings as cfg
+
+            redis_url = cfg.REDIS_URL
+        except Exception:
+            redis_url = None
+        _budgets[api_key] = ApolloBudget(api_key, redis_url)
+    return _budgets[api_key]
 
 
 async def search_page(
@@ -70,21 +202,29 @@ async def search_page(
         if filters.get(flat_key) is not None:
             params.append((apollo_key, filters[flat_key]))
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            APOLLO_SEARCH_URL,
-            headers={
-                "x-api-key": api_key,
-                "Content-Type": "application/json",
-                "Cache-Control": "no-cache",
-                "accept": "application/json",
-            },
-            params=params,
-            json={},
-        )
+    budget = budget_for(api_key)
+    for attempt in range(3):
+        await budget.acquire()
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                APOLLO_SEARCH_URL,
+                headers={
+                    "x-api-key": api_key,
+                    "Content-Type": "application/json",
+                    "Cache-Control": "no-cache",
+                    "accept": "application/json",
+                },
+                params=params,
+                json={},
+            )
+        await budget.sync(resp.headers)
+        if resp.status_code != 429:
+            break
+        if attempt == 2:
+            raise ApolloRateLimitError("Rate limit hit (429 after waiting out the minute window twice)")
+        logger.warning("Apollo 429 — waiting for the next minute window")
+        await budget.wait_for_next_minute()
 
-    if resp.status_code == 429:
-        raise ApolloRateLimitError("Rate limit hit")
     if resp.status_code == 403:
         raise ValueError("Apollo key lacks access — ensure it is a master API key")
     if resp.status_code == 401:
@@ -97,42 +237,20 @@ async def search_page(
 
 class ApolloRateLimiter:
     """
-    Paces Apollo requests to stay within free-tier limits:
-      - 1 request per second (200/min limit = comfortable headroom)
-      - Pauses ~1 hour when approaching 550 of the 600/hour ceiling
-      - Exponential backoff on 429 (60s → 120s → 240s … max 600s)
+    Per-caller pacing between pages (smooths bursts inside the minute window)
+    plus backoff on repeated 429s. Window budgets live in ApolloBudget.
     """
 
-    def __init__(self, min_interval: float = 1.1):
+    def __init__(self, min_interval: float = 0.35):
         self._min_interval = min_interval
         self._last_call: float = 0.0
-        self._hourly_count: int = 0
-        self._hour_start: float = time.monotonic()
         self._backoff: float = 60.0
 
     async def wait(self) -> None:
-        now = time.monotonic()
-
-        # Reset hourly window
-        if now - self._hour_start >= 3600:
-            self._hourly_count = 0
-            self._hour_start = now
-
-        # Approaching hourly ceiling — sit out the remainder of the window
-        if self._hourly_count >= 550:
-            remaining = 3600 - (now - self._hour_start) + 10
-            logger.info(f"Approaching hourly limit — pausing {remaining:.0f}s")
-            await asyncio.sleep(remaining)
-            self._hourly_count = 0
-            self._hour_start = time.monotonic()
-
-        # Enforce minimum interval between calls
         elapsed = time.monotonic() - self._last_call
         if elapsed < self._min_interval:
             await asyncio.sleep(self._min_interval - elapsed)
-
         self._last_call = time.monotonic()
-        self._hourly_count += 1
 
     async def on_rate_limit(self) -> None:
         logger.warning(f"Apollo 429 — backing off {self._backoff:.0f}s")

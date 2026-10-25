@@ -17,7 +17,7 @@ from database import make_engine, run_with_db_retry
 from infra.lifespan import SERVICE_WORKER
 from infra.sentry_telemetry import capture_task_failure
 from signals.pipeline import enrich_company_signals
-from signals.runner import persist_result
+from signals.runner import persist_result, push_alert_if_tier1
 
 logger = logging.getLogger("discovery.monitoring")
 
@@ -195,6 +195,7 @@ async def _refresh_company(row: dict, sem: asyncio.Semaphore) -> None:
             with Session(_engine) as session:
                 persist_result(session, company_id, result)
                 session.commit()
+            push_alert_if_tier1(row.get("domain"), result)
         except Exception as exc:
             logger.error(f"Refresh failed for {row.get('name')}: {exc}", exc_info=True)
             capture_task_failure(
@@ -307,9 +308,11 @@ async def poll_edgar_form_d_task(ctx) -> dict:
 
     filings = await fetch_filing_details(filings)
 
+    from signals.entity import CompanyIndex
+
     with Session(_engine) as session:
         stored = persist_filings(session, filings)
-        matched_domains = match_and_insert_events(session, filings)
+        matched_domains = match_and_insert_events(session, filings, CompanyIndex.load(session))
         session.commit()
 
     with Session(_engine) as session:
@@ -329,6 +332,54 @@ async def poll_edgar_form_d_task(ctx) -> dict:
     }
 
 
+def _insert_extra_events(session: Session, by_company: dict[str, list[dict]]) -> tuple[int, list[str]]:
+    """Insert batch-sourced extra_events; returns (inserted, domains with new alertable events)."""
+    from signals.diff import TIER1_ALERTABLE, draft_from_extra, insert_events
+
+    inserted, alert_ids = 0, []
+    for company_id, raw_events in by_company.items():
+        types = insert_events(session, company_id, [draft_from_extra(e) for e in raw_events])
+        inserted += len(types)
+        if TIER1_ALERTABLE.intersection(types):
+            alert_ids.append(company_id)
+    domains = []
+    if alert_ids:
+        rows = session.execute(text(
+            "SELECT domain FROM discovery_company WHERE id = ANY(:ids) AND domain IS NOT NULL"
+        ), {"ids": alert_ids}).all()
+        domains = [r[0] for r in rows]
+    return inserted, domains
+
+
+async def poll_edgar_8k_task(ctx) -> dict:
+    """Every 6h: officer changes (Item 5.02) and acquisitions (Item 2.01) from tracked public companies."""
+    from signals.sources.edgar import fetch_matched_8k_events, push_instant_alerts
+
+    with Session(_engine) as session:
+        by_company = await fetch_matched_8k_events(session, days=2)
+        inserted, domains = _insert_extra_events(session, by_company)
+        session.commit()
+    push_instant_alerts(domains)
+    logger.info(f"EDGAR 8-K poll: {len(by_company)} companies, {inserted} events inserted")
+    return {"companies": len(by_company), "inserted": inserted, "alerted": len(domains)}
+
+
+async def poll_warn_notices_task(ctx) -> dict:
+    """Weekly: WARN Act layoff notices from state labor departments → layoffs events."""
+    from signals.entity import CompanyIndex
+    from signals.sources.edgar import push_instant_alerts
+    from signals.sources.warn import fetch_recent_notices, match_notices
+
+    notices = await fetch_recent_notices()
+    with Session(_engine) as session:
+        by_company = match_notices(notices, CompanyIndex.load(session))
+        inserted, domains = _insert_extra_events(session, by_company)
+        session.commit()
+    push_instant_alerts(domains)
+    logger.info(f"WARN poll: {len(notices)} recent notices, {len(by_company)} matched, {inserted} inserted")
+    return {"notices": len(notices), "matched": len(by_company), "inserted": inserted}
+
+
 async def poll_product_hunt_task(ctx) -> dict:
     """Daily: match Product Hunt launches to companies; auto-create unmatched (capped)."""
     from signals.sources.news import (
@@ -336,6 +387,7 @@ async def poll_product_hunt_task(ctx) -> dict:
         fetch_product_hunt_launches,
         match_ph_launches,
     )
+    from signals.sources.edgar import push_instant_alerts
 
     launches = await fetch_product_hunt_launches()
     if not launches:
@@ -344,6 +396,7 @@ async def poll_product_hunt_task(ctx) -> dict:
     with Session(_engine) as session:
         matched_domains = match_ph_launches(session, launches)
         session.commit()
+    push_instant_alerts(matched_domains)
 
     with Session(_engine) as session:
         created = await create_companies_from_launches(session, launches)
@@ -461,22 +514,87 @@ async def import_jobhive_slugs_task(ctx) -> dict:
     return stats
 
 
-async def daily_discovery_maintenance_task(ctx) -> dict:
-    """Daily consolidated maintenance — ordered steps with per-step stats."""
-    import time
+async def fill_index_for_icp_task(ctx, key: str, filters: dict, max_new: int = 150,
+                                  release_keys: list[str] | None = None) -> dict:
+    """
+    On demand (backend: ICP saved, thin Discover pool, weekly top-up): add
+    companies matching one org's ICP, then ask the backend to rebuild that
+    org's Discover feed so they show up. release_keys are the backend's
+    cooldown claims for this fill; they're deleted when nothing could run
+    (daily cap or Apollo budget), so the backend retries on its next pass.
+    """
+    from sqlmodel import Session as SQLModelSession
 
-    from signals.scheduler_metrics import log_scheduler_health
+    from scrape.icp_fill import fill_index_for_icp
+
+    with SQLModelSession(_engine) as session:
+        stats = await fill_index_for_icp(session, key, filters, max_new=max_new)
+    if release_keys and not stats.get("added") and (stats.get("skipped") or stats.get("stopped")):
+        await _release_claims(release_keys)
+    if stats.get("added"):
+        import arq
+        from arq.connections import RedisSettings
+
+        pool = await arq.create_pool(RedisSettings.from_dsn(cfg.REDIS_URL))
+        try:
+            # the backend worker's default queue; delayed so the first enrichments land
+            await pool.enqueue_job("warm_discover_feed_task", org_id=key, refresh=True,
+                                   _defer_by=timedelta(minutes=10))
+        finally:
+            await pool.aclose()
+    return stats
+
+
+async def reembed_companies_task(ctx) -> dict:
+    """
+    Rebuild every company vector in the current embedding model (queued at
+    worker startup; returns at once when this model's run is complete).
+    """
+    from signals.reembed import reembed_companies
+
+    with Session(_engine) as session:
+        return await reembed_companies(session)
+
+
+async def _release_claims(keys: list[str]) -> None:
+    try:
+        import redis.asyncio as aioredis
+
+        r = aioredis.from_url(cfg.REDIS_URL, socket_connect_timeout=2)
+        await r.delete(*keys)
+        await r.aclose()
+    except Exception as exc:
+        logger.warning(f"[icp_fill] could not release claims {keys}: {exc}")
+
+
+async def resolve_customer_edges_task(ctx) -> dict:
+    """Daily: resolve has_customer edges to tracked companies (customer chains)."""
+    from signals.edges import resolve_customer_edges
+
+    with Session(_engine) as session:
+        stats = resolve_customer_edges(session)
+        session.commit()
+    logger.info(f"Customer edges: {stats}")
+    return stats
+
+
+async def daily_discovery_maintenance_task(ctx) -> dict:
+    """
+    Daily consolidated maintenance — ordered steps with per-step stats.
+    EDGAR Form D and the scheduler-health snapshot have their own crons
+    (worker.py), so they are not steps here.
+    """
+    import time
 
     steps: dict = {}
     for name, coro in (
-        ("scheduler_health", log_scheduler_health()),
         ("watched", refresh_watched_companies_task(ctx)),
         ("icp_hot", refresh_icp_hot_task(ctx)),
         ("cold", refresh_cold_index_task(ctx)),
         ("job_posts", poll_job_posts_task(ctx)),
         ("headcounts", refresh_headcounts_task(ctx)),
-        ("edgar", poll_edgar_form_d_task(ctx)),
         ("product_hunt", poll_product_hunt_task(ctx)),
+        ("customer_edges", resolve_customer_edges_task(ctx)),
     ):
         start = time.perf_counter()
         try:
@@ -499,7 +617,7 @@ async def daily_discovery_maintenance_task(ctx) -> dict:
 
 async def refresh_headcounts_task(ctx) -> dict:
     """Daily: re-fetch Apollo headcount estimates for rows with stale values."""
-    from scrape.headcount_backfill import refresh_stale_apollo_headcounts
+    from signals.headcount_backfill import refresh_stale_apollo_headcounts
 
     return await refresh_stale_apollo_headcounts()
 
