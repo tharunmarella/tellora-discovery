@@ -10,14 +10,14 @@ Only updates rows where headquarters is set and hq_city is still NULL.
 Deduplicates by distinct headquarters string (~2k values → ~85 LLM calls at batch=25).
 
 Prerequisites:
-  - OPENAI_API_KEY set (or GROQ_API_KEY with --provider groq)
+  - OPENAI_API_KEY set
   - DATABASE_URL set (same as discovery service)
 
 Usage:
   python scripts/backfill_hq_normalize.py --dry-run
   python scripts/backfill_hq_normalize.py --limit 50
   python scripts/backfill_hq_normalize.py --batch-size 25
-  python scripts/backfill_hq_normalize.py --provider groq --model openai/gpt-oss-20b
+  python scripts/backfill_hq_normalize.py --model openai/gpt-5.6-luna
   python scripts/backfill_hq_normalize.py --force
 """
 
@@ -105,11 +105,10 @@ def _chunks(items: list[str], size: int) -> list[list[str]]:
 def _normalize_batch(
     batch: list[str],
     *,
-    provider: str,
     model: str | None,
 ) -> dict[str, dict]:
     """LLM batch call with per-item fallback if the batch fails."""
-    results = normalize_headquarters_batch(batch, provider=provider, model=model)
+    results = normalize_headquarters_batch(batch, model=model)
     if len(results) >= len(batch) * 0.8:
         return results
 
@@ -118,14 +117,8 @@ def _normalize_batch(
     )
     for raw in batch:
         if raw not in results:
-            results[raw] = normalize_headquarters(raw, provider=provider, model=model)
+            results[raw] = normalize_headquarters(raw, model=model)
     return results
-
-
-def _provider_ready(provider: str) -> bool:
-    if provider == "groq":
-        return bool(cfg.GROQ_API_KEY)
-    return llm_available()
 
 
 def _apply_batch(
@@ -164,7 +157,6 @@ def run(
     force: bool,
     batch_size: int,
     delay_s: float,
-    provider: str,
     model: str | None,
 ) -> None:
     engine = _make_engine()
@@ -177,11 +169,11 @@ def run(
         to_process = min(distinct_hq, limit) if limit else distinct_hq
         num_batches = (to_process + batch_size - 1) // batch_size if to_process else 0
 
-        model_label = model or (cfg.HQ_GROQ_MODEL if provider == "groq" else cfg.HQ_NORMALIZE_MODEL or signal_model_chain()[0])
+        model_label = model or cfg.HQ_NORMALIZE_MODEL or signal_model_chain()[0]
         logger.info(
             f"Rows to update: {row_count} | distinct headquarters: {distinct_hq} | "
             f"will normalize: {to_process} in {num_batches} batch(es) of {batch_size} | "
-            f"provider={provider} model={model_label}"
+            f"model={model_label}"
         )
         if dry_run:
             logger.info("Dry run — exiting without changes")
@@ -203,7 +195,7 @@ def run(
 
     for batch_idx, batch in enumerate(batches, start=1):
         batch_start = time.time()
-        normalized = _normalize_batch(batch, provider=provider, model=model)
+        normalized = _normalize_batch(batch, model=model)
         with Session(engine) as session:
             b_ok, b_skipped, b_failed = _apply_batch(
                 session, batch, normalized, force=force,
@@ -255,19 +247,13 @@ def main() -> None:
         help="Seconds between LLM batch calls (default: 0.3)",
     )
     parser.add_argument(
-        "--provider", choices=["llm", "groq"], default=None,
-        help="LLM provider (default: HQ_NORMALIZE_PROVIDER env or llm — the MODEL_P* chain)",
-    )
-    parser.add_argument(
         "--model", default=None,
-        help="Model override (default: first MODEL_P* model or openai/gpt-oss-20b)",
+        help="Model override (default: HQ_NORMALIZE_MODEL or the first MODEL_P* model)",
     )
     args = parser.parse_args()
 
-    provider = (args.provider or cfg.HQ_NORMALIZE_PROVIDER or "llm").strip().lower()
-    if not _provider_ready(provider):
-        key = "GROQ_API_KEY" if provider == "groq" else "OPENAI_API_KEY"
-        logger.error(f"{key} is not set for provider={provider}")
+    if not llm_available():
+        logger.error("OPENAI_API_KEY is not set")
         sys.exit(1)
 
     if args.batch_size < 1:
@@ -280,7 +266,6 @@ def main() -> None:
         force=args.force,
         batch_size=args.batch_size,
         delay_s=args.delay,
-        provider=provider,
         model=args.model,
     )
 

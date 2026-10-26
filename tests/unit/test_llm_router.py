@@ -14,15 +14,13 @@ from llm import (
 )
 
 
-def _openai_chain(monkeypatch, *, openai_key="test-key", groq_key=""):
+def _openai_chain(monkeypatch, *, openai_key="test-key"):
     import llm as llm_mod
 
     monkeypatch.setattr(llm_mod, "MODEL_P1", "gpt-6-luna")
     monkeypatch.setattr(llm_mod, "MODEL_P2", "openai/gpt-5.6-luna")
     monkeypatch.setattr(llm_mod, "MODEL_P3", "")
-    monkeypatch.setattr(llm_mod, "MODEL_P4", "groq/openai/gpt-oss-20b")
     monkeypatch.setattr(llm_mod.cfg, "OPENAI_API_KEY", openai_key)
-    monkeypatch.setattr(llm_mod.cfg, "GROQ_API_KEY", groq_key, raising=False)
 
 
 def test_to_litellm_model_adds_openai_prefix():
@@ -30,7 +28,7 @@ def test_to_litellm_model_adds_openai_prefix():
 
 
 def test_to_litellm_model_keeps_provider_prefix():
-    assert to_litellm_model("groq/openai/gpt-oss-20b") == "groq/openai/gpt-oss-20b"
+    assert to_litellm_model("anthropic/claude-x") == "anthropic/claude-x"
 
 
 def test_to_litellm_model_requires_name():
@@ -39,11 +37,11 @@ def test_to_litellm_model_requires_name():
 
 
 def test_model_chain_dedupes_and_skips_blanks():
-    chain = model_chain("gpt-6-luna", None, "openai/gpt-6-luna", "groq/x")
-    assert chain == ["openai/gpt-6-luna", "groq/x"]
+    chain = model_chain("gpt-6-luna", None, "openai/gpt-6-luna", "anthropic/x")
+    assert chain == ["openai/gpt-6-luna", "anthropic/x"]
 
 
-def test_default_model_chain_is_openai_and_skips_keyless_groq(monkeypatch):
+def test_default_model_chain_is_openai(monkeypatch):
     _openai_chain(monkeypatch)
     assert default_model_chain() == ["openai/gpt-6-luna", "openai/gpt-5.6-luna"]
 
@@ -53,12 +51,6 @@ def test_default_model_chain_without_keys_raises(monkeypatch):
     assert llm_available() is False
     with pytest.raises(RuntimeError):
         default_model_chain()
-
-
-def test_llm_available_with_only_groq(monkeypatch):
-    _openai_chain(monkeypatch, openai_key="", groq_key="g")
-    assert llm_available() is True
-    assert default_model_chain() == ["groq/openai/gpt-oss-20b"]
 
 
 def test_signal_model_chain_primary_override(monkeypatch):
@@ -100,6 +92,7 @@ def test_complete_text_tries_models_in_order(monkeypatch):
     # luna only accepts temperature=0 with reasoning off
     assert "reasoning_effort" not in calls[0]
     assert calls[1]["reasoning_effort"] == "none"
+    assert calls[1]["allowed_openai_params"] == ["reasoning_effort"]
 
 
 def test_configure_litellm_sets_drop_params():

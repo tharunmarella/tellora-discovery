@@ -651,43 +651,11 @@ def _parse_hq_batch_response(raw: str) -> list[dict]:
     return json.loads(text)
 
 
-def _hq_normalize_model(provider: str, model: Optional[str] = None) -> str:
-    if model:
-        return model
-    if provider == "groq":
-        return cfg.HQ_GROQ_MODEL
-    if cfg.HQ_NORMALIZE_MODEL:
-        return cfg.HQ_NORMALIZE_MODEL
-    return signal_model_chain()[0]
+def _hq_normalize_model(model: Optional[str] = None) -> str:
+    return model or cfg.HQ_NORMALIZE_MODEL or signal_model_chain()[0]
 
 
-def _hq_provider_ready(provider: str) -> bool:
-    if provider == "groq":
-        return bool(cfg.GROQ_API_KEY)
-    return llm_available()
-
-
-def _call_hq_llm(prompt: str, *, provider: str, model: str) -> str:
-    if provider == "groq":
-        from groq import Groq
-        client = Groq(api_key=cfg.GROQ_API_KEY)
-        resp = client.chat.completions.create(
-            model=model,
-            temperature=0,
-            response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You normalize company headquarters strings to structured geographic fields. "
-                        "Respond with valid JSON only."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-        )
-        return resp.choices[0].message.content or ""
-
+def _call_hq_llm(prompt: str, *, model: str) -> str:
     return get_router().complete_text(
         prompt,
         models=signal_model_chain(primary=model),
@@ -730,34 +698,32 @@ def _items_to_hq_map(items: list[dict]) -> dict[str, dict]:
 def normalize_headquarters_batch(
     raw_headquarters: list[str],
     *,
-    provider: Optional[str] = None,
     model: Optional[str] = None,
 ) -> dict[str, dict]:
     """
-    Normalize many raw headquarters strings in one LLM call (MODEL_P* chain or Groq).
+    Normalize many raw headquarters strings in one LLM call (MODEL_P* chain).
     Returns {raw_string: {hq_city, hq_region, hq_country}} for each input.
     """
     inputs = [(r or "").strip() for r in raw_headquarters if (r or "").strip()]
     if not inputs:
         return {}
 
-    provider = (provider or cfg.HQ_NORMALIZE_PROVIDER or "llm").strip().lower()
-    if not _hq_provider_ready(provider):
-        logger.warning(f"HQ batch normalization skipped — {provider} API key not set")
+    if not llm_available():
+        logger.warning("HQ batch normalization skipped — OPENAI_API_KEY not set")
         return {}
 
     prompt = _build_hq_batch_prompt(inputs)
-    model_id = _hq_normalize_model(provider, model)
+    model_id = _hq_normalize_model(model)
 
     def _do():
-        raw = _call_hq_llm(prompt, provider=provider, model=model_id)
+        raw = _call_hq_llm(prompt, model=model_id)
         return _items_to_hq_map(_parse_hq_batch_response(raw))
 
     try:
         return retry_llm(_do)
     except Exception as exc:
         logger.warning(
-            f"HQ batch normalization failed ({len(inputs)} items, {provider}/{model_id}): {exc}"
+            f"HQ batch normalization failed ({len(inputs)} items, {model_id}): {exc}"
         )
         return {}
 
@@ -765,7 +731,6 @@ def normalize_headquarters_batch(
 def normalize_headquarters(
     raw_headquarters: str,
     *,
-    provider: Optional[str] = None,
     model: Optional[str] = None,
 ) -> dict:
     """
@@ -775,7 +740,7 @@ def normalize_headquarters(
     raw = (raw_headquarters or "").strip()
     if not raw:
         return dict(_EMPTY_HQ)
-    batch = normalize_headquarters_batch([raw], provider=provider, model=model)
+    batch = normalize_headquarters_batch([raw], model=model)
     return batch.get(raw) or dict(_EMPTY_HQ)
 
 

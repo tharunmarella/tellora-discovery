@@ -15,7 +15,6 @@ def _require(key: str) -> str:
 
 DATABASE_URL: str = _require("DATABASE_URL")
 TELLORA_APOLLO_API_KEY: str = _require("TELLORA_APOLLO_API_KEY")
-GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 
 # Embeddings — must match the backend's EMBEDDING_PROVIDER / OPENAI_EMBEDDING_MODEL:
@@ -26,10 +25,8 @@ EMBEDDING_PROVIDER: str = os.getenv("EMBEDDING_PROVIDER", "openai").strip().lowe
 OPENAI_EMBEDDING_MODEL: str = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large").strip()
 EMBEDDING_DIM = 768  # vector(768) columns
 
-# HQ backfill LLM: "llm" (default — the MODEL_P* chain) or "groq"
-HQ_NORMALIZE_PROVIDER: str = os.getenv("HQ_NORMALIZE_PROVIDER", "llm").strip().lower()
+# HQ backfill LLM: optional primary model in front of the MODEL_P* chain
 HQ_NORMALIZE_MODEL: str = os.getenv("HQ_NORMALIZE_MODEL", "").strip()
-HQ_GROQ_MODEL: str = os.getenv("HQ_GROQ_MODEL", "openai/gpt-oss-20b").strip()
 
 # LiteLLM gateway — the MODEL_P* fallback chain lives in llm.py. Bare model ids are
 # treated as openai/*.

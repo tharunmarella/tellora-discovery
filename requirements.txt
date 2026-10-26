@@ -7,7 +7,6 @@ python-dotenv>=1.0.0
 ddgs>=9.0.0
 litellm>=1.51.0
 openai>=1.40.0
-groq>=0.37.0
 pgvector>=0.3.0
 redis>=5.0.0
 arq>=0.26.0

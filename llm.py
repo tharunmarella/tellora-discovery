@@ -1,4 +1,4 @@
-"""LiteLLM model ladder — P1 (default) → P2 → P3 → P4 (cheap Groq), OpenAI first."""
+"""LiteLLM model ladder — P1 (default) → P2 → P3."""
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ logger = logging.getLogger("discovery.llm")
 MODEL_P1 = os.getenv("MODEL_P1", "openai/gpt-6-luna").strip()
 MODEL_P2 = os.getenv("MODEL_P2", "openai/gpt-5.6-luna").strip()
 MODEL_P3 = os.getenv("MODEL_P3", "").strip()
-MODEL_P4 = os.getenv("MODEL_P4", "groq/openai/gpt-oss-20b").strip()
 
 
 def configure_litellm() -> None:
@@ -67,24 +66,22 @@ def model_chain(*models: Optional[str]) -> List[str]:
 def _model_available(model: str) -> bool:
     if model.startswith("openai/"):
         return bool(cfg.OPENAI_API_KEY)
-    if model.startswith("groq/"):
-        return bool(getattr(cfg, "GROQ_API_KEY", ""))
     if model.startswith("anthropic/"):
         return bool(getattr(cfg, "ANTHROPIC_API_KEY", ""))
     return False
 
 
 def default_model_chain() -> List[str]:
-    chain = model_chain(MODEL_P1, MODEL_P2, MODEL_P3, MODEL_P4)
+    chain = model_chain(MODEL_P1, MODEL_P2, MODEL_P3)
     available = [m for m in chain if _model_available(m)]
     if not available:
-        raise RuntimeError("No LLM models available — set OPENAI_API_KEY and/or GROQ_API_KEY")
+        raise RuntimeError("No LLM models available — set OPENAI_API_KEY")
     return available
 
 
 def llm_available() -> bool:
     """True when at least one model in the default chain has its API key."""
-    return any(_model_available(m) for m in model_chain(MODEL_P1, MODEL_P2, MODEL_P3, MODEL_P4))
+    return any(_model_available(m) for m in model_chain(MODEL_P1, MODEL_P2, MODEL_P3))
 
 
 def signal_model_chain(*, primary: Optional[str] = None) -> List[str]:
@@ -109,8 +106,6 @@ class LLMRouter:
             os.environ.setdefault("OPENAI_API_KEY", cfg.OPENAI_API_KEY)
         if getattr(cfg, "ANTHROPIC_API_KEY", ""):
             os.environ.setdefault("ANTHROPIC_API_KEY", cfg.ANTHROPIC_API_KEY)
-        if getattr(cfg, "GROQ_API_KEY", ""):
-            os.environ.setdefault("GROQ_API_KEY", cfg.GROQ_API_KEY)
 
     @property
     def enrichment_models(self) -> List[str]:
@@ -149,11 +144,12 @@ class LLMRouter:
             }
             if json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
-            if model.startswith("groq/"):
-                kwargs["reasoning_format"] = "hidden"
             if "luna" in model:
                 # luna rejects temperature != 1 unless reasoning is off; extraction wants it off anyway
                 kwargs["reasoning_effort"] = "none"
+                # with drop_params, LiteLLM silently drops reasoning_effort for
+                # models its param map doesn't list (gpt-6-luna) unless allowed
+                kwargs["allowed_openai_params"] = ["reasoning_effort"]
             try:
                 response = litellm.completion(**kwargs)
                 text = (response.choices[0].message.content or "").strip()
