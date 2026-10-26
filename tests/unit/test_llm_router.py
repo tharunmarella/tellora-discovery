@@ -6,17 +6,27 @@ import pytest
 
 from llm import (
     LLMRouter,
-    MODEL_P1,
-    MODEL_P2,
     default_model_chain,
+    llm_available,
     model_chain,
     signal_model_chain,
     to_litellm_model,
 )
 
 
-def test_to_litellm_model_adds_gemini_prefix():
-    assert to_litellm_model("gemini-3.1-flash-lite") == "gemini/gemini-3.1-flash-lite"
+def _openai_chain(monkeypatch, *, openai_key="test-key", groq_key=""):
+    import llm as llm_mod
+
+    monkeypatch.setattr(llm_mod, "MODEL_P1", "gpt-6-luna")
+    monkeypatch.setattr(llm_mod, "MODEL_P2", "openai/gpt-5.6-luna")
+    monkeypatch.setattr(llm_mod, "MODEL_P3", "")
+    monkeypatch.setattr(llm_mod, "MODEL_P4", "groq/openai/gpt-oss-20b")
+    monkeypatch.setattr(llm_mod.cfg, "OPENAI_API_KEY", openai_key)
+    monkeypatch.setattr(llm_mod.cfg, "GROQ_API_KEY", groq_key, raising=False)
+
+
+def test_to_litellm_model_adds_openai_prefix():
+    assert to_litellm_model("gpt-6-luna") == "openai/gpt-6-luna"
 
 
 def test_to_litellm_model_keeps_provider_prefix():
@@ -29,36 +39,31 @@ def test_to_litellm_model_requires_name():
 
 
 def test_model_chain_dedupes_and_skips_blanks():
-    chain = model_chain("gemini-3.1-flash-lite", None, "gemini-3.1-flash-lite", "groq/x")
-    assert chain == ["gemini/gemini-3.1-flash-lite", "groq/x"]
+    chain = model_chain("gpt-6-luna", None, "openai/gpt-6-luna", "groq/x")
+    assert chain == ["openai/gpt-6-luna", "groq/x"]
 
 
-def test_default_model_chain_starts_with_p1(monkeypatch):
-    import llm as llm_mod
+def test_default_model_chain_is_openai_and_skips_keyless_groq(monkeypatch):
+    _openai_chain(monkeypatch)
+    assert default_model_chain() == ["openai/gpt-6-luna", "openai/gpt-5.6-luna"]
 
-    monkeypatch.setattr(llm_mod, "MODEL_P1", "gemini-3.1-flash-lite")
-    monkeypatch.setattr(llm_mod, "MODEL_P2", "gemini-2.5-flash")
-    monkeypatch.setattr(llm_mod, "MODEL_P3", "gemini-2.5-flash-lite")
-    monkeypatch.setattr(llm_mod, "MODEL_P4", "groq/openai/gpt-oss-20b")
-    monkeypatch.setattr(llm_mod.cfg, "GEMINI_API_KEY", "test-key", raising=False)
-    monkeypatch.setattr(llm_mod.cfg, "GROQ_API_KEY", "", raising=False)
 
-    chain = default_model_chain()
-    assert chain[0] == "gemini/gemini-3.1-flash-lite"
-    assert "gemini/gemini-2.5-flash" in chain
+def test_default_model_chain_without_keys_raises(monkeypatch):
+    _openai_chain(monkeypatch, openai_key="")
+    assert llm_available() is False
+    with pytest.raises(RuntimeError):
+        default_model_chain()
+
+
+def test_llm_available_with_only_groq(monkeypatch):
+    _openai_chain(monkeypatch, openai_key="", groq_key="g")
+    assert llm_available() is True
+    assert default_model_chain() == ["groq/openai/gpt-oss-20b"]
 
 
 def test_signal_model_chain_primary_override(monkeypatch):
-    import llm as llm_mod
-
-    monkeypatch.setattr(llm_mod, "MODEL_P1", "gemini-3.1-flash-lite")
-    monkeypatch.setattr(llm_mod, "MODEL_P2", "gemini-2.5-flash")
-    monkeypatch.setattr(llm_mod, "MODEL_P3", "gemini-2.5-flash-lite")
-    monkeypatch.setattr(llm_mod, "MODEL_P4", "groq/openai/gpt-oss-20b")
-    monkeypatch.setattr(llm_mod.cfg, "GEMINI_API_KEY", "test-key", raising=False)
-    monkeypatch.setattr(llm_mod.cfg, "GROQ_API_KEY", "", raising=False)
-
-    assert signal_model_chain(primary="gemini-custom")[0] == "gemini/gemini-custom"
+    _openai_chain(monkeypatch)
+    assert signal_model_chain(primary="gpt-custom")[0] == "openai/gpt-custom"
 
 
 def test_complete_text_tries_models_in_order(monkeypatch):
@@ -66,7 +71,7 @@ def test_complete_text_tries_models_in_order(monkeypatch):
 
     monkeypatch.setattr(cfg, "LITELLM_NUM_RETRIES", 1)
 
-    calls: list[str] = []
+    calls: list[dict] = []
 
     class _Msg:
         content = "  hello  "
@@ -75,23 +80,26 @@ def test_complete_text_tries_models_in_order(monkeypatch):
         message = _Msg()
 
     class _Resp:
-        model = "gemini/gemini-2.5-flash"
+        model = "openai/gpt-6-luna"
         choices = [_Choice()]
 
     import litellm
 
     def _fake_completion(**kwargs):
-        calls.append(kwargs["model"])
-        if kwargs["model"] == "gemini/a":
+        calls.append(kwargs)
+        if kwargs["model"] == "openai/a":
             raise RuntimeError("fail primary")
         return _Resp()
 
     monkeypatch.setattr(litellm, "completion", _fake_completion)
 
     router = LLMRouter()
-    out = router.complete_text("prompt", models=["gemini/a", "gemini/b"], temperature=0.0)
+    out = router.complete_text("prompt", models=["openai/a", "openai/gpt-6-luna"], temperature=0.0)
     assert out == "hello"
-    assert calls == ["gemini/a", "gemini/b"]
+    assert [c["model"] for c in calls] == ["openai/a", "openai/gpt-6-luna"]
+    # luna only accepts temperature=0 with reasoning off
+    assert "reasoning_effort" not in calls[0]
+    assert calls[1]["reasoning_effort"] == "none"
 
 
 def test_configure_litellm_sets_drop_params():

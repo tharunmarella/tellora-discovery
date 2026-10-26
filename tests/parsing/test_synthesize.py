@@ -1,13 +1,12 @@
-"""Tests for Gemini synthesis with stubbed client."""
+"""Tests for LLM synthesis with a stubbed router."""
 
 import json
 
 from signals.pipeline import CompanySignalResult, synthesize_company_signals
 
 
-def test_synthesize_company_signals_with_stub(gemini_stub, monkeypatch):
-    monkeypatch.setattr("settings.GEMINI_API_KEY", "test-key")
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+def test_synthesize_company_signals_with_stub(llm_stub, monkeypatch):
+    monkeypatch.setattr("signals.pipeline.llm_available", lambda: True)
     payload = {
         "company_summary": "Acme builds dev tools.",
         "buying_signals": ["Hiring 5 engineers"],
@@ -25,7 +24,7 @@ def test_synthesize_company_signals_with_stub(gemini_stub, monkeypatch):
         "hq_region": "CA",
         "hq_country": "US",
     }
-    gemini_stub(payload)
+    llm_stub(payload)
     result = synthesize_company_signals(
         company_name="Acme",
         homepage_text="We build developer tools for teams.",
@@ -41,7 +40,7 @@ def test_synthesize_company_signals_with_stub(gemini_stub, monkeypatch):
 
 
 def test_synthesize_missing_api_key_returns_empty(monkeypatch):
-    monkeypatch.setattr("settings.GEMINI_API_KEY", "")
+    monkeypatch.setattr("signals.pipeline.llm_available", lambda: False)
     result = synthesize_company_signals(
         company_name="Acme",
         homepage_text="x",

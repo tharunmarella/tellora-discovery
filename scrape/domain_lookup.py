@@ -4,11 +4,11 @@ Company enrichment pipeline for the discovery service.
 Flow per company:
   1. Serper search "{company_name} CEO: {ceo_first_name}"
   2. Trim response to knowledgeGraph + top 7 organic results
-  3. Single Gemini call: extract all DiscoveryCompany fields from the JSON
+  3. Single LLM call: extract all DiscoveryCompany fields from the JSON
   4. Embed description + use_case → 768-dim vector for semantic search
 
 Fallback: DuckDuckGo if Serper is not configured or returns nothing.
-Requires: GOOGLE_API_KEY. Optional: SERPER_API_KEY.
+Requires: OPENAI_API_KEY. Optional: SERPER_API_KEY.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import time
 import httpx
 
 import settings as cfg
-from llm import get_router, retry_llm, strip_json_fences
+from llm import get_router, llm_available, retry_llm, strip_json_fences
 
 logger = logging.getLogger("discovery.enrichment")
 
@@ -103,7 +103,7 @@ def extract_linkedin_url(serper_data: dict) -> str | None:
     return None
 
 
-def _call_gemini(company_name: str, serper_data: dict) -> dict:
+def _call_llm(company_name: str, serper_data: dict) -> dict:
     trimmed = {
         "knowledgeGraph": serper_data.get("knowledgeGraph"),
         "organic": serper_data.get("organic", [])[:7],
@@ -182,7 +182,7 @@ def _fetch_ddg(query: str) -> dict:
 
 def _run_lookup(company_name: str, ceo_first_name: str, serper_api_key: str) -> dict:
     """
-    One search (Serper → DDG fallback) + one Gemini call.
+    One search (Serper → DDG fallback) + one LLM call.
     Returns enrichment dict matching DiscoveryCompany fields plus
     keywords, use_case (stored in raw_meta) and description_embedding.
     """
@@ -201,14 +201,14 @@ def _run_lookup(company_name: str, ceo_first_name: str, serper_api_key: str) -> 
         logger.debug(f"No search results for {company_name!r}")
         return {}
 
-    # Single Gemini call — extracts all fields from the full Serper JSON
+    # Single LLM call — extracts all fields from the full Serper JSON
     try:
-        extracted = _call_gemini(company_name, serper_data)
+        extracted = _call_llm(company_name, serper_data)
     except Exception as exc:
-        logger.warning(f"Gemini extraction failed for {company_name!r}: {exc}")
+        logger.warning(f"LLM extraction failed for {company_name!r}: {exc}")
         return {}
 
-    # Map Gemini output → enrichment dict (only include non-null values)
+    # Map LLM output → enrichment dict (only include non-null values)
     enrichment: dict = {}
     for field in ("name", "domain", "website_url", "description",
                   "ceo_name", "headquarters", "founded_year", "funding", "linkedin_url"):
@@ -216,7 +216,7 @@ def _run_lookup(company_name: str, ceo_first_name: str, serper_api_key: str) -> 
         if val:
             enrichment[field] = val
 
-    # Prefer deterministic LinkedIn company URL from search results over Gemini guess.
+    # Prefer deterministic LinkedIn company URL from search results over the LLM guess.
     linkedin = extract_linkedin_url(serper_data) or enrichment.get("linkedin_url")
     if linkedin:
         enrichment["linkedin_url"] = linkedin
@@ -227,7 +227,7 @@ def _run_lookup(company_name: str, ceo_first_name: str, serper_api_key: str) -> 
         else:
             enrichment.pop("linkedin_url", None)
 
-    # industries: array from Gemini → store as comma-joined string in `industry` column
+    # industries: array from the LLM → store as comma-joined string in `industry` column
     industries = extracted.get("industries") or []
     if isinstance(industries, list) and industries:
         enrichment["industry"] = ", ".join(industries)
@@ -261,8 +261,8 @@ async def lookup_domain(company_name: str, ceo_first_name: str = "") -> dict:
     Async wrapper — runs in thread pool to avoid blocking the event loop.
     Returns enrichment dict with DiscoveryCompany fields ready to write to DB.
     """
-    if not cfg.GEMINI_API_KEY:
-        logger.warning("GEMINI_API_KEY not set — skipping enrichment")
+    if not llm_available():
+        logger.warning("OPENAI_API_KEY not set — skipping enrichment")
         return {}
 
     serper_api_key = cfg.SERPER_API_KEY

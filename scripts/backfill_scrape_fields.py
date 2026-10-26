@@ -1,7 +1,7 @@
 """
 Backfill scrape-time fields on existing discovery_company rows.
 
-Re-runs the same Serper + Gemini lookup used at Apollo ingest to fill
+Re-runs the same Serper + LLM lookup used at Apollo ingest to fill
 linkedin_url, website_url, ceo_name, raw_meta (keywords/use_case), logo_url,
 and other scrape metadata — without touching signal enrichment fields.
 

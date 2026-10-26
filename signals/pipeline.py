@@ -6,11 +6,10 @@ Gathers buying signals for a single discovery_company record:
   2. Job boards   — Greenhouse, Lever, Ashby, SmartRecruiters, Workable (public APIs)
   3. Funding news — Serper News (or Google News RSS fallback)
   4. Tech stack   — regex on homepage HTML/headers (no API needed)
-  5. Gemini synthesis — company-only prompt using gemini-3.1-flash-lite
+  5. LLM synthesis — company-only prompt through the MODEL_P* chain (llm.py)
 
 Adapted from tellora-backend/services/enrichment_service.py.
 Person-specific params (name, job title, LinkedIn) removed.
-Model: gemini-3.1-flash-lite  ($0.25/$1.50 per 1M tokens, stable)
 """
 
 import asyncio
@@ -26,7 +25,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 import settings as cfg
-from llm import embed_text, get_router, retry_llm, signal_model_chain, strip_json_fences
+from llm import embed_text, get_router, llm_available, retry_llm, signal_model_chain, strip_json_fences
 from signals.cache import TTLLRUCache
 from signals.constants import (
     CONTEXT_FALLBACK_MAX,
@@ -44,7 +43,7 @@ logger = logging.getLogger("discovery.signal")
 
 # Apollo's free people-search returns total_entries (contacts Apollo knows at a
 # company). It is NOT headcount, but scales with company size, so we use it as a
-# last-resort headcount proxy when Gemini + Serper KG give us nothing. The factor
+# last-resort headcount proxy when the LLM + Serper KG give us nothing. The factor
 # converts "contacts Apollo has" → "approx employees" (rough; tune via env).
 APOLLO_HEADCOUNT_FACTOR = float(getattr(cfg, "APOLLO_HEADCOUNT_FACTOR", 1.0) or 1.0)
 
@@ -543,10 +542,10 @@ async def fetch_company_context(domain: str) -> dict:
     return ctx
 
 
-# ── Gemini synthesis ───────────────────────────────────────────────────────
+# ── LLM synthesis ──────────────────────────────────────────────────────────
 
 class CompanySignalResult(BaseModel):
-    """Structured company-level signal output from Gemini."""
+    """Structured company-level signal output from the LLM."""
     company_summary: Optional[str] = Field(
         None,
         description="2-3 sentences: what the company does, who they sell to, market position. "
@@ -659,13 +658,13 @@ def _hq_normalize_model(provider: str, model: Optional[str] = None) -> str:
         return cfg.HQ_GROQ_MODEL
     if cfg.HQ_NORMALIZE_MODEL:
         return cfg.HQ_NORMALIZE_MODEL
-    return cfg.SIGNAL_GEMINI_MODEL
+    return signal_model_chain()[0]
 
 
 def _hq_provider_ready(provider: str) -> bool:
     if provider == "groq":
         return bool(cfg.GROQ_API_KEY)
-    return bool(cfg.GEMINI_API_KEY)
+    return llm_available()
 
 
 def _call_hq_llm(prompt: str, *, provider: str, model: str) -> str:
@@ -735,14 +734,14 @@ def normalize_headquarters_batch(
     model: Optional[str] = None,
 ) -> dict[str, dict]:
     """
-    Normalize many raw headquarters strings in one LLM call (Gemini or Groq).
+    Normalize many raw headquarters strings in one LLM call (MODEL_P* chain or Groq).
     Returns {raw_string: {hq_city, hq_region, hq_country}} for each input.
     """
     inputs = [(r or "").strip() for r in raw_headquarters if (r or "").strip()]
     if not inputs:
         return {}
 
-    provider = (provider or cfg.HQ_NORMALIZE_PROVIDER or "gemini").strip().lower()
+    provider = (provider or cfg.HQ_NORMALIZE_PROVIDER or "llm").strip().lower()
     if not _hq_provider_ready(provider):
         logger.warning(f"HQ batch normalization skipped — {provider} API key not set")
         return {}
@@ -817,12 +816,11 @@ def synthesize_company_signals(
     changelog_text: str = "",
 ) -> CompanySignalResult:
     """
-    Send all company evidence to Gemini and receive a structured CompanySignalResult.
-    Uses gemini-3.1-flash-lite — stable, optimized for extraction at scale.
+    Send all company evidence to the LLM and receive a structured CompanySignalResult.
     Synchronous: runs in a thread pool via asyncio.get_event_loop().run_in_executor.
     """
-    if not cfg.GEMINI_API_KEY:
-        logger.warning("GEMINI_API_KEY not set — skipping synthesis")
+    if not llm_available():
+        logger.warning("OPENAI_API_KEY not set — skipping synthesis")
         return _EMPTY_SIGNAL
 
     tech_line = (
@@ -916,9 +914,8 @@ Respond with ONLY valid JSON matching this exact schema. No markdown, no explana
 {_JSON_SCHEMA}"""
 
     def _do():
-        # Route through the LiteLLM gateway: Gemini primary → Gemini fallback →
-        # Anthropic (when configured), so a single-provider outage doesn't drop
-        # the whole synthesis batch.
+        # Route through the LiteLLM gateway (MODEL_P* chain in llm.py), so one
+        # model's outage doesn't drop the whole synthesis batch.
         raw = get_router().complete_text(prompt, temperature=0.0)
         data = json.loads(strip_json_fences(raw))
         return CompanySignalResult(**{
@@ -929,7 +926,7 @@ Respond with ONLY valid JSON matching this exact schema. No markdown, no explana
     try:
         return retry_llm(_do)
     except Exception as exc:
-        logger.warning(f"Gemini synthesis failed for {company_name}: {exc}")
+        logger.warning(f"LLM synthesis failed for {company_name}: {exc}")
         return _EMPTY_SIGNAL
 
 
@@ -1195,8 +1192,8 @@ async def _enrich_company_signals_impl(
         )
 
     if job_posts:
-        from signals.job_posts import extract_posts_with_gemini
-        job_posts = await loop.run_in_executor(None, extract_posts_with_gemini, job_posts)
+        from signals.job_posts import extract_posts_with_llm
+        job_posts = await loop.run_in_executor(None, extract_posts_with_llm, job_posts)
 
     concepts: list[str] = []
     for p in job_posts:

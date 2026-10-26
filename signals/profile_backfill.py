@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Optional
 import httpx
 
 import settings as cfg
-from llm import get_router, retry_llm, signal_model_chain, strip_json_fences
+from llm import get_router, llm_available, retry_llm, signal_model_chain, strip_json_fences
 
 if TYPE_CHECKING:
     from signals.pipeline import CompanySignalResult
@@ -60,7 +60,7 @@ async def fetch_serper_web_snippets(query: str, *, num: int = 5) -> list[str]:
 
 def extract_funding_profile(company_name: str, snippets: list[str]) -> dict:
     """Profile-only funding extraction from search snippets."""
-    if not snippets or not cfg.GEMINI_API_KEY:
+    if not snippets or not llm_available():
         return {}
     evidence = "\n".join(f"- {s}" for s in snippets[:5])
     prompt = f"""Extract funding profile facts for a CRM company record.
@@ -101,7 +101,7 @@ Return ONLY valid JSON:
 
 def extract_hq_raw(company_name: str, snippets: list[str]) -> Optional[str]:
     """Pick a headquarters string from search snippets for normalization."""
-    if not snippets or not cfg.GEMINI_API_KEY:
+    if not snippets or not llm_available():
         return None
     evidence = "\n".join(f"- {s}" for s in snippets[:5])
     prompt = f"""From the search snippets below, extract the company's headquarters location as a single raw string (city, region, country if available).

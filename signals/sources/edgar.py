@@ -52,7 +52,7 @@ TECH_INDUSTRY_GROUPS = frozenset({
     "other health care",
 })
 
-# Max new discovery_company rows auto-created per daily EDGAR poll (caps Serper/Gemini cost)
+# Max new discovery_company rows auto-created per daily EDGAR poll (caps Serper/LLM cost)
 AUTO_CREATE_CAP = int(getattr(cfg, "EDGAR_AUTO_CREATE_CAP", 25) or 25)
 
 _CORP_SUFFIXES = re.compile(

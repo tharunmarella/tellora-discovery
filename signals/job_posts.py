@@ -1,5 +1,5 @@
 """
-Job-post ingestion — fetch ATS bodies, Gemini-extract concepts, persist to DB.
+Job-post ingestion — fetch ATS bodies, LLM-extract concepts, persist to DB.
 
 Slug resolution tiers:
   0. Cached ats_board on discovery_company (or jobhive pre-enrich lookup)
@@ -23,7 +23,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 import settings as cfg
-from llm import get_router, retry_llm, strip_json_fences
+from llm import get_router, llm_available, retry_llm, strip_json_fences
 from signals.ats_detect import (
     detect_ats_candidates,
     extract_slug_from_serp_url,
@@ -435,9 +435,9 @@ async def check_job_boards(
     }
 
 
-def extract_posts_with_gemini(posts: list[dict]) -> list[dict]:
-    """Batch Gemini extraction for role_family, concepts, tech, initiatives."""
-    if not posts or not cfg.GEMINI_API_KEY:
+def extract_posts_with_llm(posts: list[dict]) -> list[dict]:
+    """Batch LLM extraction for role_family, concepts, tech, initiatives."""
+    if not posts or not llm_available():
         return posts
 
     sample = [p for p in posts if p.get("body_text")][: _MAX_POSTS_EXTRACT]
@@ -478,7 +478,7 @@ Respond ONLY with valid JSON:
             p["tech"] = ex.get("tech") or []
             p["initiatives"] = ex.get("initiatives") or []
     except Exception as exc:
-        logger.warning(f"Job post Gemini extraction failed: {exc}")
+        logger.warning(f"Job post LLM extraction failed: {exc}")
 
     return posts
 

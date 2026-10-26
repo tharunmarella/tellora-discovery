@@ -1,7 +1,7 @@
 """
 End-to-end pipeline quality gate — runs real enrichment + LLM judge.
 
-Requires SERPER_API_KEY, GOOGLE_API_KEY/GEMINI_API_KEY, Docker not required.
+Requires SERPER_API_KEY, OPENAI_API_KEY, Docker not required.
 Pre-push hook runs this suite and blocks push if quality is below threshold.
 """
 
@@ -15,13 +15,13 @@ from datetime import datetime, timezone
 import pytest
 
 import settings as cfg
-from llm import get_gemini_client, retry_llm, strip_json_fences
+from llm import get_openai_client, retry_llm, strip_json_fences
 from signals.pipeline import enrich_company_signals
 
 
 pytestmark = [pytest.mark.e2e, pytest.mark.asyncio]
 
-_PLACEHOLDERS = {"", "test-gemini-key", "test-apollo-key"}
+_PLACEHOLDERS = {"", "test-openai-key", "test-apollo-key"}
 
 
 def _has_real_key(*names: str) -> bool:
@@ -32,8 +32,8 @@ def _require_keys() -> None:
     missing = []
     if not _has_real_key("SERPER_API_KEY"):
         missing.append("SERPER_API_KEY")
-    if not _has_real_key("GOOGLE_API_KEY", "GEMINI_API_KEY"):
-        missing.append("GOOGLE_API_KEY or GEMINI_API_KEY")
+    if not _has_real_key("OPENAI_API_KEY"):
+        missing.append("OPENAI_API_KEY")
     if missing:
         pytest.fail(
             "E2E pipeline quality gate requires real API keys: "
@@ -53,13 +53,13 @@ MEAN_THRESHOLD = 8
 
 JUDGE_PROMPT = """You are a strict data-quality auditor for a B2B company enrichment pipeline.
 
-TODAY'S DATE IS {today}. You have a Google Search tool — USE IT to verify recent,
+TODAY'S DATE IS {today}. You have a web search tool — USE IT to verify recent,
 time-sensitive claims (funding rounds, launches, headcount, customers) before judging.
 
 CRITICAL DATE RULE: Any event dated on or before {today} is a PAST event, not a
 "future" one. Do NOT call a claim a hallucination merely because it is more recent
 than your training data — search to confirm it. Only flag a claim as a hallucination
-if Google Search contradicts it or finds no supporting evidence.
+if web search contradicts it or finds no supporting evidence.
 
 Company: {company_name} ({domain})
 
@@ -67,7 +67,7 @@ PIPELINE OUTPUT (JSON):
 {payload}
 
 Score the output 0-10 on:
-1. factual_accuracy — claims match what Google Search confirms for this company
+1. factual_accuracy — claims match what web search confirms for this company
 2. completeness — key fields populated (summary, industry signals, tech, HQ if known, hiring if public)
 3. no_hallucination — no invented funding, customers, or products (verify via search)
 
@@ -127,22 +127,15 @@ def judge_pipeline_output(company_name: str, domain: str, result: dict) -> dict:
         domain=domain,
         payload=json.dumps(_judge_payload(result), indent=2),
     )
-    client = get_gemini_client()
-
-    from google.genai import types
-
-    config = types.GenerateContentConfig(
-        tools=[types.Tool(google_search=types.GoogleSearch())],
-        temperature=0,
-    )
+    model = cfg.E2E_JUDGE_MODEL.removeprefix("openai/")
 
     def _do() -> dict:
-        resp = client.models.generate_content(
-            model=os.getenv("MODEL_P2", "gemini-3.5-flash"),
-            contents=prompt,
-            config=config,
+        resp = get_openai_client().responses.create(
+            model=model,
+            input=prompt,
+            tools=[{"type": "web_search"}],
         )
-        return _extract_json_obj(resp.text)
+        return _extract_json_obj(resp.output_text)
 
     return retry_llm(_do)
 

@@ -52,7 +52,7 @@ class DiscoveryCompany(SQLModel, table=True):
     description: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
     industry: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True, index=True))
 
-    # Company profile fields — sourced from Serper KG / Apollo / Gemini
+    # Company profile fields — sourced from Serper KG / Apollo / LLM
     ceo_name: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
     headquarters: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
     hq_city: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True, index=True))
@@ -63,7 +63,7 @@ class DiscoveryCompany(SQLModel, table=True):
     logo_url: Optional[str] = Field(default=None, sa_column=Column(String, nullable=True))
 
     # Embedding of description + use_case — used for semantic prospect search
-    # Populated during discovery scrape via gemini-embedding-001 (768 dims)
+    # Populated during discovery scrape via OpenAI text-embedding-3-large (768 dims)
     description_embedding: Optional[List[float]] = Field(
         default=None, sa_column=Column(Vector(768), nullable=True)
     )

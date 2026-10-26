@@ -10,7 +10,7 @@ Also: searches per ICP query separately (no averaging), deduplicates by company 
 
 Usage:
   cd tellora-discovery
-  GOOGLE_API_KEY=xxx DATABASE_URL=postgresql://... python scripts/test_search.py
+  OPENAI_API_KEY=xxx DATABASE_URL=postgresql://... python scripts/test_search.py
   or just: python scripts/test_search.py  (reads from .env)
 """
 
@@ -21,9 +21,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import settings as cfg
+from llm import embed_texts, get_router, llm_available, strip_json_fences
 
-if not cfg.GEMINI_API_KEY:
-    print("Set GOOGLE_API_KEY / GEMINI_API_KEY env var")
+if not llm_available():
+    print("Set OPENAI_API_KEY env var")
     sys.exit(1)
 if not cfg.DATABASE_URL:
     print("Set DATABASE_URL env var")
@@ -36,11 +37,7 @@ SEARCHES = [
     "HR onboarding automation for mid-size companies",
 ]
 
-from google import genai
-from google.genai import types
 import psycopg2
-
-client = genai.Client(api_key=cfg.GEMINI_API_KEY)
 
 
 def generate_buyer_profiles(product_description: str) -> list[str]:
@@ -64,24 +61,13 @@ Example for "field service scheduling software":
 
 Return a JSON array of strings. No explanation."""
 
-    resp = client.models.generate_content(model=cfg.ENRICHMENT_GEMINI_MODEL, contents=prompt)
-    raw = resp.text.strip().strip("`").strip()
-    if raw.startswith("json"):
-        raw = raw[4:].strip()
-    queries = json.loads(raw)
+    raw = get_router().complete_text(prompt, models=get_router().enrichment_models, temperature=0.0)
+    queries = json.loads(strip_json_fences(raw))
     return [q for q in queries if isinstance(q, str)][:5]
 
 
 def embed(text: str) -> list[float]:
-    resp = client.models.embed_content(
-        model="gemini-embedding-001",
-        contents=text,
-        config=types.EmbedContentConfig(
-            task_type="RETRIEVAL_QUERY",
-            output_dimensionality=768,
-        ),
-    )
-    return resp.embeddings[0].values
+    return embed_texts([text])[0]
 
 
 def search(vector: list[float], limit: int = 10, min_score: float = 0.40) -> list[dict]:

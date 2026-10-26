@@ -33,19 +33,6 @@ def _sentry_before_send(event: dict[str, Any], hint: dict[str, Any]) -> dict[str
         if "Unclosed client session" in msg or "Unclosed connector" in msg:
             return None
 
-    exc_info = hint.get("exc_info")
-    if exc_info:
-        _exc_type, exc_value, _tb = exc_info
-        if exc_value is not None:
-            from llm import is_transient_llm_error
-
-            if not is_transient_llm_error(exc_value):
-                return event
-            for entry in (event.get("exception") or {}).get("values") or []:
-                mech = entry.get("mechanism") or {}
-                if mech.get("type") == "google_genai":
-                    return None
-
     return event
 
 

@@ -1,4 +1,4 @@
-"""LiteLLM model ladder — P1 (default) → P2 → P3 → P4 (cheap Groq)."""
+"""LiteLLM model ladder — P1 (default) → P2 → P3 → P4 (cheap Groq), OpenAI first."""
 
 from __future__ import annotations
 
@@ -13,22 +13,10 @@ import settings as cfg
 
 logger = logging.getLogger("discovery.llm")
 
-GEMINI_EMBED_MODEL = "gemini-embedding-001"
-
-MODEL_P1 = os.getenv("MODEL_P1", "gemini-3.1-flash-lite").strip()
-MODEL_P2 = os.getenv("MODEL_P2", "gemini-2.5-flash").strip()
-MODEL_P3 = os.getenv("MODEL_P3", "gemini-2.5-flash-lite").strip()
+MODEL_P1 = os.getenv("MODEL_P1", "openai/gpt-6-luna").strip()
+MODEL_P2 = os.getenv("MODEL_P2", "openai/gpt-5.6-luna").strip()
+MODEL_P3 = os.getenv("MODEL_P3", "").strip()
 MODEL_P4 = os.getenv("MODEL_P4", "groq/openai/gpt-oss-20b").strip()
-
-_gemini_client = None
-
-
-def get_gemini_client():
-    global _gemini_client
-    if _gemini_client is None:
-        from google import genai
-        _gemini_client = genai.Client(api_key=cfg.GEMINI_API_KEY)
-    return _gemini_client
 
 
 def configure_litellm() -> None:
@@ -60,7 +48,7 @@ def to_litellm_model(model: str) -> str:
     model = (model or "").strip()
     if not model:
         raise ValueError("model name required")
-    return model if "/" in model else f"gemini/{model}"
+    return model if "/" in model else f"openai/{model}"
 
 
 def model_chain(*models: Optional[str]) -> List[str]:
@@ -77,21 +65,26 @@ def model_chain(*models: Optional[str]) -> List[str]:
 
 
 def _model_available(model: str) -> bool:
-    if model.startswith("gemini/"):
-        return bool(cfg.GEMINI_API_KEY)
+    if model.startswith("openai/"):
+        return bool(cfg.OPENAI_API_KEY)
     if model.startswith("groq/"):
         return bool(getattr(cfg, "GROQ_API_KEY", ""))
     if model.startswith("anthropic/"):
         return bool(getattr(cfg, "ANTHROPIC_API_KEY", ""))
-    return bool(cfg.GEMINI_API_KEY)
+    return False
 
 
 def default_model_chain() -> List[str]:
     chain = model_chain(MODEL_P1, MODEL_P2, MODEL_P3, MODEL_P4)
     available = [m for m in chain if _model_available(m)]
     if not available:
-        raise RuntimeError("No LLM models available — set GOOGLE_API_KEY and/or GROQ_API_KEY")
+        raise RuntimeError("No LLM models available — set OPENAI_API_KEY and/or GROQ_API_KEY")
     return available
+
+
+def llm_available() -> bool:
+    """True when at least one model in the default chain has its API key."""
+    return any(_model_available(m) for m in model_chain(MODEL_P1, MODEL_P2, MODEL_P3, MODEL_P4))
 
 
 def signal_model_chain(*, primary: Optional[str] = None) -> List[str]:
@@ -112,8 +105,8 @@ class LLMRouter:
         self._export_provider_keys()
 
     def _export_provider_keys(self) -> None:
-        if cfg.GEMINI_API_KEY:
-            os.environ.setdefault("GEMINI_API_KEY", cfg.GEMINI_API_KEY)
+        if cfg.OPENAI_API_KEY:
+            os.environ.setdefault("OPENAI_API_KEY", cfg.OPENAI_API_KEY)
         if getattr(cfg, "ANTHROPIC_API_KEY", ""):
             os.environ.setdefault("ANTHROPIC_API_KEY", cfg.ANTHROPIC_API_KEY)
         if getattr(cfg, "GROQ_API_KEY", ""):
@@ -158,6 +151,9 @@ class LLMRouter:
                 kwargs["response_format"] = {"type": "json_object"}
             if model.startswith("groq/"):
                 kwargs["reasoning_format"] = "hidden"
+            if "luna" in model:
+                # luna rejects temperature != 1 unless reasoning is off; extraction wants it off anyway
+                kwargs["reasoning_effort"] = "none"
             try:
                 response = litellm.completion(**kwargs)
                 text = (response.choices[0].message.content or "").strip()
@@ -251,40 +247,22 @@ def get_openai_client():
 
 def embedding_model() -> str:
     """Names the vector space stored in description_embedding."""
-    if cfg.EMBEDDING_PROVIDER == "openai":
-        return f"openai/{cfg.OPENAI_EMBEDDING_MODEL}"
-    return f"gemini/{GEMINI_EMBED_MODEL}"
+    return f"openai/{cfg.OPENAI_EMBEDDING_MODEL}"
 
 
 def embedding_available() -> bool:
-    return bool(cfg.OPENAI_API_KEY if cfg.EMBEDDING_PROVIDER == "openai" else cfg.GEMINI_API_KEY)
+    return cfg.EMBEDDING_PROVIDER == "openai" and bool(cfg.OPENAI_API_KEY)
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Document embeddings, one per text (one API call for OpenAI). Raises on failure."""
-    if cfg.EMBEDDING_PROVIDER == "openai":
-        def _do():
-            resp = get_openai_client().embeddings.create(
-                model=cfg.OPENAI_EMBEDDING_MODEL, input=texts, dimensions=cfg.EMBEDDING_DIM,
-            )
-            return [d.embedding for d in sorted(resp.data, key=lambda d: d.index)]
-
-        return retry_llm(_do)
-
-    from google.genai import types
-
-    def _one(text: str):
-        resp = get_gemini_client().models.embed_content(
-            model=GEMINI_EMBED_MODEL,
-            contents=text,
-            config=types.EmbedContentConfig(
-                task_type="RETRIEVAL_DOCUMENT",
-                output_dimensionality=cfg.EMBEDDING_DIM,
-            ),
+    """Document embeddings, one per text, in one API call. Raises on failure."""
+    def _do():
+        resp = get_openai_client().embeddings.create(
+            model=cfg.OPENAI_EMBEDDING_MODEL, input=texts, dimensions=cfg.EMBEDDING_DIM,
         )
-        return resp.embeddings[0].values
+        return [d.embedding for d in sorted(resp.data, key=lambda d: d.index)]
 
-    return [retry_llm(lambda t=t: _one(t)) for t in texts]
+    return retry_llm(_do)
 
 
 def embed_text(text: str) -> list[float] | None:

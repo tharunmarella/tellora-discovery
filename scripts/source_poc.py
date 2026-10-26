@@ -30,8 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import httpx
 
-import settings as cfg
-from llm import get_gemini_client, retry_llm, strip_json_fences
+from llm import get_router, retry_llm, strip_json_fences
 
 DEMO_COMPANY = "Vercel"
 DEMO_DOMAIN = "vercel.com"
@@ -42,12 +41,10 @@ def header(n, title):
     print(f"\n{'=' * 78}\nSOURCE {n} — {title}\n{'=' * 78}")
 
 
-def gemini_json(prompt):
+def llm_json(prompt):
     def _do():
-        client = get_gemini_client()
-        resp = client.models.generate_content(
-            model=cfg.SIGNAL_GEMINI_MODEL, contents=prompt)
-        return json.loads(strip_json_fences(resp.text))
+        raw = get_router().complete_text(prompt, models=get_router().signal_models, temperature=0.0)
+        return json.loads(strip_json_fences(raw))
     return retry_llm(_do)
 
 
@@ -67,7 +64,7 @@ async def source1():
         print(f"  {path:<12} {len(text):>5} chars   fingerprint={fp}")
 
     if pages.get("/changelog"):
-        extracted = gemini_json(f"""From this changelog page text, list product
+        extracted = llm_json(f"""From this changelog page text, list product
 launches/releases with approximate dates. Only items visible in the text.
 TEXT: {pages['/changelog'][:1800]}
 Return JSON: {{"launches": [{{"title": "...", "date": "YYYY-MM or null"}}]}}""")
@@ -218,11 +215,11 @@ async def source4():
 
     if items:
         sample = [{"i": i, "title": it["title"]} for i, it in enumerate(items[:8])]
-        verdicts = gemini_json(f"""Classify each headline about {DEMO_COMPANY}:
+        verdicts = llm_json(f"""Classify each headline about {DEMO_COMPANY}:
 category = funding | exec_hire | partnership | product | expansion | layoffs | irrelevant
 {json.dumps(sample)}
 Return JSON: {{"results": [{{"i": 0, "category": "...", "relevant": true}}]}}""")
-        print("\n  OUTPUT: Gemini classification → events:")
+        print("\n  OUTPUT: LLM classification → events:")
         for v in verdicts.get("results", []):
             it = items[v["i"]]
             mark = v.get("category", "?")
@@ -309,7 +306,7 @@ async def source6():
         if posts:
             p = posts[0]
             print(f"    sample: {p['title'][:55]}  body={len(p.get('body_text') or '')}c")
-    print("\n  => same Gemini extraction + discovery_job_post pipeline as Greenhouse/Lever")
+    print("\n  => same LLM extraction + discovery_job_post pipeline as Greenhouse/Lever")
 
 
 # ════════════════════════════════════════════════════════════════════════════

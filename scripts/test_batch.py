@@ -1,14 +1,14 @@
 """
-Batch enrichment test: Serper → Gemini → DiscoveryCompany-shaped JSON.
+Batch enrichment test: Serper → LLM → DiscoveryCompany-shaped JSON.
 
 Flow:
   1. Search Serper: "{company_name} CEO: {ceo_name}"
-  2. Dump the full Serper JSON to Gemini
-  3. Ask Gemini to return a JSON matching the DiscoveryCompany model fields
+  2. Dump the full Serper JSON to the LLM
+  3. Ask the LLM to return a JSON matching the DiscoveryCompany model fields
 
 Usage:
   cd tellora-discovery
-  SERPER_API_KEY=xxx GOOGLE_API_KEY=xxx python scripts/test_batch.py
+  SERPER_API_KEY=xxx OPENAI_API_KEY=xxx python scripts/test_batch.py
 """
 
 import json
@@ -16,15 +16,15 @@ import sys
 from pathlib import Path
 
 import httpx
-from google import genai
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import settings as cfg
+from llm import get_router, llm_available
 from scrape.domain_lookup import EXTRACT_PROMPT, INDUSTRY_ENUM
 
-if not cfg.SERPER_API_KEY or not cfg.GEMINI_API_KEY:
-    print("Set SERPER_API_KEY and GOOGLE_API_KEY / GEMINI_API_KEY env vars")
+if not cfg.SERPER_API_KEY or not llm_available():
+    print("Set SERPER_API_KEY and OPENAI_API_KEY env vars")
     sys.exit(1)
 
 # Test companies: (company_name, ceo_first_name)
@@ -50,8 +50,7 @@ def search_serper(company_name: str, ceo_first_name: str) -> dict:
     return resp.json()
 
 
-def ask_gemini(company_name: str, serper_data: dict) -> dict:
-    client = genai.Client(api_key=cfg.GEMINI_API_KEY)
+def ask_llm(company_name: str, serper_data: dict) -> dict:
     trimmed = {
         "knowledgeGraph": serper_data.get("knowledgeGraph"),
         "organic": serper_data.get("organic", [])[:7],
@@ -61,10 +60,8 @@ def ask_gemini(company_name: str, serper_data: dict) -> dict:
         serper_json=json.dumps(trimmed, indent=2),
         industry_list=", ".join(INDUSTRY_ENUM),
     )
-    resp = client.models.generate_content(model=cfg.ENRICHMENT_GEMINI_MODEL, contents=prompt)
-    raw = resp.text.strip().strip("`").strip()
-    if raw.startswith("json"):
-        raw = raw[4:].strip()
+    router = get_router()
+    raw = router.complete_text(prompt, models=router.enrichment_models, temperature=0.0, json_mode=True)
     return json.loads(raw)
 
 
@@ -84,9 +81,9 @@ def main():
             continue
 
         try:
-            result = ask_gemini(company_name, serper_data)
+            result = ask_llm(company_name, serper_data)
         except Exception as e:
-            print(f"  Gemini error: {e}")
+            print(f"  LLM error: {e}")
             continue
 
         for key, val in result.items():

@@ -1,5 +1,5 @@
 """
-Funding news snippets for Gemini synthesis — Google News RSS (free).
+Funding news snippets for LLM synthesis — Google News RSS (free).
 
 Serper News was the paid primary; it searched the same Google News index by
 name, so it cost money without adding coverage. Structured funding comes from

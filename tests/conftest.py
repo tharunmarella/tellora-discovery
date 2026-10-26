@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 os.environ.setdefault("DATABASE_URL", "postgresql://placeholder:placeholder@localhost:5432/placeholder")
 os.environ.setdefault("TELLORA_APOLLO_API_KEY", "test-apollo-key")
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
-os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
+os.environ.setdefault("OPENAI_API_KEY", "test-openai-key")
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -35,8 +35,8 @@ def clear_domain_cache():
 
 
 @pytest.fixture
-def gemini_stub(monkeypatch):
-    """Stub Gemini client to return canned JSON from generate_content."""
+def llm_stub(monkeypatch):
+    """Stub the LiteLLM router so every text path returns canned JSON."""
 
     def _apply(response_json: dict | str):
         if isinstance(response_json, dict):
@@ -46,29 +46,23 @@ def gemini_stub(monkeypatch):
         else:
             text_body = response_json
 
-        mock_client = MagicMock()
-        mock_resp = MagicMock()
-        mock_resp.text = text_body
-        mock_client.models.generate_content.return_value = mock_resp
-        monkeypatch.setattr("llm._gemini_client", None)
-        monkeypatch.setattr("llm.get_gemini_client", lambda: mock_client)
-
-        # LLM text paths route through the LiteLLM gateway — stub complete_text.
-        # complete_text so tests never hit the network.
+        # LLM text paths route through the LiteLLM gateway — stub complete_text
+        # so tests never hit the network.
         mock_router = MagicMock()
         mock_router.complete_text.return_value = text_body
-        mock_router.enrichment_models = ["gemini/test-enrichment"]
-        mock_router.signal_models = ["gemini/test-signal"]
-        mock_router.synthesis_models = ["gemini/test-signal"]
+        mock_router.enrichment_models = ["openai/test-enrichment"]
+        mock_router.signal_models = ["openai/test-signal"]
+        mock_router.synthesis_models = ["openai/test-signal"]
         for target in (
             "llm.get_router",
             "signals.pipeline.get_router",
+            "signals.profile_backfill.get_router",
             "scrape.domain_lookup.get_router",
             "signals.job_posts.get_router",
             "signals.sources.news.get_router",
         ):
             monkeypatch.setattr(target, lambda _r=mock_router: _r)
-        return mock_client
+        return mock_router
 
     return _apply
 

@@ -83,8 +83,8 @@ async def test_apply_profile_backfill_hq_from_search(monkeypatch):
     assert updated.hq_country == "US"
 
 
-def test_extract_funding_profile_uses_llm(gemini_stub):
-    gemini_stub({
+def test_extract_funding_profile_uses_llm(llm_stub):
+    llm_stub({
         "funding_stage": "Series C",
         "total_raised": "$100M",
         "investors": ["Sequoia"],

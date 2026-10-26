@@ -30,7 +30,7 @@ pytestmark = [pytest.mark.live, pytest.mark.asyncio]
 
 # conftest.py sets placeholder keys via setdefault so imports don't blow up.
 # Treat those placeholders as "no real key" for gating purposes.
-_PLACEHOLDERS = {"", "test-gemini-key", "test-apollo-key", "your_apollo_master_key_here"}
+_PLACEHOLDERS = {"", "test-openai-key", "test-apollo-key", "your_apollo_master_key_here"}
 
 
 def _has(*env_names: str) -> bool:
@@ -38,7 +38,7 @@ def _has(*env_names: str) -> bool:
 
 
 HAS_SERPER = _has("SERPER_API_KEY")
-HAS_GEMINI = _has("GOOGLE_API_KEY", "GEMINI_API_KEY")
+HAS_OPENAI = _has("OPENAI_API_KEY")
 HAS_JINA = _has("JINA_API_KEY")
 HAS_GITHUB = _has("GITHUB_TOKEN")
 HAS_APOLLO = _has("TELLORA_APOLLO_API_KEY")
@@ -199,12 +199,12 @@ async def test_live_github_signals():
         assert isinstance(gh["languages"], list)
 
 
-# ── Gemini synthesis + embeddings (needs GOOGLE_API_KEY) ─────────────────────
+# ── LLM synthesis + embeddings (needs OPENAI_API_KEY) ────────────────────────
 
 
-@pytest.mark.skipif(not HAS_GEMINI, reason="GOOGLE_API_KEY / GEMINI_API_KEY required")
-async def test_live_gemini_synthesize():
-    """Real Gemini call returns a populated CompanySignalResult, not _EMPTY_SIGNAL."""
+@pytest.mark.skipif(not HAS_OPENAI, reason="OPENAI_API_KEY required")
+async def test_live_llm_synthesize():
+    """Real LLM call returns a populated CompanySignalResult, not _EMPTY_SIGNAL."""
     from signals.pipeline import CompanySignalResult, synthesize_company_signals
 
     homepage = (
@@ -223,11 +223,11 @@ async def test_live_gemini_synthesize():
     )
     assert isinstance(result, CompanySignalResult)
     # A real model run on real homepage text should produce a summary.
-    assert result.company_summary, "Gemini returned no company_summary — synthesis failed"
+    assert result.company_summary, "LLM returned no company_summary — synthesis failed"
 
 
-@pytest.mark.skipif(not HAS_GEMINI, reason="GOOGLE_API_KEY / GEMINI_API_KEY required")
-async def test_live_gemini_embedding():
+@pytest.mark.skipif(not HAS_OPENAI, reason="OPENAI_API_KEY required")
+async def test_live_openai_embedding():
     from llm import embed_text
 
     vec = embed_text("Vercel is a developer tools and frontend cloud company.")

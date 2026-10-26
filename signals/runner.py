@@ -42,6 +42,7 @@ from sqlalchemy.orm import Session
 
 import settings as cfg
 from database import make_engine
+from llm import llm_available
 from signals.pipeline import enrich_company_signals
 
 logging.basicConfig(
@@ -434,8 +435,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not cfg.GEMINI_API_KEY:
-        logger.error("GEMINI_API_KEY / GOOGLE_API_KEY is not set — cannot run signal enrichment")
+    if not llm_available():
+        logger.error("OPENAI_API_KEY is not set — cannot run signal enrichment")
         sys.exit(1)
 
     asyncio.run(run(

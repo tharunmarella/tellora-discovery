@@ -1,4 +1,4 @@
-"""Backfill scrape-time DiscoveryCompany fields via Serper + Gemini lookup."""
+"""Backfill scrape-time DiscoveryCompany fields via Serper + LLM lookup."""
 
 from __future__ import annotations
 
@@ -182,7 +182,7 @@ async def backfill_scrape_fields(
     source: str = "apollo",
 ) -> dict:
     """
-    Re-run scrape-time Serper + Gemini lookup for rows missing linkedin_url
+    Re-run scrape-time Serper + LLM lookup for rows missing linkedin_url
     and/or other scrape metadata. Only fills empty columns.
     """
     batch_size = int(getattr(cfg, "SCRAPE_FIELDS_BACKFILL_LIMIT", 500))

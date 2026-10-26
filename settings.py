@@ -15,32 +15,25 @@ def _require(key: str) -> str:
 
 DATABASE_URL: str = _require("DATABASE_URL")
 TELLORA_APOLLO_API_KEY: str = _require("TELLORA_APOLLO_API_KEY")
-GEMINI_API_KEY: str = os.getenv("GOOGLE_API_KEY", os.getenv("GEMINI_API_KEY", ""))
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 
 # Embeddings — must match the backend's EMBEDDING_PROVIDER / OPENAI_EMBEDDING_MODEL:
 # the backend embeds queries, this worker embeds companies, both into description_embedding.
 # Changing either re-embeds every company (reembed_companies_task, queued at startup).
+# Only "openai" is supported.
 EMBEDDING_PROVIDER: str = os.getenv("EMBEDDING_PROVIDER", "openai").strip().lower()
 OPENAI_EMBEDDING_MODEL: str = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large").strip()
 EMBEDDING_DIM = 768  # vector(768) columns
 
-# HQ backfill LLM: "gemini" (default) or "groq"
-HQ_NORMALIZE_PROVIDER: str = os.getenv("HQ_NORMALIZE_PROVIDER", "gemini").strip().lower()
+# HQ backfill LLM: "llm" (default — the MODEL_P* chain) or "groq"
+HQ_NORMALIZE_PROVIDER: str = os.getenv("HQ_NORMALIZE_PROVIDER", "llm").strip().lower()
 HQ_NORMALIZE_MODEL: str = os.getenv("HQ_NORMALIZE_MODEL", "").strip()
 HQ_GROQ_MODEL: str = os.getenv("HQ_GROQ_MODEL", "openai/gpt-oss-20b").strip()
 
-# Gemini model IDs (intentionally different per pipeline stage)
-ENRICHMENT_GEMINI_MODEL: str = os.getenv("ENRICHMENT_GEMINI_MODEL", "gemini-2.5-flash-lite")
-ENRICHMENT_GEMINI_FALLBACK_MODEL: str = os.getenv("ENRICHMENT_GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
-SIGNAL_GEMINI_MODEL: str = os.getenv("SIGNAL_GEMINI_MODEL", "gemini-3.1-flash-lite")
-E2E_JUDGE_MODEL: str = os.getenv("E2E_JUDGE_MODEL", "gemini-3.5-flash")
-
-# LiteLLM gateway — multi-model fallback chains (Gemini primary → Gemini fallback →
-# Anthropic when ANTHROPIC_API_KEY is set). Bare model ids are treated as gemini/*.
-SIGNAL_GEMINI_FALLBACK_MODEL: str = os.getenv("SIGNAL_GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
-LLM_CROSS_PROVIDER_MODEL: str = os.getenv("LLM_CROSS_PROVIDER_MODEL", "anthropic/claude-haiku-4-5")
+# LiteLLM gateway — the MODEL_P* fallback chain lives in llm.py. Bare model ids are
+# treated as openai/*.
+E2E_JUDGE_MODEL: str = os.getenv("E2E_JUDGE_MODEL", "openai/gpt-6.1-sol")
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 # Per-model retries inside LiteLLM before advancing to the next fallback model.
 LITELLM_NUM_RETRIES: int = int(os.getenv("LITELLM_NUM_RETRIES", "2"))

@@ -414,7 +414,7 @@ async def poll_job_posts_task(ctx) -> dict:
     Daily: cheap ATS-board poll (index) + full re-enrich path for watched accounts.
     """
     from signals.job_posts import (
-        extract_posts_with_gemini,
+        extract_posts_with_llm,
         fetch_cached_ats_board_posts,
         fetch_job_board_posts,
         persist_job_posts,
@@ -454,7 +454,7 @@ async def poll_job_posts_task(ctx) -> dict:
             or known.get(str(p.get("external_id") or "")) != p.get("title")
         ]
         if new_or_changed:
-            enriched = extract_posts_with_gemini(new_or_changed)
+            enriched = extract_posts_with_llm(new_or_changed)
             by_id = {str(p.get("external_id")): p for p in enriched}
             for p in posts:
                 ext = str(p.get("external_id") or "")
@@ -481,7 +481,7 @@ async def poll_job_posts_task(ctx) -> dict:
         )
         if not posts:
             continue
-        posts = extract_posts_with_gemini(posts)
+        posts = extract_posts_with_llm(posts)
         with Session(_engine) as session:
             persist_job_posts(session, row["id"], posts, source)
             session.commit()

@@ -4,7 +4,7 @@ Standalone service for **on-demand company signal enrichment** (Watch / Enrich i
 
 ## What it does
 
-The ARQ worker (`arq worker.WorkerSettings`, queue `arq:ondemand`) claims `discovery_company` rows and enriches them with Serper, Jina, ATS boards, and Gemini. The backend enqueues `enrich_company_task` when a rep Watches or Enrichs a company.
+The ARQ worker (`arq worker.WorkerSettings`, queue `arq:ondemand`) claims `discovery_company` rows and enriches them with Serper, Jina, ATS boards, and OpenAI (via LiteLLM). The backend enqueues `enrich_company_task` when a rep Watches or Enrichs a company.
 
 Helpers still in `scrape/` are **not** a census pipeline: domain lookup and Apollo people-count used during enrichment / headcount refresh.
 
@@ -16,7 +16,7 @@ Helpers still in `scrape/` are **not** a census pipeline: domain lookup and Apol
 4. **First-party feed** — the company's own changelog / blog / newsroom RSS → launches, funding, exec, expansion
 5. **News** — Google News RSS, verified per headline against the company's domain + description (drops same-name companies, places, people)
 6. **Free sources** — GitHub/npm, HN, USAspending (matched by UEI once known), DNS
-7. **Gemini synthesis** → `buying_signals`, `signal_score`, embeddings
+7. **LLM synthesis** → `buying_signals`, `signal_score`, embeddings
 8. **Signal diff** → typed events; adopt/drop tech only between full fingerprint runs; repeat reports of one event merge into it as extra sources
 
 ### Batch sources (cron)
@@ -95,7 +95,7 @@ pytest
 # Task integration: real Postgres via testcontainers (Docker required)
 pytest -m integration
 
-# Live smoke: hits Serper/Gemini/Jina (needs API keys in .env)
+# Live smoke: hits Serper/OpenAI/Jina (needs API keys in .env)
 pytest -m live
 
 # Coverage gate (same as pre-push step 1): non-live suite, 75% on scoped modules
@@ -115,7 +115,7 @@ Blocks `git push` if:
 1. Non-live tests fail or scoped coverage drops below 75%
 2. E2E pipeline quality judge scores below threshold (per-company floor 7, mean >= 8)
 
-Judge model: `E2E_JUDGE_MODEL` (default `gemini-3.5-flash`) runs with **Google Search grounding**.
+Judge model: `E2E_JUDGE_MODEL` (default `openai/gpt-6.1-sol`) runs with OpenAI **web search**.
 CI does **not** run e2e (no secrets in GitHub Actions).
 
 Omitted from the coverage gate (live-only): `signals/pipeline.py`, `signals/runner.py`, `signals/sources/*`, etc. — see `.coveragerc`.
@@ -125,7 +125,7 @@ Test layout:
 ```
 tests/
 ├── unit/           # diff, name_match, pipeline helpers, llm, source mappers
-├── parsing/        # respx-mocked HTTP fetchers + Gemini synthesis
+├── parsing/        # respx-mocked HTTP fetchers + LLM synthesis
 ├── integration/    # worker tasks, DB persistence (testcontainers)
 ├── live/           # opt-in external API smoke tests
 └── e2e/            # LLM-judged pipeline quality gate (pre-push)
@@ -141,16 +141,16 @@ tellora-discovery/
 ├── settings.py              # Env vars
 ├── database.py              # DB engine + migrations
 ├── models.py                # SQLModel tables
-├── llm.py                   # Shared Gemini client
+├── llm.py                   # LiteLLM model chain (MODEL_P*) + OpenAI embeddings
 ├── config_logging.py
 │
 ├── scrape/                  # Enrichment helpers (not a census scrape)
 │   ├── apollo_client.py     # Apollo people-count / pagination
-│   ├── domain_lookup.py     # Serper + Gemini domain resolve
+│   ├── domain_lookup.py     # Serper + LLM domain resolve
 │   └── scrape_fields_backfill.py
 │
 ├── signals/                 # Buying-signal enrichment
-│   ├── pipeline.py          # Per-company orchestration (Jina, Gemini, …)
+│   ├── pipeline.py          # Per-company orchestration (Jina, LLM, …)
 │   ├── runner.py            # Batch backfill CLI + persist helper
 │   ├── headcount_backfill.py
 │   ├── diff.py              # Snapshot diff → typed events

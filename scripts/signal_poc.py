@@ -11,8 +11,8 @@ Live data sources used (same keys as production):
   - Serper News            (funding news; RSS fallback)
   - Serper                (social posts, exec-hire news)
   - Apollo free search    (people + titles for job-change detection)
-  - Gemini flash-lite     (JD extraction, relevance filtering)
-  - gemini-embedding-001  (ICP relevance, learning-loop centroid)
+  - MODEL_P* LLM chain    (JD extraction, relevance filtering)
+  - OpenAI embeddings    (ICP relevance, learning-loop centroid)
 
 Where a phase needs HISTORY we don't have yet (diffs need a last-week
 baseline), the baseline is SIMULATED and clearly labeled as such; the
@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import httpx
 
 import settings as cfg
-from llm import embed_text, get_gemini_client, retry_llm, strip_json_fences
+from llm import embed_text, get_router, retry_llm, strip_json_fences
 from signals.job_posts import check_job_boards
 from signals.pipeline import fetch_funding_news
 
@@ -67,11 +67,10 @@ def sub(title: str) -> None:
     print(f"\n--- {title} ---")
 
 
-def gemini_json(prompt: str) -> dict | list:
+def llm_json(prompt: str) -> dict | list:
     def _do():
-        client = get_gemini_client()
-        resp = client.models.generate_content(model=cfg.SIGNAL_GEMINI_MODEL, contents=prompt)
-        return json.loads(strip_json_fences(resp.text))
+        raw = get_router().complete_text(prompt, models=get_router().signal_models, temperature=0.0)
+        return json.loads(strip_json_fences(raw))
     return retry_llm(_do)
 
 
@@ -273,7 +272,7 @@ async def phase2() -> None:
         body = _strip_html(p.get("content", ""))
         print(f"    - {p['title']}  (body: {len(body)} chars)")
 
-    sub("LIVE: Gemini per-post extraction (role_family, concepts, tech, initiatives)")
+    sub("LIVE: LLM per-post extraction (role_family, concepts, tech, initiatives)")
     blocks = []
     for i, p in enumerate(sample):
         body = _strip_html(p.get("content", ""))[:2200]
@@ -291,7 +290,7 @@ named internal projects, else [].
 Respond ONLY with valid JSON:
 {{"posts": [{{"title": "...", "role_family": "...", "seniority": "junior|mid|senior|staff|exec",
 "concepts": ["..."], "tech": ["..."], "initiatives": ["..."]}}]}}"""
-    extracted = gemini_json(prompt)["posts"]
+    extracted = llm_json(prompt)["posts"]
     for e in extracted:
         print(f"    {e['title']}")
         print(f"      role_family={e['role_family']}  seniority={e.get('seniority')}")
@@ -400,7 +399,7 @@ async def phase4() -> None:
         print("  (run phases 1-2 first to populate events)")
         return
 
-    sub("LIVE: ICP relevance via real embeddings (gemini-embedding-001)")
+    sub("LIVE: ICP relevance via real embeddings (OpenAI)")
     print(f"  ICP: \"{ICP_TEXT[:80]}...\"")
     icp_vec = embed_text(ICP_TEXT)
     rows = []
@@ -480,7 +479,7 @@ async def phase5() -> None:
     moved = [n for i, (n, _) in enumerate(learned) if base[i][0] != n]
     print(f"\n  ordering changed: {'yes — ' + ', '.join(moved[:3]) if moved else 'no (margins shifted)'}")
 
-    sub("OUTPUT: few-shot block injected into the existing Gemini rerank prompt")
+    sub("OUTPUT: few-shot block injected into the existing LLM rerank prompt")
     print("  ORG FEEDBACK — companies this team ACCEPTED (score similar ones higher):")
     for n, d in ACCEPTED:
         print(f"    + {n}: {d[:70]}")
@@ -578,10 +577,10 @@ async def phase7() -> None:
     if not organic:
         return
 
-    sub("LIVE: Gemini relevance filter → social_post events")
+    sub("LIVE: LLM relevance filter → social_post events")
     items = [{"i": i, "title": h.get("title", ""), "snippet": h.get("snippet", "")[:200]}
              for i, h in enumerate(organic[:8])]
-    verdicts = gemini_json(f"""Signal query: "{SOCIAL_QUERY_PROMPT}"
+    verdicts = llm_json(f"""Signal query: "{SOCIAL_QUERY_PROMPT}"
 For each LinkedIn post below decide if it is a RELEVANT company/person buying-adjacent
 signal for that query (not an ad, not a job post, not spam). Extract the company if named.
 
