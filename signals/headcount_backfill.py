@@ -9,7 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 import settings as cfg
-from database import make_engine
+from database import engine as shared_engine
 from signals.pipeline import fetch_apollo_headcount
 
 logger = logging.getLogger("discovery.headcount_backfill")
@@ -33,7 +33,7 @@ async def backfill_apollo_headcounts(
     else:
         cap = limit if limit is not None else batch_size
 
-    engine = make_engine()
+    engine = shared_engine
 
     _select = text("""
         SELECT id, domain, name
@@ -115,7 +115,7 @@ async def refresh_stale_apollo_headcounts(
     """
     cap = limit if limit is not None else int(cfg.HEADCOUNT_REFRESH_LIMIT)
     days = stale_days if stale_days is not None else int(cfg.HEADCOUNT_REFRESH_STALE_DAYS)
-    engine = make_engine()
+    engine = shared_engine
 
     _select = text("""
         SELECT id, domain, name, headcount

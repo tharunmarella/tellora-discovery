@@ -41,7 +41,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 import settings as cfg
-from database import make_engine
+from database import engine as shared_engine
 from llm import llm_available
 from signals.pipeline import enrich_company_signals
 
@@ -303,7 +303,7 @@ async def run(
     reset_failed: bool,
     reset_enriched: bool = False,
 ) -> None:
-    engine = make_engine()
+    engine = shared_engine
 
     with Session(engine) as session:
         if reset_failed:

@@ -73,6 +73,11 @@ def make_engine(*, pool_pre_ping: bool = True, **kwargs):
     return create_engine(url, pool_pre_ping=pool_pre_ping, **kwargs)
 
 
+# The one engine (one connection pool) for the whole process — import it, don't
+# call make_engine() at runtime: each call builds a new pool whose connections
+# stay open until the process exits. make_engine() is for one-off scripts.
+# Sized for SIGNAL_ENRICH_MAX_JOBS concurrent jobs; in production DATABASE_URL
+# is the PgBouncer pool, so these are cheap client-side connections.
 engine = make_engine(
     echo=False,
     pool_recycle=300,

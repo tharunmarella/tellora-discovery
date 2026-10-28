@@ -13,7 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 import settings as cfg
-from database import make_engine, run_with_db_retry
+from database import engine as _engine, run_with_db_retry
 from infra.lifespan import SERVICE_WORKER
 from infra.sentry_telemetry import capture_task_failure
 from signals.pipeline import enrich_company_signals
@@ -21,7 +21,6 @@ from signals.runner import persist_result, push_alert_if_tier1
 
 logger = logging.getLogger("discovery.monitoring")
 
-_engine = make_engine(pool_recycle=300, pool_size=3, max_overflow=5)
 
 _SELECT_WATCHED_STALE_CANDIDATES = text("""
     WITH candidates AS (

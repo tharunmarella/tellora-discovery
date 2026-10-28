@@ -13,13 +13,12 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 import settings as cfg
-from database import make_engine
+from database import engine as _engine
 from infra.axiom_logger import axiom_logger
 from infra.lifespan import SERVICE_WORKER
 
 logger = logging.getLogger("discovery.scheduler_metrics")
 
-_engine = make_engine(pool_recycle=300, pool_size=2, max_overflow=2)
 
 _SNAPSHOT_SQL = text("""
     SELECT

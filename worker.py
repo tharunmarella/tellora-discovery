@@ -23,7 +23,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 import settings as cfg
-from database import make_engine
+from database import engine as _engine
 from infra.axiom_arq import after_job_end, on_job_failure
 from infra.lifespan import SERVICE_WORKER, bootstrap, shutdown as lifespan_shutdown, startup as lifespan_startup
 from signals.monitoring import (
@@ -47,11 +47,6 @@ bootstrap(server_name=SERVICE_WORKER)
 
 logger = logging.getLogger("discovery.worker")
 
-_engine = make_engine(
-    pool_recycle=300,
-    pool_size=3,
-    max_overflow=5,
-)
 
 _ENRICH_MAX_TRIES = cfg.SIGNAL_ENRICH_MAX_TRIES
 

@@ -93,11 +93,15 @@ def _patch_engines(engine) -> None:
     import worker
     import signals.monitoring as monitoring
     import signals.scheduler_metrics as scheduler_metrics
+    import signals.runner as runner
+    import signals.headcount_backfill as headcount_backfill
 
     database.engine = engine
     worker._engine = engine
     monitoring._engine = engine
     scheduler_metrics._engine = engine
+    runner.shared_engine = engine
+    headcount_backfill.shared_engine = engine
 
 
 def _ensure_company_watch_table(conn) -> None:
